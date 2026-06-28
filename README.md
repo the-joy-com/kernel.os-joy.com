@@ -29,11 +29,12 @@ So `GET /health` answers:
 | --- | --- |
 | `GET /` | A name on the door — `{ "msg": "the ghost in the shell", "data": { "version": "0.0.1" } }` — so the bare host is legible instead of a 404. |
 | `GET /health` | The probe the shell's connectivity dot reads — `{ "msg": "ok", "data": { "version": "0.0.1" } }`. |
+| `POST /intake` | Takes one line off the shell's prompt — body `{ "line": "<text>" }` — and acknowledges it with `{ "msg": "copy", "data": null }`. `"copy"` means *received*, not *stored*: the line is dropped (holding it in the buffer is a separate concern that layers on top of this round trip). The `line` is required, non-empty, and capped at 4096 chars; anything else is a `422`. The request shape is validated by the `IntakeRequest` DTO in [`dtos.py`](./dtos.py). |
 | `GET /docs` | Interactive API docs (Swagger UI), generated for free by FastAPI from the route signatures. `GET /redoc` and the raw `GET /openapi.json` come along with it. |
 
 ## CORS
 
-The shell reads `/health` from a different origin (`shell.os-joy.com`, or `localhost` in dev), so the kernel sends an explicit CORS allow-list — without it the browser blocks the read and the shell's dot reads offline even when the kernel is up. The allowed origins are pinned in `main.py` (`ALLOWED_ORIGINS`): the production shell plus the two local dev origins (`http://localhost:5173`, `http://127.0.0.1:5173`), `GET` only, nothing wildcarded. Add an origin there when a new front-end needs to read the kernel from the browser.
+The shell reads `/health` from a different origin (`shell.os-joy.com`, or `localhost` in dev), so the kernel sends an explicit CORS allow-list — without it the browser blocks the read and the shell's dot reads offline even when the kernel is up. The allowed origins are pinned in `main.py` (`ALLOWED_ORIGINS`): the production shell plus the two local dev origins (`http://localhost:5173`, `http://127.0.0.1:5173`), `GET` (the health probe) and `POST` (sending a line to `/intake`), nothing wildcarded. The `POST` carries a JSON body, so the browser preflights it with an `OPTIONS` request — the CORS middleware answers that itself, which is why `OPTIONS` isn't in the method list. Add an origin there when a new front-end needs to read the kernel from the browser.
 
 ## Stack
 
