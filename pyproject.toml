@@ -1,0 +1,9 @@
+[project]
+name = "kernel-os-joy"
+version = "0.0.1"
+description = "The kernel — the privileged core behind kernel.os-joy.com."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.138.1",
+    "uvicorn[standard]>=0.49.0",
+]

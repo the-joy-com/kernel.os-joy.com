@@ -1,0 +1,6 @@
+# uv builds the virtualenv here (named via UV_PROJECT_ENVIRONMENT=venv);
+# it's reproducible from uv.lock, so never committed.
+venv/
+
+__pycache__/
+*.pyc
