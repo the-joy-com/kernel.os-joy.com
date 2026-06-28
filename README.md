@@ -4,7 +4,7 @@
 
 The kernel — the privileged core behind `kernel.os-joy.com`. The server-side counterpart to the [shell](../shell.os-joy.com): where the shell is the thin user-facing input layer, the kernel does the real work — intake/release, the buffer, identity, the Dead Man's Switch — mediating World ↔ symbiot.
 
-**First slice:** one endpoint, `GET /health`, answering `200` so the shell's connectivity dot has something real to probe. Everything else lands on top of this round trip, never beside it.
+It exposes a small HTTP surface: a health probe the shell's connectivity dot reads, a name on the door at `/`, and auto-generated API docs — see [Routes](#routes) below. Every response wears the same [envelope](#api-response-envelope).
 
 ## API response envelope
 
@@ -77,6 +77,20 @@ uv sync                     # bring venv in line with uv.lock
 ```
 
 Commit `pyproject.toml` and `uv.lock`; never commit `venv/`.
+
+## Deploy
+
+The kernel runs on a server as a **systemd unit** — uvicorn bound to `127.0.0.1:9713` — behind **nginx** as a reverse proxy for `kernel.os-joy.com`, with TLS terminated by a **certbot** certificate. The uvicorn port is never exposed to the internet directly; nginx is the only door.
+
+Deployment is by hand from a clone of this repo on the box. **The Joy's apps all live under `~/apps` on the server** — this clone must sit at `~/apps/kernel.os-joy.com`, because the systemd unit resolves the working directory and the venv from that path. Every deploy is one command:
+
+```bash
+./deploy.sh
+```
+
+`deploy.sh` runs under `set -euo pipefail`: it pulls `main`, runs `uv sync --frozen` against `uv.lock`, ensures the systemd unit is current, and restarts the service. On its first run it asks once for the server user (the account that owns the clone), remembers it in a gitignored `.deploy-user`, renders [`deploy/kernel-os-joy.service`](./deploy/kernel-os-joy.service) from that, and installs + enables the unit so the process survives crashes and reboots.
+
+The nginx server block and the certbot certificate are one-time setup per host: nginx `proxy_pass`es `kernel.os-joy.com` to `http://127.0.0.1:9713`, and `certbot --nginx -d kernel.os-joy.com` issues the certificate and adds the HTTP→HTTPS redirect.
 
 ## License
 

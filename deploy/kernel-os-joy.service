@@ -1,0 +1,20 @@
+# systemd unit *template* for the kernel. `deploy.sh` fills in __SERVER_USER__ from the server user you're prompted for once, 
+# renders this, and installs it to /etc/systemd/system/kernel-os-joy.service. You don't copy this by hand.
+# Confirm the two paths match the box: the clone lives under the user's ~/apps, and uv resolves to ~/.local/bin/uv (`which uv`). Everything else is portable.
+[Unit]
+Description=kernel.os-joy.com — the privileged core behind The Joy
+After=network.target
+
+[Service]
+Type=exec
+User=__SERVER_USER__
+WorkingDirectory=/home/__SERVER_USER__/apps/kernel.os-joy.com
+# uv reads the venv location from here, exactly as the local README does.
+Environment=UV_PROJECT_ENVIRONMENT=venv
+# Bound to localhost only — nginx is the sole front door; the port is never exposed to the internet directly. No --reload in production.
+ExecStart=/home/__SERVER_USER__/.local/bin/uv run uvicorn main:app --host 127.0.0.1 --port 9713
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -4,3 +4,6 @@ venv/
 
 __pycache__/
 *.pyc
+
+# Server user persisted by deploy.sh on first run — local to each box.
+.deploy-user
