@@ -7,12 +7,30 @@ lands on top of this round trip, never beside it.
 """
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 # Pinned here for now, the single source the envelope reports.
 # Bump in lockstep with real changes to what the kernel answers.
 VERSION = "0.0.1"
 
 app = FastAPI(title="kernel.os-joy.com", version=VERSION)
+
+# The shell runs on a different origin (shell.os-joy.com, or localhost in dev),
+# so the browser needs explicit permission to *read* the kernel's responses —
+# without it the connectivity dot's fetch is blocked and the kernel reads dead even when it's up. 
+# Only the shell's own origins, only the method it uses;
+# nothing wildcarded.
+ALLOWED_ORIGINS = [
+    "https://shell.os-joy.com",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 
 def envelope(msg: str, data=None) -> dict:

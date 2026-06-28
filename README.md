@@ -31,6 +31,10 @@ So `GET /health` answers:
 | `GET /health` | The probe the shell's connectivity dot reads — `{ "msg": "ok", "data": { "version": "0.0.1" } }`. |
 | `GET /docs` | Interactive API docs (Swagger UI), generated for free by FastAPI from the route signatures. `GET /redoc` and the raw `GET /openapi.json` come along with it. |
 
+## CORS
+
+The shell reads `/health` from a different origin (`shell.os-joy.com`, or `localhost` in dev), so the kernel sends an explicit CORS allow-list — without it the browser blocks the read and the shell's dot reads offline even when the kernel is up. The allowed origins are pinned in `main.py` (`ALLOWED_ORIGINS`): the production shell plus the two local dev origins (`http://localhost:5173`, `http://127.0.0.1:5173`), `GET` only, nothing wildcarded. Add an origin there when a new front-end needs to read the kernel from the browser.
+
 ## Stack
 
 - **Python 3.12+**
