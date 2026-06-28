@@ -5,5 +5,22 @@ description = "The kernel — the privileged core behind kernel.os-joy.com."
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.138.1",
+    "google-api-python-client>=2.198.0",
+    "google-auth>=2.55.1",
+    "psycopg-pool>=3.3.1",
+    "psycopg[binary]>=3.3.4",
+    "python-dotenv>=1.2.2",
     "uvicorn[standard]>=0.49.0",
 ]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+# Tests live in test/ and import the kernel's top-level modules (main, db, …),
+# so the repo root must be importable.
+testpaths = ["test"]
+pythonpath = ["."]

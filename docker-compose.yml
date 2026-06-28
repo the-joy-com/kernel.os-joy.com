@@ -1,0 +1,28 @@
+# Local Postgres for development and the test suite.
+# The server does NOT use this —
+# it has its own Postgres reached over a unix socket with peer auth (see README).
+# This compose file is a local convenience only;
+# nothing here runs in production.
+services:
+  postgres:
+    image: postgres:16
+    # Matches the credentials baked into the default local DATABASE_URL in config.py,
+    # so a plain `docker compose up -d` needs no .env to develop against.
+    environment:
+      POSTGRES_USER: joy
+      POSTGRES_PASSWORD: joy
+      POSTGRES_DB: joy
+    ports:
+      - "5432:5432"
+    volumes:
+      - joy_pgdata:/var/lib/postgresql/data
+    # The kernel runs migrations at startup;
+    # only wait until Postgres is actually accepting connections so a fast boot doesn't race the database.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U joy -d joy"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  joy_pgdata:

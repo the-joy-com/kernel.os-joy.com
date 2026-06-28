@@ -7,3 +7,13 @@ __pycache__/
 
 # Server user persisted by deploy.sh on first run — local to each box.
 .deploy-user
+
+# Per-box secrets and config: database URL, symbiot email, HMAC secret, Gmail.
+# .env.example is the committed template; .env itself never is.
+.env
+
+# GCP service-account key for the Gmail API — a credential, never committed.
+*.gmail.json
+gmail-credentials*.json
+*-sa-creds.json
+
