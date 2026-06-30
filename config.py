@@ -49,9 +49,10 @@ GMAIL_SENDER = os.getenv("GMAIL_SENDER", "").strip()
 
 # Lifetimes for the two short-lived secrets.
 # Codes are deliberately brief;
-# a session outlives a single request but is not forever.
+# a session lasts a day — long enough that the shell needn't re-ask for a login on every reload,
+# short enough that a forgotten open tab doesn't stay authed indefinitely.
 LOGIN_CODE_TTL_SECONDS = 10 * 60
-SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
+SESSION_TTL_SECONDS = 24 * 60 * 60
 
 # Abuse limits enforced in the strict layer (the database), not by request timing.
 # The smallest gap between two issued codes for one symbiot:
