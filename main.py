@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import config
 import db
 import identity
+import logs
 from dtos import IntakeRequest, LoginRequest, VerifyRequest
 from email_client import EmailClient, GmailEmailClient
 from rate_limit import RateLimitMiddleware
@@ -25,6 +26,10 @@ from rate_limit import RateLimitMiddleware
 # The single source the envelope reports.
 # Bump in lockstep with real changes to what the kernel answers.
 VERSION = "0.0.1"
+
+# Wire the kernel's timestamped log stream before anything logs (db on startup,
+# the routes below). Each call site names its own area via logs.get("<area>").
+logs.configure()
 
 
 @asynccontextmanager
@@ -54,6 +59,10 @@ ALLOWED_ORIGINS = [
     "https://shell.os-joy.com",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    # `vite preview` (the built-shell server) — the service worker, and so the
+    # offline outbox, only exist in a real build, so they can only be tested there.
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -121,13 +130,17 @@ def health() -> dict:
 
 
 @app.post("/intake")
-def intake(_body: IntakeRequest) -> dict:
+def intake(body: IntakeRequest) -> dict:
     # Receive a line and acknowledge it.
     # FastAPI validates the body against the DTO.
-    # We then drop it on purpose (hence the leading underscore):
-    # "copy" means *The Joy received it*, not that it kept it.
+    # We read it only to log a timestamped, content-free receipt — the line
+    # count, never the text — then drop it: "copy" means *The Joy received it*,
+    # not that it kept it. A reconnect arrives as one batch (the outbox joins its
+    # queued lines with newlines), so the count tells a live tail whether one
+    # POST carried one line or a whole drained queue.
     # Holding the line in the buffer is a separate concern that layers on top of this round trip,
     # never ahead of it.
+    logs.get("intake").info("intake — %d line(s)", body.line.count("\n") + 1)
     return envelope("copy")
 
 
