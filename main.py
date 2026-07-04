@@ -24,6 +24,7 @@ import protocol
 import push
 import worker
 from dtos import (
+    DeliveredRequest,
     IntakeRequest,
     LoginRequest,
     PushSubscriptionRequest,
@@ -33,7 +34,7 @@ from dtos import (
 
 # The /intake handler is named intake(),
 # so the module is reached by its function rather than imported as `intake` (which the handler would shadow).
-from intake import read_outcome, record_message
+from intake import mark_delivered, read_outcome, record_message, recover_orphaned
 from missive import mark_seen, unseen_for_symbiot
 from email_client import EmailClient, GmailEmailClient
 from rate_limit import RateLimitMiddleware
@@ -67,6 +68,29 @@ async def lifespan(app: FastAPI):
     worker_stop = threading.Event()
     worker_threads = []
     if config.WORKER_ENABLED:
+        # Before any worker of this process starts, reconcile rows the previous one left mid-work.
+        # A row still 'working' at boot is an orphan — the worker that held it died with that process —
+        # so recover_orphaned re-queues it for a fresh claim, or abandons it if its retry budget is spent.
+        # Re-queued, not failed: the kernel fell over, the work didn't, so there's nothing to record as a failure.
+        # Runs before the workers below so none can claim a row mid-recovery,
+        # and only when workers are enabled — under test the suite drives the state machine, and this reconcile, by hand.
+        log = logs.get("kernel")
+        with db.get_pool().connection() as conn:
+            requeued, abandoned = recover_orphaned(conn, config.MAX_INTAKE_ATTEMPTS)
+        if requeued or abandoned:
+            log.warning(
+                "restart recovery: re-queued %d orphaned message(s), abandoned %d out of budget",
+                requeued,
+                len(abandoned),
+            )
+        # 'abandoned' is terminal: nudge each one's subscription (if any) that the kernel gave up,
+        # the same as the reconcile sweep does — outside any transaction, a slow push must not hold a connection,
+        # and a failed nudge must not break startup.
+        for message_id in abandoned:
+            try:
+                push.notify(db.get_pool(), message_id)
+            except Exception:
+                log.exception("restart recovery: nudge failed for abandoned message %d", message_id)
         for n in range(config.WORKER_CONCURRENCY):
             thread = threading.Thread(
                 target=worker.run,
@@ -205,6 +229,24 @@ def answers(id: int, conn=Depends(db.get_conn)) -> dict:
     if status == "abandoned":
         return envelope(protocol.ANSWER_ABANDONED, {"id": id})
     return envelope(protocol.ANSWER_PENDING, {"id": id})
+
+
+@app.post("/answers/delivered")
+def answers_delivered(body: DeliveredRequest, conn=Depends(db.get_conn)) -> dict:
+    """Confirm the shell has shown a message's outcome — the reply's 'truly out' receipt.
+
+    The outbox's COPY proves a line reached the kernel;
+    this is the mirror on the way back:
+    after the shell renders an answer (or an abandonment) it read off /answers,
+    it POSTs the id here and the kernel stamps delivered_at —
+    so 'answered' means the reply was produced, and delivered_at means it actually reached the symbiot,
+    never a hopeful guess.
+    Unauthed like /answers itself — the id is the capability —
+    and the stamp only touches a terminal, still-undelivered row,
+    so a stray, in-flight, or already-delivered id is a clean no-op rather than an error.
+    """
+    delivered = mark_delivered(conn, body.ids)
+    return envelope(protocol.COPY, {"delivered": delivered})
 
 
 @app.get("/health")

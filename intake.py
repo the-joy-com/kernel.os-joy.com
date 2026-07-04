@@ -13,6 +13,16 @@ So the two resting states are 'answered' and 'abandoned', with 'failed' a way-st
 Each move is guarded — the UPDATE names the state it's allowed to move *from* —
 so a transition that doesn't fit the message's current state simply doesn't happen,
 and "one row, one outcome" is a guarantee the row layer enforces rather than one the calling order has to be careful to preserve.
+Should the kernel die while a message is 'working', a restart doesn't orphan it:
+recover_orphaned sends it back to 'received' for a fresh claim,
+because a process that fell over mid-flight is not the same as work that failed —
+only the latter has a failure to record.
+A terminal outcome carries one mark past its status: delivered_at,
+set once the shell confirms it showed the answer (or the abandonment) to the symbiot.
+'answered' means the reply exists and is durable; delivered_at means it actually reached the human —
+the reply's honest counterpart, on the way back, to the outbox's COPY, never a hopeful guess.
+It rides orthogonal to status, the way a missive's seen_at does,
+so the resting states stay 'answered' and 'abandoned' and delivery is a separate fact about them.
 The worker (worker.py) drives a message along this path;
 this module owns the durable write and the legal moves it makes, not the deciding.
 
@@ -31,11 +41,22 @@ table and module (missive.py), not folded into this one.
 # so it says exactly that, and the two are told apart by their reason.
 SWEEP_REASON = "deadline exceeded (swept: no worker reported an outcome)"
 
+# The reason recorded when restart recovery abandons a message rather than re-queuing it:
+# it was caught mid-work by a kernel that died, re-run as far as its budget allowed, and never once completed —
+# so there is no traceback to keep, only this.
+# Written anyway because an abandoned row must always say why,
+# the same invariant a swept or worker failure keeps.
+ORPHAN_ABANDON_REASON = (
+    "abandoned in restart recovery (caught mid-work, retry budget spent, no attempt completed)"
+)
+
 
 # The functions below are ordered by the message's lifecycle, not alphabetically:
 # record_message and read_outcome first (the write at receipt and the read back off it),
 # then the state transitions in the order a message walks them —
-# claim, answer, fail, sweep, requeue, abandon.
+# claim, answer, fail, sweep, requeue, abandon, deliver —
+# and last, off the per-message path, recover_orphaned:
+# the once-at-startup reconcile of rows a dead process left mid-work.
 # The order mirrors the path the module docstring narrates,
 # so reading top to bottom is reading a message's life start to finish.
 def record_message(conn, message: str, reply_channel_id: int | None = None) -> int:
@@ -194,3 +215,72 @@ def abandon_exhausted(conn, max_attempts: int) -> list[int]:
         (max_attempts,),
     )
     return [row[0] for row in cursor.fetchall()]
+
+
+def mark_delivered(conn, ids: list[int]) -> int:
+    """Record that the shell has shown a message's outcome to the symbiot: stamp delivered_at.
+
+    Returns how many rows this marked delivered.
+    A reply is 'truly out' — the honest counterpart, on the way back, to the outbox's COPY —
+    only once the terminal it was emitted to confirms it displayed it.
+    The shell reports that here, after rendering an answer (or an abandonment) it read off /answers,
+    so 'answered' means the reply was produced and delivered_at means it actually reached the human.
+    Guarded on a terminal, still-undelivered row (status in answered/abandoned, delivered_at null),
+    so a re-ack, an in-flight id, or an unknown one changes nothing:
+    idempotent and safe on an unauthed route where the id is the only capability.
+    A lost ack simply leaves delivered_at null — the signal errs toward not-yet-delivered,
+    never toward a delivery that didn't happen, so a set delivered_at is always trustworthy.
+    """
+    if not ids:
+        return 0
+    cursor = conn.execute(
+        "UPDATE intake SET delivered_at = now() "
+        "WHERE delivered_at IS NULL AND status IN ('answered', 'abandoned') AND id = ANY(%s)",
+        (ids,),
+    )
+    return cursor.rowcount
+
+
+def recover_orphaned(conn, max_attempts: int) -> tuple[int, list[int]]:
+    """Reconcile rows a dead process left mid-work: working → received, or → abandoned.
+
+    Returns (how many were re-queued, the ids abandoned).
+    Run once at startup, before any worker of this process begins.
+    At that instant every row still in 'working' is an orphan by definition —
+    the worker that claimed it belonged to a process that has since exited,
+    so no one is left to finish it.
+    That is why this needs no heartbeat or lease to spot an orphan: the process boundary is the signal.
+    It does assume a single kernel against the database —
+    a second live instance's in-flight rows would look orphaned from here,
+    and telling those apart is high-availability work (OS-16), not this.
+
+    An orphan is re-queued, not failed, and that distinction is the whole point of this step.
+    Nothing about the work failed — the kernel did, mid-flight —
+    so there is no outcome to record and no traceback to keep;
+    marking it 'failed' would invent a failure that never happened.
+    A row with attempts to spare goes straight back to 'received' for a fresh claim,
+    as if it had never been taken.
+
+    The reclaim is bounded by the same budget as every other retry (requeue_failed),
+    so a message that crashes the whole kernel on each try can't loop across restarts forever:
+    a row that has already spent its attempts is parked in the terminal 'abandoned' instead,
+    with a reason of its own (ORPHAN_ABANDON_REASON) — it has no traceback to carry,
+    but an abandoned row must still say why.
+
+    Both moves are guarded on status = 'working' and split on the attempts test,
+    so a row goes to exactly one of them, the same disjoint shape as requeue_failed / abandon_exhausted.
+    The abandoned ids come back (not just a count) because 'abandoned' is terminal:
+    each one's subscription, if it registered one, is owed the give-up nudge.
+    """
+    requeued = conn.execute(
+        "UPDATE intake SET status = 'received', updated_at = now() "
+        "WHERE status = 'working' AND attempts < %s",
+        (max_attempts,),
+    ).rowcount
+    cursor = conn.execute(
+        "UPDATE intake SET status = 'abandoned', failed_reason = %s, updated_at = now() "
+        "WHERE status = 'working' AND attempts >= %s "
+        "RETURNING id",
+        (ORPHAN_ABANDON_REASON, max_attempts),
+    )
+    return requeued, [row[0] for row in cursor.fetchall()]

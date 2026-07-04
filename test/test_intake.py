@@ -264,6 +264,155 @@ def test_retry_lifecycle_ends_in_abandoned(client):  # bounded retries, then a v
     assert _attempts(message_id) == max_attempts  # tried exactly the budget, never more
 
 
+# --- restart recovery: rows a dead process left mid-work ------------------------------
+
+
+def test_recover_orphaned_requeues_within_budget(client):  # a restart orphan is retried, not failed
+    # A row left 'working' by a dead process, with attempts to spare, goes back to received —
+    # never failed: the kernel fell over, the work didn't, so no failure reason is invented.
+    message_id = _insert()
+    with db.get_pool().connection() as conn:
+        intake.claim_next(conn)  # attempts -> 1, now 'working'
+    with db.get_pool().connection() as conn:
+        requeued, abandoned = intake.recover_orphaned(conn, 3)
+    assert (requeued, abandoned) == (1, [])
+    row = _rows()[0]
+    assert row[2] == "received"  # back in the queue for a fresh claim
+    assert row[6] is None  # no failure reason invented for a process that merely died
+    assert _attempts(message_id) == 1  # recovery doesn't touch the meter; the next claim will
+
+
+def test_recover_orphaned_abandons_when_budget_spent(client):  # a poison message can't loop across restarts
+    # A row caught 'working' whose attempts are already spent is parked in abandoned,
+    # not re-queued — so a message that crashes the kernel every time can't loop forever on restart.
+    message_id = _insert()
+    with db.get_pool().connection() as conn:
+        intake.claim_next(conn)  # attempts -> 1
+    with db.get_pool().connection() as conn:
+        requeued, abandoned = intake.recover_orphaned(conn, 1)  # budget of 1 already spent
+    assert requeued == 0
+    assert abandoned == [message_id]
+    row = _rows()[0]
+    assert row[2] == "abandoned"  # terminal give-up
+    assert row[6] == intake.ORPHAN_ABANDON_REASON  # says why, though it has no traceback to keep
+
+
+def test_recover_orphaned_touches_only_working(client):  # received, answered, failed are out of scope
+    # Recovery is guarded on 'working', so a row in any other state is left exactly as it is —
+    # a failed row keeps its own reason rather than being overwritten by recovery's.
+    answered = _insert("done")  # oldest, claimed first
+    failed = _insert("broke")
+    still_received = _insert("never claimed")  # newest, never claimed
+    with db.get_pool().connection() as conn:
+        a_id, _ = intake.claim_next(conn)
+        assert a_id == answered
+        intake.mark_answered(conn, answered, "x")
+        f_id, _ = intake.claim_next(conn)
+        assert f_id == failed
+        intake.mark_failed(conn, failed, "its own reason")
+    with db.get_pool().connection() as conn:
+        assert intake.recover_orphaned(conn, 3) == (0, [])  # nothing was 'working'
+    by_id = {row[0]: (row[2], row[6]) for row in _rows()}
+    assert by_id[still_received] == ("received", None)
+    assert by_id[answered] == ("answered", None)
+    assert by_id[failed] == ("failed", "its own reason")  # untouched, not overwritten
+
+
+def test_recover_orphaned_splits_by_budget(client):  # one call, both moves, disjoint
+    # In a single recovery, an orphaned working row with budget is re-queued,
+    # while one whose budget is spent is abandoned — the two moves partition the working rows, never overlap.
+    requeued_row = _insert("has budget")  # oldest, claimed first
+    abandoned_row = _insert("out of budget")
+    with db.get_pool().connection() as conn:
+        intake.claim_next(conn)  # requeued_row -> working, attempts 1
+        intake.claim_next(conn)  # abandoned_row -> working, attempts 1
+        # push one past the budget by hand, as re-runs across restarts would
+        conn.execute("UPDATE intake SET attempts = 2 WHERE id = %s", (abandoned_row,))
+    with db.get_pool().connection() as conn:
+        requeued, abandoned = intake.recover_orphaned(conn, 2)  # budget of 2
+    assert requeued == 1
+    assert abandoned == [abandoned_row]
+    by_id = {row[0]: row[2] for row in _rows()}
+    assert by_id[requeued_row] == "received"  # attempts 1 < 2, retried
+    assert by_id[abandoned_row] == "abandoned"  # attempts 2 >= 2, parked
+
+
+# --- delivery confirmation: the reply's "truly out" receipt ---------------------------
+
+
+def _delivered_at(message_id: int):
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT delivered_at FROM intake WHERE id = %s", (message_id,)
+        ).fetchone()[0]
+
+
+def test_mark_delivered_stamps_a_shown_answer(client):  # answered → confirmed out
+    # Once the shell has shown an answer, the kernel stamps delivered_at,
+    # so a produced reply is told apart from one that actually reached the symbiot.
+    message_id = _insert()
+    with db.get_pool().connection() as conn:
+        intake.claim_next(conn)
+        intake.mark_answered(conn, message_id, "the reply")
+    assert _delivered_at(message_id) is None  # produced, but not yet confirmed out
+    with db.get_pool().connection() as conn:
+        assert intake.mark_delivered(conn, [message_id]) == 1
+    assert _delivered_at(message_id) is not None  # now truly out
+
+
+def test_mark_delivered_covers_abandoned(client):  # an abandonment is an outcome too
+    # The shell renders a give-up notice as much as an answer,
+    # so a delivered abandonment is confirmed the same way.
+    message_id = _insert()
+    with db.get_pool().connection() as conn:
+        intake.claim_next(conn)
+        intake.mark_failed(conn, message_id, "kept breaking")
+        intake.abandon_exhausted(conn, 1)  # budget of 1 already spent
+    with db.get_pool().connection() as conn:
+        assert intake.mark_delivered(conn, [message_id]) == 1
+    assert _delivered_at(message_id) is not None
+
+
+def test_mark_delivered_ignores_in_flight(client):  # nothing to confirm until it's settled
+    # A message still in flight has no outcome to have been shown,
+    # so a stray ack for it stamps nothing.
+    message_id = _insert()  # received, never claimed
+    with db.get_pool().connection() as conn:
+        assert intake.mark_delivered(conn, [message_id]) == 0
+    assert _delivered_at(message_id) is None
+
+
+def test_mark_delivered_is_idempotent(client):  # a re-ack changes nothing
+    # A second confirmation of an already-delivered message is a clean no-op,
+    # so the stamp records the first delivery and never drifts.
+    message_id = _insert()
+    with db.get_pool().connection() as conn:
+        intake.claim_next(conn)
+        intake.mark_answered(conn, message_id, "the reply")
+        assert intake.mark_delivered(conn, [message_id]) == 1
+        assert intake.mark_delivered(conn, [message_id]) == 0  # already out, nothing to do
+
+
+def test_answers_delivered_route_confirms_an_answer(client):  # the ack over the wire
+    # The shell POSTs the id it has shown; the kernel rogers back and marks it delivered.
+    message_id = _insert()
+    with db.get_pool().connection() as conn:
+        intake.claim_next(conn)
+        intake.mark_answered(conn, message_id, "the reply")
+    r = client.post("/answers/delivered", json={"ids": [message_id]})
+    assert r.status_code == 200
+    assert r.json()["msg"] == "roger"
+    assert r.json()["data"]["delivered"] == 1
+    assert _delivered_at(message_id) is not None
+
+
+def test_answers_delivered_route_empty_is_a_clean_noop(client):  # nothing to confirm
+    # Nothing shown this pass is not an error — the shell just has nothing to acknowledge.
+    r = client.post("/answers/delivered", json={"ids": []})
+    assert r.status_code == 200
+    assert r.json()["data"]["delivered"] == 0
+
+
 # --- the /answers route: the shell asking what became of a message it captured --------
 
 

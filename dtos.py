@@ -11,6 +11,20 @@ and only get their own DTO class if a second route makes a generic worth it.
 from pydantic import BaseModel, Field
 
 
+class DeliveredRequest(BaseModel):
+    """The message ids the shell is reporting it has shown the outcome of to the symbiot.
+
+    After the shell renders an answer (or an abandonment) it read off /answers, it POSTs the id here,
+    and the kernel stamps delivered_at — the reply's 'truly out' receipt,
+    the honest counterpart on the way back to the outbox's COPY (see the /answers/delivered route).
+    The list may be empty — the shell sometimes has nothing new to confirm —
+    which is a clean no-op rather than a validation error.
+    Capped so a stray client can't ship an unbounded array.
+    """
+
+    ids: list[int] = Field(max_length=1000)
+
+
 # Named for what it carries (a request) rather than the action,
 # so it doesn't collide with the /intake route or the intake() handler.
 class IntakeRequest(BaseModel):

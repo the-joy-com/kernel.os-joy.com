@@ -31,7 +31,7 @@ ANSWER_UNKNOWN = "unknown"  # no message carries that id
 ABANDONED_NOTICE = "no joy"  # the line the shell shows when a message is abandoned — retry budget spent, negative outcome
 COPY = "roger"  # POST /intake — received all your last, durably written down (not the answer, which comes later)
 REPLY = "reply"  # the push nudge's kind for a reply to the symbiot's own message — its outcome rides in status (an ANSWER_* word); the missive's counterpart is TRAFFIC_WAITING
-STANDIN_ANSWER = "received and processed"  # placeholder in data.answer until the kernel has real work to perform
+STANDIN_ANSWER = "good copy"  # placeholder in data.answer until the kernel has real work to perform
 
 # Traffic waiting: unsolicited messages the kernel raises for the symbiot, discovered on open.
 TRAFFIC_WAITING = "traffic waiting"  # GET /inbox — the symbiot's unseen inbound; the messages ride in data.messages
