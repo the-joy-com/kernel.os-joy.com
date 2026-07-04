@@ -45,13 +45,21 @@ POLL_INTERVAL_SECONDS = 1.0
 SWEEP_INTERVAL_SECONDS = 5.0
 
 
-def _produce_reply(message: str) -> str:
-    """The reply to a message.
+def _produce_reply(task: tuple[str, int | None]) -> str:
+    """The reply to a message, given the line and who sent it.
 
     A placeholder: the kernel has nothing real to compute on a message yet,
     so this stands in for the answer until that work exists.
+    But it already answers a recognized symbiot differently from an anonymous caller —
+    the distinction is real and the server draws it, which is what this rung is for;
+    only the wording is a stand-in, and this is the seam the intelligence layer will grow from.
+    task is (message, symbiot_id): symbiot_id is None when the line came in with no live session.
+    It arrives as one tuple because the work runs in a child process (see run_with_deadline), which passes a single arg.
     """
-    return protocol.STANDIN_ANSWER
+    _message, symbiot_id = task
+    if symbiot_id is None:
+        return protocol.STANDIN_ANSWER_ANON
+    return protocol.STANDIN_ANSWER_AUTHED
 
 
 def _process_one() -> bool:
@@ -72,9 +80,9 @@ def _process_one() -> bool:
         claimed = intake.claim_next(conn)
     if claimed is None:
         return False
-    message_id, message = claimed
+    message_id, message, symbiot_id = claimed
     result = execution.run_with_deadline(
-        _produce_reply, message, config.INTAKE_DEADLINE_SECONDS
+        _produce_reply, (message, symbiot_id), config.INTAKE_DEADLINE_SECONDS
     )
     answered = False
     with pool.connection() as conn:

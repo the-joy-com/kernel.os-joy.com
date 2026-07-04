@@ -296,7 +296,11 @@ def inbox_seen(
 
 
 @app.post("/intake")
-def intake(body: IntakeRequest, conn=Depends(db.get_conn)) -> dict:
+def intake(
+    body: IntakeRequest,
+    conn=Depends(db.get_conn),
+    token: str | None = Depends(bearer_token),
+) -> dict:
     # Receive a message, write it down, then acknowledge it.
     # FastAPI validates the body against the DTO;
     # we persist it as one 'received' row *before* answering, so "roger" now means
@@ -308,7 +312,11 @@ def intake(body: IntakeRequest, conn=Depends(db.get_conn)) -> dict:
     # and that whole blob is one message — the kernel doesn't split on a newline it can't trust as a boundary.
     # The count stays a content-free transport diagnostic,
     # telling a live tail whether one POST carried one line or a whole drained queue.
-    message_id = record_message(conn, body.line, body.reply_channel_id)
+    # Read who sent it from the session, now, while the request is in hand:
+    # a live session names the symbiot, its absence is an anonymous line — both welcome, the input layer never gates on auth.
+    # We stamp that on the row so the worker can answer by it later; the shell can't assert identity, only the token proves it.
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    message_id = record_message(conn, body.line, body.reply_channel_id, symbiot_id)
     logs.get("intake").info("intake — %d line(s)", body.line.count("\n") + 1)
     # Hand back the row's id: the batch crossed the wire with no identity of its own,
     # so this is the handle the shell keeps to ask /answers, later, what became of it.

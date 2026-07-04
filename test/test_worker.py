@@ -8,7 +8,10 @@ _process_one directly.
 import db
 import execution
 import intake
+import protocol
 import worker
+
+SEEDED_SYMBIOT_ID = 1  # conftest re-seeds exactly one symbiot with RESTART IDENTITY, so it's always id 1
 
 
 def _state_of(message_id):
@@ -18,9 +21,9 @@ def _state_of(message_id):
         ).fetchone()
 
 
-def _insert(message="a message") -> int:
+def _insert(message="a message", symbiot_id=None) -> int:
     with db.get_pool().connection() as conn:
-        intake.record_message(conn, message)
+        intake.record_message(conn, message, symbiot_id=symbiot_id)
         return conn.execute("SELECT max(id) FROM intake").fetchone()[0]
 
 
@@ -30,8 +33,36 @@ def test_worker_answers_a_received_message(client):
 
     status, answer, failed_reason = _state_of(message_id)
     assert status == "answered"
-    assert answer == worker._produce_reply("hello")  # the produced reply, stored
+    assert answer == worker._produce_reply(("hello", None))  # the produced reply, stored
     assert failed_reason is None  # a success carries no failure reason
+
+
+def test_produce_reply_distinguishes_the_caller(client):
+    # The whole point of this rung: a recognized symbiot and an anonymous caller get different replies,
+    # and it's the kernel that draws the line — the reply turns on symbiot_id, nothing the caller sends.
+    assert worker._produce_reply(("hi", SEEDED_SYMBIOT_ID)) == protocol.STANDIN_ANSWER_AUTHED
+    assert worker._produce_reply(("hi", None)) == protocol.STANDIN_ANSWER_ANON
+
+
+def test_worker_answers_an_authed_line_as_the_symbiot(client):
+    # End to end through the claim: a line stamped with a symbiot is answered with the authed reply,
+    # proving symbiot_id survives record → claim → produce, not just the branch in isolation.
+    message_id = _insert("who am I", symbiot_id=SEEDED_SYMBIOT_ID)
+    assert worker._process_one() is True
+
+    status, answer, _ = _state_of(message_id)
+    assert status == "answered"
+    assert answer == protocol.STANDIN_ANSWER_AUTHED
+
+
+def test_worker_answers_an_anonymous_line_as_a_stranger(client):
+    # The other side of the branch, end to end: a line with no symbiot gets the anonymous reply.
+    message_id = _insert("who am I")  # no symbiot_id — an unauthed line
+    assert worker._process_one() is True
+
+    status, answer, _ = _state_of(message_id)
+    assert status == "answered"
+    assert answer == protocol.STANDIN_ANSWER_ANON
 
 
 def test_worker_idle_when_nothing_waiting(client):

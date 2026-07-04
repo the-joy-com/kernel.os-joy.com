@@ -53,12 +53,31 @@ def test_batch_lands_as_one_message(client):
     assert rows[0][1] == batch  # every line intact, nothing dropped
 
 
+def test_intake_tolerates_a_stale_reply_channel(client):
+    # A browser can carry a reply_channel_id whose channel no longer exists —
+    # its channel was pruned, or the database was reset under a browser that still remembers one.
+    # That dangling id must not crash intake: the line is accepted, it just loses its nudge,
+    # exactly as if the channel had been deleted (ON DELETE SET NULL).
+    r = client.post(
+        "/intake", json={"line": "line with a dead channel", "reply_channel_id": 999999}
+    )
+    assert r.status_code == 200  # not a 500 from a foreign-key violation
+    assert r.json()["msg"] == "roger"
+
+    with db.get_pool().connection() as conn:
+        channel = conn.execute(
+            "SELECT reply_channel_id FROM intake WHERE id = %s",
+            (r.json()["data"]["id"],),
+        ).fetchone()[0]
+    assert channel is None  # the dangling id collapsed to NULL, never stored as a broken reference
+
+
 def test_status_path_received_to_answered(client):
     _insert()
     with db.get_pool().connection() as conn:
         claimed = intake.claim_next(conn)
         assert claimed is not None
-        message_id, _message = claimed
+        message_id, _message, _symbiot = claimed
         assert intake.mark_answered(conn, message_id, "a reply") is True
     row = _rows()[0]
     assert row[2] == "answered"
@@ -68,7 +87,7 @@ def test_status_path_received_to_answered(client):
 def test_status_path_received_to_failed(client):
     _insert()
     with db.get_pool().connection() as conn:
-        message_id, _ = intake.claim_next(conn)
+        message_id, *_ = intake.claim_next(conn)
         assert intake.mark_failed(conn, message_id, "a reason") is True
     row = _rows()[0]
     assert row[2] == "failed"
@@ -124,7 +143,7 @@ def test_one_message_one_terminal_state(client):  # received → working → ans
     # be marked failed, and it can't be answered twice.
     _insert()
     with db.get_pool().connection() as conn:
-        message_id, _ = intake.claim_next(conn)
+        message_id, *_ = intake.claim_next(conn)
         assert intake.mark_answered(conn, message_id, "the reply") is True
         assert intake.mark_failed(conn, message_id, "x") is False  # can't flip an answered row
         assert intake.mark_answered(conn, message_id, "again") is False  # nor answer it twice
@@ -171,9 +190,9 @@ def test_deadline_sweep_touches_only_working(client):  # received and answered a
     working = _insert("hung")  # claimed but never finished
     still_received = _insert("never claimed")  # newest, stays received
     with db.get_pool().connection() as conn:
-        answered_id, _ = intake.claim_next(conn)
+        answered_id, *_ = intake.claim_next(conn)
         assert answered_id == answered
-        working_id, _ = intake.claim_next(conn)
+        working_id, *_ = intake.claim_next(conn)
         assert working_id == working
         intake.mark_answered(conn, answered, "done")
     for message_id in (answered, working, still_received):
@@ -304,10 +323,10 @@ def test_recover_orphaned_touches_only_working(client):  # received, answered, f
     failed = _insert("broke")
     still_received = _insert("never claimed")  # newest, never claimed
     with db.get_pool().connection() as conn:
-        a_id, _ = intake.claim_next(conn)
+        a_id, *_ = intake.claim_next(conn)
         assert a_id == answered
         intake.mark_answered(conn, answered, "x")
-        f_id, _ = intake.claim_next(conn)
+        f_id, *_ = intake.claim_next(conn)
         assert f_id == failed
         intake.mark_failed(conn, failed, "its own reason")
     with db.get_pool().connection() as conn:

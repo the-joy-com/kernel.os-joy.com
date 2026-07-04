@@ -59,7 +59,12 @@ ORPHAN_ABANDON_REASON = (
 # the once-at-startup reconcile of rows a dead process left mid-work.
 # The order mirrors the path the module docstring narrates,
 # so reading top to bottom is reading a message's life start to finish.
-def record_message(conn, message: str, reply_channel_id: int | None = None) -> int:
+def record_message(
+    conn,
+    message: str,
+    reply_channel_id: int | None = None,
+    symbiot_id: int | None = None,
+) -> int:
     """Persist a received message, status 'received', and return its id once it's durable.
 
     Called inside the /intake request's transaction,
@@ -72,10 +77,18 @@ def record_message(conn, message: str, reply_channel_id: int | None = None) -> i
     reply_channel_id, when given, is the channel to notify once this message reaches a terminal outcome —
     the shell passes the id it got from /push/subscribe (its reply channel), so the kernel knows where to send the nudge.
     None (the default) means no one asked to be told: the answer still stands to be read on next open, there's just no nudge.
+    symbiot_id is who sent the line, as the kernel read it from the request's session — None when there's no live session.
+    It's stamped here, at the one moment identity is in hand, so the worker (which has no request) can answer by it later.
+    reply_channel_id is resolved through a subquery rather than inserted raw:
+    a client can carry a stale id (its channel was pruned, or the database was reset out from under a browser that still remembers one),
+    and a raw insert of a dangling foreign key would raise, turning an accepted-by-design line into a 500.
+    The subquery collapses an id that names no live channel to NULL — the same outcome as ON DELETE SET NULL —
+    so a stale channel costs the message its nudge, never its acceptance.
     """
     row = conn.execute(
-        "INSERT INTO intake (message, reply_channel_id) VALUES (%s, %s) RETURNING id",
-        (message, reply_channel_id),
+        "INSERT INTO intake (message, reply_channel_id, symbiot_id) "
+        "VALUES (%s, (SELECT id FROM reply_channel WHERE id = %s), %s) RETURNING id",
+        (message, reply_channel_id, symbiot_id),
     ).fetchone()
     return row[0]
 
@@ -98,10 +111,12 @@ def read_outcome(conn, message_id: int) -> tuple[str, str | None] | None:
     return (row[0], row[1]) if row else None
 
 
-def claim_next(conn) -> tuple[int, str] | None:
+def claim_next(conn) -> tuple[int, str, int | None] | None:
     """Claim the oldest waiting message for work: received → working, atomically.
 
-    Returns (id, message) for the message claimed, or None when none is waiting.
+    Returns (id, message, symbiot_id) for the message claimed, or None when none is waiting.
+    symbiot_id rides along because answering is the worker's job and the reply turns on who sent the line —
+    it was stamped at intake (the one moment identity was in hand), and the claim hands it to the worker.
     The oldest received row is selected and flipped in a single statement, under
     FOR UPDATE SKIP LOCKED, so two workers can never claim the same message —
     a second worker skips the locked row and takes the next one instead.
@@ -115,9 +130,9 @@ def claim_next(conn) -> tuple[int, str] | None:
         "SELECT id FROM intake WHERE status = 'received' "
         "ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"
         ") "
-        "RETURNING id, message"
+        "RETURNING id, message, symbiot_id"
     ).fetchone()
-    return (row[0], row[1]) if row else None
+    return (row[0], row[1], row[2]) if row else None
 
 
 def mark_answered(conn, message_id: int, answer: str) -> bool:
