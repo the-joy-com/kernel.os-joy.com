@@ -134,7 +134,8 @@ def test_notify_pushes_when_a_message_is_answered(client, monkeypatch):
     assert len(sent) == 1
     endpoint, payload = sent[0]
     assert endpoint == "https://push.example/abc"
-    assert payload == {"id": message_id, "status": "answer"}  # id + the shell-facing word
+    # kind names the nudge family; id + the shell-facing status word ride under it
+    assert payload == {"kind": "reply", "id": message_id, "status": "answer"}
 
 
 def test_notify_is_silent_when_push_is_off(client, monkeypatch):

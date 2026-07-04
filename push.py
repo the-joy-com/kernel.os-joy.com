@@ -181,7 +181,11 @@ def notify(pool, message_id: int) -> None:
     if target is None:
         return
     channel_id, endpoint, p256dh, auth, status = target
-    payload = {"id": message_id, "status": _PAYLOAD_STATUS.get(status, status)}
+    payload = {
+        "kind": protocol.REPLY,
+        "id": message_id,
+        "status": _PAYLOAD_STATUS.get(status, status),
+    }
     if _send(endpoint, p256dh, auth, payload):
         with pool.connection() as conn:
             prune_subscription(conn, channel_id)
