@@ -9,6 +9,10 @@ so the whole login flow is exercised end to end without a single network call.
 import os
 import re
 
+import psycopg
+from psycopg import sql
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
 # Point the kernel at the test database and a known symbiot BEFORE importing the app —
 # config.py reads the environment at import time.
 os.environ["DATABASE_URL"] = os.environ.get(
@@ -40,6 +44,29 @@ if not _db_name.endswith("_test"):
         f"refusing to run the test suite against database {_db_name!r}: "
         "its name must end in '_test'. Check DATABASE_URL / TEST_DATABASE_URL."
     )
+
+
+def _ensure_test_database() -> None:
+    # Make the suite self-sufficient: create the test database if it isn't there yet, so a
+    # fresh clone — or a box where joy_test was dropped — just runs `pytest`, no manual
+    # createdb step. Safe because the guard above has already proved the target name ends in
+    # '_test', so this can only ever bring a *test* database into being, never a live one.
+    # The migrations still build the schema inside it (the client fixture's lifespan); this
+    # only ensures the empty database exists for that pool to connect to.
+    # CREATE DATABASE can't run inside a transaction, so we connect to the 'postgres'
+    # maintenance database in autocommit and create only on absence.
+    params = conninfo_to_dict(os.environ["DATABASE_URL"])
+    target = params["dbname"]
+    admin = make_conninfo(**{**params, "dbname": "postgres"})
+    with psycopg.connect(admin, autocommit=True) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s", (target,)
+        ).fetchone()
+        if not exists:
+            conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(target)))
+
+
+_ensure_test_database()
 
 from fastapi.testclient import TestClient
 import pytest
