@@ -68,6 +68,19 @@ class PushSubscriptionRequest(BaseModel):
     keys: PushKeys
 
 
+class SeenRequest(BaseModel):
+    """The inbox message ids the shell is reporting it has shown to the symbiot.
+
+    When the shell surfaces an inbox message it POSTs its id here, and the kernel marks it
+    seen so /inbox stops offering it on the next open (see the /inbox/seen route).
+    The list may be empty: the shell sometimes has nothing new to acknowledge, and that's a
+    clean no-op rather than a validation error.
+    It's capped so a stray client can't ship an unbounded array.
+    """
+
+    ids: list[int] = Field(max_length=1000)
+
+
 class VerifyRequest(BaseModel):
     """A one-time code being spent for a session, and the address it was issued to.
 

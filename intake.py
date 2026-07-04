@@ -18,6 +18,11 @@ this module owns the durable write and the legal moves it makes, not the decidin
 
 One row per request — the message, never the lines inside it.
 The kernel stores what it can honestly stand behind, nothing it would have to guess.
+
+Every row here is the symbiot's, walking the path above.
+A message the kernel raises *for* a symbiot — a nudge, a line relayed from the World —
+is a different thing with a different shape (no question, no walk), so it lives in its own
+table and module (missive.py), not folded into this one.
 """
 
 # The reason recorded when the deadline sweep — not a worker — fails a row.
@@ -66,7 +71,8 @@ def read_outcome(conn, message_id: int) -> tuple[str, str | None] | None:
     A pure read: it takes no lock and moves nothing, so it never contends with a worker.
     """
     row = conn.execute(
-        "SELECT status, answer FROM intake WHERE id = %s", (message_id,)
+        "SELECT status, answer FROM intake WHERE id = %s",
+        (message_id,),
     ).fetchone()
     return (row[0], row[1]) if row else None
 

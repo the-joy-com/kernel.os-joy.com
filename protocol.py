@@ -28,8 +28,12 @@ ANSWER_ABANDONED = "abandoned"  # the kernel tried its budget of times and gave 
 ANSWER_PENDING = "wait out"  # still in flight — received, working, or between retries; ask again, I'll call you back
 ANSWER_READY = "answer"  # answered — the reply is in data.answer
 ANSWER_UNKNOWN = "unknown"  # no message carries that id
+ABANDONED_NOTICE = "no joy"  # the line the shell shows when a message is abandoned — retry budget spent, negative outcome
 COPY = "roger"  # POST /intake — received all your last, durably written down (not the answer, which comes later)
 STANDIN_ANSWER = "received and processed"  # placeholder in data.answer until the kernel has real work to perform
+
+# Traffic waiting: unsolicited messages the kernel raises for the symbiot, discovered on open.
+TRAFFIC_WAITING = "traffic waiting"  # GET /inbox — the symbiot's unseen inbound; the messages ride in data.messages
 
 # Identity: the login handshake and session state.
 AUTHED = "authenticated"  # GET /status — a live session

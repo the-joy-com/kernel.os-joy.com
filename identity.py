@@ -32,6 +32,25 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def authenticated_symbiot_id(conn, token: str | None) -> int | None:
+    """The id of the symbiot a live session names, or None when there's no live one.
+
+    The identity behind a symbiot-scoped route (see /inbox).
+    Where session_status answers the shell's "who am I" in human terms (an email),
+    this returns the internal id the kernel keys a symbiot's own messages on —
+    and returns None for an absent, revoked, or expired token, so a route that reads it
+    is gated on a real session without having to re-check the token's life itself.
+    """
+    if not token:
+        return None
+    row = conn.execute(
+        "SELECT symbiot_id FROM session "
+        "WHERE token_hash = %s AND revoked_at IS NULL AND expires_at > now()",
+        (_hash(token),),
+    ).fetchone()
+    return row[0] if row else None
+
+
 def issue_login_code(conn, address: str, email_client: EmailClient) -> None:
     """Issue a fresh code to a symbiot — but only if `address` matches a registered one.
 

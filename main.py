@@ -23,11 +23,18 @@ import logs
 import protocol
 import push
 import worker
-from dtos import IntakeRequest, LoginRequest, PushSubscriptionRequest, VerifyRequest
+from dtos import (
+    IntakeRequest,
+    LoginRequest,
+    PushSubscriptionRequest,
+    SeenRequest,
+    VerifyRequest,
+)
 
 # The /intake handler is named intake(),
 # so the module is reached by its function rather than imported as `intake` (which the handler would shadow).
 from intake import read_outcome, record_message
+from missive import mark_seen, unseen_for_symbiot
 from email_client import EmailClient, GmailEmailClient
 from rate_limit import RateLimitMiddleware
 
@@ -208,6 +215,44 @@ def health() -> dict:
     return envelope(protocol.OK, {"version": VERSION})
 
 
+@app.get("/inbox")
+def inbox(conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)) -> dict:
+    """A symbiot's unseen inbound messages — the ones it couldn't have discovered on its own.
+
+    The shell learns of an answer to its *own* line from the id it kept at intake, and asks
+    /answers about it. But a message the kernel raises unprompted — a nudge, a line relayed
+    from the World — was never sent from here, so there's no id to have kept; this is where
+    the shell discovers those. Identity-gated on purpose: these messages are addressed to a
+    symbiot, so a caller with no live session is owed nothing and gets an empty list rather
+    than an error (nothing here is an oracle about who's registered or what's waiting).
+    Each message carries its id and body; the shell shows it, then POSTs the ids to
+    /inbox/seen so it isn't offered again.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    messages = (
+        [{"id": mid, "body": body} for mid, body in unseen_for_symbiot(conn, symbiot_id)]
+        if symbiot_id is not None
+        else []
+    )
+    return envelope(protocol.TRAFFIC_WAITING, {"messages": messages})
+
+
+@app.post("/inbox/seen")
+def inbox_seen(
+    body: SeenRequest,
+    conn=Depends(db.get_conn),
+    token: str | None = Depends(bearer_token),
+) -> dict:
+    """Acknowledge inbox messages the shell has shown, so /inbox stops offering them.
+
+    Scoped to the caller's own missives, so an id that isn't theirs changes nothing.
+    A no-op — no session, no ids, or ids already seen — is a clean no-op, never an error.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    seen = mark_seen(conn, symbiot_id, body.ids) if symbiot_id is not None else 0
+    return envelope(protocol.COPY, {"seen": seen})
+
+
 @app.post("/intake")
 def intake(body: IntakeRequest, conn=Depends(db.get_conn)) -> dict:
     # Receive a message, write it down, then acknowledge it.
@@ -268,13 +313,21 @@ def push_key() -> dict:
 
 
 @app.post("/push/subscribe")
-def push_subscribe(body: PushSubscriptionRequest, conn=Depends(db.get_conn)) -> dict:
+def push_subscribe(
+    body: PushSubscriptionRequest,
+    conn=Depends(db.get_conn),
+    token: str | None = Depends(bearer_token),
+) -> dict:
     # Register (or refresh) a browser's push address as a reply channel, and hand back its id —
     # the token the shell then threads through /intake so the kernel knows which channel to nudge when that message settles.
-    # Unauthed, like /intake: the right to be answered is never gated on identity,
+    # Ungated, like /intake: the right to be reachable is never fenced behind identity,
     # and a push address is nothing an attacker gains by planting.
+    # A session, when one is present, ties the channel to that symbiot so the kernel can also
+    # reach them for a missive (a message it raises on its own); without one it stays anonymous
+    # and still serves per-message reply nudges.
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
     channel_id = push.save_subscription(
-        conn, body.endpoint, body.keys.p256dh, body.keys.auth
+        conn, body.endpoint, body.keys.p256dh, body.keys.auth, symbiot_id
     )
     return envelope(protocol.SUBSCRIBED, {"id": channel_id})
 

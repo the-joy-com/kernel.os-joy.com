@@ -47,6 +47,14 @@ _PAYLOAD_STATUS = {
 }
 
 
+# The functions below are ordered by layer, not alphabetically:
+# each is defined above the ones that call it, so reading top to bottom follows the push
+# from its pieces to the whole — the VAPID signer (_vapid) first, then the capability probes
+# a route asks before anything (is_enabled, application_server_key), then the subscription
+# store (save_subscription, prune_subscription), then the private send machinery
+# (_read_target, _send), and finally the two public nudges that compose all of it —
+# notify (one channel, for a settled message) and notify_inbox (every channel, for a missive).
+# Alphabetising would put a caller above the helper it needs; the layering keeps define-before-use.
 def _vapid() -> Vapid02 | None:
     """The signer built from the configured key, or None when push is unconfigured."""
     if not config.VAPID_PRIVATE_KEY:
@@ -72,7 +80,9 @@ def application_server_key() -> str | None:
     return base64.urlsafe_b64encode(point).decode().rstrip("=")
 
 
-def save_subscription(conn, endpoint: str, p256dh: str, auth: str) -> int:
+def save_subscription(
+    conn, endpoint: str, p256dh: str, auth: str, symbiot_id: int | None = None
+) -> int:
     """Store a browser's push address as a reply channel, and return its channel id. Idempotent on the endpoint.
 
     A browser re-subscribing (its keys rotate, the push service migrates it) sends the
@@ -80,12 +90,23 @@ def save_subscription(conn, endpoint: str, p256dh: str, auth: str) -> int:
     in place rather than duplicated, and its id is stable, which matters because that id
     is what the shell threads through /intake to say "notify this channel".
     The row is a reply_channel of kind 'web_push' — the only kind there is today.
+
+    symbiot_id ties the channel to whoever registered it, when that's known — the shell
+    sends its session token with /notify, so a channel registered while logged in belongs
+    to that symbiot and can be reached for a missive (a message the kernel raises on its
+    own). It's optional: a subscribe with no session leaves the channel anonymous, which
+    still serves per-message reply nudges. On a re-subscribe the identity is adopted but
+    never cleared — COALESCE keeps an existing symbiot if this call happens to be anonymous,
+    so an already-linked channel can't be un-linked by a later logged-out refresh.
     """
     row = conn.execute(
-        "INSERT INTO reply_channel (kind, endpoint, p256dh, auth) VALUES ('web_push', %s, %s, %s) "
-        "ON CONFLICT (endpoint) DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth "
+        "INSERT INTO reply_channel (kind, endpoint, p256dh, auth, symbiot_id) "
+        "VALUES ('web_push', %s, %s, %s, %s) "
+        "ON CONFLICT (endpoint) DO UPDATE SET "
+        "p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth, "
+        "symbiot_id = COALESCE(EXCLUDED.symbiot_id, reply_channel.symbiot_id) "
         "RETURNING id",
-        (endpoint, p256dh, auth),
+        (endpoint, p256dh, auth, symbiot_id),
     ).fetchone()
     return row[0]
 
@@ -164,3 +185,35 @@ def notify(pool, message_id: int) -> None:
     if _send(endpoint, p256dh, auth, payload):
         with pool.connection() as conn:
             prune_subscription(conn, channel_id)
+
+
+def notify_inbox(pool, symbiot_id: int) -> None:
+    """Nudge every channel a symbiot has, that a missive is waiting in their inbox.
+
+    Called when the kernel raises a missive (see missive.deliver). This is the missive's
+    counterpart to notify(): where notify() nudges the one channel a message named, this
+    fans out to all of a symbiot's channels, because a missive was addressed to the symbiot,
+    not tied to any single request.
+    The payload carries no id and no text — only a content-free "traffic waiting". A
+    missive's body never rides the third-party push service (the same rule notify() keeps);
+    the shell wakes on the nudge and reads the real messages from the authed /inbox.
+    Best-effort like every push: a no-op when push is off or the symbiot has no channel,
+    it runs its sends outside any transaction, never raises into its caller, and prunes any
+    channel the push service reports dead.
+    """
+    if not is_enabled():
+        return
+    with pool.connection() as conn:
+        channels = conn.execute(
+            "SELECT id, endpoint, p256dh, auth FROM reply_channel WHERE symbiot_id = %s",
+            (symbiot_id,),
+        ).fetchall()
+    dead = [
+        channel_id
+        for channel_id, endpoint, p256dh, auth in channels
+        if _send(endpoint, p256dh, auth, {"kind": protocol.TRAFFIC_WAITING})
+    ]
+    if dead:
+        with pool.connection() as conn:
+            for channel_id in dead:
+                prune_subscription(conn, channel_id)

@@ -76,7 +76,7 @@ def clean_db(client):
     with pool.connection() as conn:
         _assert_test_database(conn)
         conn.execute(
-            "TRUNCATE symbiot, login_code, session, intake, reply_channel "
+            "TRUNCATE symbiot, login_code, session, intake, missive, reply_channel "
             "RESTART IDENTITY CASCADE"
         )
         conn.execute("INSERT INTO symbiot (email) VALUES (%s)", (SYMBIOT_EMAIL,))
