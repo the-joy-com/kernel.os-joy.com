@@ -29,6 +29,15 @@ this module owns the durable write and the legal moves it makes, not the decidin
 One row per request — the message, never the lines inside it.
 The kernel stores what it can honestly stand behind, nothing it would have to guess.
 
+This table is the symbiot's diary of record, and the raw words in it are kept under two
+guarantees the database itself enforces (migration 0008), not ones a caller has to remember:
+the message text is immutable — no update may rewrite it — and a row is never deleted.
+So what the symbiot said is kept verbatim and kept forever; only the work-state around it
+(status, answer, attempts, the timestamps) moves as the message walks toward its outcome.
+And nothing derivable from the words is stored beside them — tags, slices, classifications
+are recomputed on read, never kept as a second source of truth (pinned by a test, since it's
+a rule about what must never be added rather than something the schema can state on its own).
+
 Every row here is the symbiot's, walking the path above.
 A message the kernel raises *for* a symbiot — a nudge, a line relayed from the World —
 is a different thing with a different shape (no question, no walk), so it lives in its own

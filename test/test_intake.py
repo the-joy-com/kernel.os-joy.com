@@ -5,8 +5,11 @@ write and the state machine — not the wire.
 The live round trip (a real POST landing a real row) is proven separately, by hand.
 """
 
-import intake
+import psycopg
+import pytest
+
 import db
+import intake
 
 
 def _rows():
@@ -472,3 +475,72 @@ def test_answers_unknown_for_a_missing_id(client):
     body = client.get("/answers?id=999999").json()
     assert body["msg"] == "unknown"
     assert body["data"]["id"] == 999999
+
+
+# --- the diary bedrock: the words are verbatim, immutable, and never deleted -----------
+
+
+def test_message_cannot_be_edited(client):  # verbatim, now enforced by the database
+    # A stored message's text is immutable: the words the symbiot handed over are kept
+    # exactly, and the database refuses any update that would rewrite them — so "keep the
+    # words verbatim" no longer rests on no caller happening to touch the column.
+    message_id = _insert("the exact words")
+    with pytest.raises(psycopg.errors.RaiseException):
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE intake SET message = %s WHERE id = %s", ("rewritten", message_id)
+            )
+    assert _rows()[0][1] == "the exact words"  # untouched, the edit refused
+
+
+def test_intake_row_cannot_be_deleted(client):  # forever, now enforced by the database
+    # A message is walked to a terminal state, never erased: the diary keeps every entry
+    # forever, so the database refuses to delete an intake row outright.
+    message_id = _insert("kept forever")
+    with pytest.raises(psycopg.errors.RaiseException):
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM intake WHERE id = %s", (message_id,))
+    assert len(_rows()) == 1  # still there, the delete refused
+
+
+def test_transitions_leave_the_words_untouched(client):  # the guard binds words, not the walk
+    # The immutability guard binds only the words. The message's walk to an answer —
+    # claim, then answer — moves status and stores the reply as ever, and the line it
+    # started with is unchanged: the guard fires on a rewrite, never on a legitimate move.
+    message_id = _insert("the original line")
+    with db.get_pool().connection() as conn:
+        intake.claim_next(conn)
+        assert intake.mark_answered(conn, message_id, "a reply") is True
+    row = _rows()[0]
+    assert row[1] == "the original line"  # words verbatim through the whole walk
+    assert row[2] == "answered"  # yet the transition still landed
+    assert row[5] == "a reply"
+
+
+def test_intake_stores_only_raw_words_and_work_state(client):  # derived ≠ stored, tripwired
+    # The diary keeps the raw words and the work-state that walks them to an answer, and
+    # nothing else. Anything reconstructable from the words (tags, slices, classifications,
+    # a normalized copy) is recomputed on read, never kept as a second source of truth.
+    # This pins the allowed columns, so the day someone reaches to store a derived value
+    # beside the words it fails here and forces the deliberate "recompute on read" choice.
+    with db.get_pool().connection() as conn:
+        columns = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'intake'"
+            ).fetchall()
+        }
+    assert columns == {
+        "id",
+        "message",  # the raw words — verbatim, immutable, the one source of truth
+        "status",
+        "answer",
+        "failed_reason",
+        "attempts",
+        "created_at",
+        "updated_at",
+        "reply_channel_id",
+        "delivered_at",
+        "symbiot_id",
+    }
