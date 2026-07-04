@@ -23,6 +23,11 @@ class IntakeRequest(BaseModel):
     """
 
     line: str = Field(min_length=1, max_length=4096)
+    # Which reply channel to nudge once this message has an answer,
+    # if the browser registered one (see /push/subscribe).
+    # Optional — a message with no channel still gets answered,
+    # it just arrives with no one to notify.
+    reply_channel_id: int | None = None
 
 
 class LoginRequest(BaseModel):
@@ -36,6 +41,31 @@ class LoginRequest(BaseModel):
     """
 
     address: str = Field(max_length=320)
+
+
+class PushKeys(BaseModel):
+    """The client key material a push payload is encrypted against.
+
+    Both come straight from the browser's PushSubscription — p256dh is its public key, auth its secret —
+    and together they let only that browser decrypt what the kernel sends.
+    Capped well above their real base64url length as a stray-input guard.
+    """
+
+    auth: str = Field(min_length=1, max_length=256)
+    p256dh: str = Field(min_length=1, max_length=256)
+
+
+class PushSubscriptionRequest(BaseModel):
+    """A browser registering where the kernel can push it a settled-message nudge.
+
+    This mirrors a browser's PushSubscription exactly, so the shell forwards it as-is:
+    the push-service endpoint, plus the keys a payload is encrypted against.
+    The endpoint's length cap is generous — push-service URLs are long and opaque —
+    just a guard against an unbounded body, not a real rule about length.
+    """
+
+    endpoint: str = Field(min_length=1, max_length=2048)
+    keys: PushKeys
 
 
 class VerifyRequest(BaseModel):

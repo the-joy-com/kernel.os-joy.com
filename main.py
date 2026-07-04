@@ -2,7 +2,7 @@
 
 It exposes a small HTTP surface, every response in one envelope:
 GET /health is the round trip the shell's connectivity dot probes;
-POST /intake takes a line off the shell's prompt and answers "copy",
+POST /intake takes a line off the shell's prompt and answers "roger",
 the channel by which content crosses the wire;
 and the /login, /login/verify, /status, /logout routes are identity —
 a one-time code emailed to a registered symbiot, spent for a session.
@@ -10,6 +10,7 @@ The privileged work — the buffer, the Dead Man's Switch —
 layers on top of these round trips, never beside them.
 """
 
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header
@@ -19,7 +20,14 @@ import config
 import db
 import identity
 import logs
-from dtos import IntakeRequest, LoginRequest, VerifyRequest
+import protocol
+import push
+import worker
+from dtos import IntakeRequest, LoginRequest, PushSubscriptionRequest, VerifyRequest
+
+# The /intake handler is named intake(),
+# so the module is reached by its function rather than imported as `intake` (which the handler would shadow).
+from intake import read_outcome, record_message
 from email_client import EmailClient, GmailEmailClient
 from rate_limit import RateLimitMiddleware
 
@@ -39,7 +47,44 @@ async def lifespan(app: FastAPI):
     # Migrations are idempotent, so this is safe on every boot.
     db.open_pool(config.DATABASE_URL)
     db.migrate_and_seed(db.get_pool(), config.SYMBIOT_EMAIL)
+    # Start the intake workers — the background loop that answers received messages.
+    # A small pool, not one: a single slow or wedged message must not block every message behind it,
+    # so several workers drain the queue in parallel (claim_next is race-safe, so they never grab the same message).
+    # Alongside them, one reconcile sweep settles the rows a worker can't:
+    # it fails a message stuck in 'working' past the ceiling,
+    # re-queues a 'failed' one that still has attempts left,
+    # and parks a spent one in 'abandoned' —
+    # so every message reaches a terminal outcome, retried a bounded number of times along the way.
+    # Threads, not asyncio tasks: the database work is synchronous and would block the event loop the API runs on.
+    # Disabled under test, where the suite drives the state machine by hand.
+    worker_stop = threading.Event()
+    worker_threads = []
+    if config.WORKER_ENABLED:
+        for n in range(config.WORKER_CONCURRENCY):
+            thread = threading.Thread(
+                target=worker.run,
+                args=(worker_stop,),
+                name=f"intake-worker-{n}",
+                daemon=True,
+            )
+            thread.start()
+            worker_threads.append(thread)
+        # One reconcile sweep beside the pool — not another worker.
+        # On a fixed cadence it fails messages stuck in 'working' past the deadline,
+        # re-queues 'failed' ones that still have attempts, and parks the rest in 'abandoned',
+        # so every row reaches a terminal outcome without a worker waiting between retries.
+        sweep = threading.Thread(
+            target=worker.run_reconcile_sweep,
+            args=(worker_stop,),
+            name="intake-reconcile-sweep",
+            daemon=True,
+        )
+        sweep.start()
+        worker_threads.append(sweep)
     yield
+    worker_stop.set()
+    for thread in worker_threads:
+        thread.join(timeout=5)
     db.close_pool()
 
 
@@ -107,10 +152,9 @@ def bearer_token(authorization: str | None = Header(default=None)) -> str | None
 
 # --- routes ---------------------------------------------------------------
 
-# The one reply /login ever gives —
-# identical for a known address, an unknown one, or a recipient-smuggling string —
-# so it's no oracle for who's registered.
-LOGIN_REPLY = "if that address is registered, a login code is on its way"
+# Every `msg` a route returns is a token from protocol.py — the one catalog of what the
+# kernel says to the shell — so the wire's vocabulary lives in one place, not scattered
+# one literal per handler.
 
 
 @app.get("/")
@@ -118,7 +162,42 @@ def root() -> dict:
     # A name on the door:
     # anyone landing at the bare host gets a legible word back rather than a 404,
     # still inside the one envelope.
-    return envelope("the ghost in the shell", {"version": VERSION})
+    return envelope(protocol.GREETING, {"version": VERSION})
+
+
+@app.get("/answers")
+def answers(id: int, conn=Depends(db.get_conn)) -> dict:
+    """Report what became of a message — the read half of the /intake round trip.
+
+    When the shell sends a line, /intake writes it down and hands back an id.
+    That's all the shell gets at first: an acknowledgement, not a reply,
+    because the answer is computed afterward by a worker and isn't ready yet.
+    So the shell holds onto the id and comes back here to ask "is it done, and how did it end?" —
+    on next open, and while a message is in flight, until it settles.
+
+    The reply is one of four words the shell knows how to act on (see protocol.py):
+      answer    — it's done; the reply text rides along in data.answer.
+      abandoned — the kernel tried its budget of times and gave up; said plainly, never left silent.
+      wait out  — still in flight (received, working, or between retries); ask again later.
+      unknown   — no message carries that id.
+    The kernel's own state machine has more states than these,
+    but the shell only needs to know settled-or-not and, if settled, which way —
+    so the in-flight states collapse to the single "wait out".
+
+    The id is a bare correlation handle: the kernel never echoes back the line the symbiot sent,
+    so an answer crosses the wire as itself, for the shell to show on its own terms.
+    And a failed message's stored traceback never crosses either —
+    read_outcome can see it, but it stays the kernel's own diagnostic, not the symbiot's to read.
+    """
+    outcome = read_outcome(conn, id)
+    if outcome is None:
+        return envelope(protocol.ANSWER_UNKNOWN, {"id": id})
+    status, answer = outcome
+    if status == "answered":
+        return envelope(protocol.ANSWER_READY, {"id": id, "answer": answer})
+    if status == "abandoned":
+        return envelope(protocol.ANSWER_ABANDONED, {"id": id})
+    return envelope(protocol.ANSWER_PENDING, {"id": id})
 
 
 @app.get("/health")
@@ -126,22 +205,27 @@ def health() -> dict:
     # The simplest possible round trip:
     # a reachable network with a dead kernel must read offline;
     # only a real 200 from here flips it green.
-    return envelope("ok", {"version": VERSION})
+    return envelope(protocol.OK, {"version": VERSION})
 
 
 @app.post("/intake")
-def intake(body: IntakeRequest) -> dict:
-    # Receive a line and acknowledge it.
-    # FastAPI validates the body against the DTO.
-    # We read it only to log a timestamped, content-free receipt — the line
-    # count, never the text — then drop it: "copy" means *The Joy received it*,
-    # not that it kept it. A reconnect arrives as one batch (the outbox joins its
-    # queued lines with newlines), so the count tells a live tail whether one
-    # POST carried one line or a whole drained queue.
-    # Holding the line in the buffer is a separate concern that layers on top of this round trip,
-    # never ahead of it.
+def intake(body: IntakeRequest, conn=Depends(db.get_conn)) -> dict:
+    # Receive a message, write it down, then acknowledge it.
+    # FastAPI validates the body against the DTO;
+    # we persist it as one 'received' row *before* answering, so "roger" now means
+    # *The Joy has it, durably* — not "saw it and dropped it", as it did before.
+    # The write commits in lockstep with this response (db.get_conn commits the request's transaction on success),
+    # so the acknowledgement can never outrun the durable record behind it.
+    # One row per request, never the lines within: a reconnect arrives as one batch
+    # (the outbox joins its queued lines with newlines),
+    # and that whole blob is one message — the kernel doesn't split on a newline it can't trust as a boundary.
+    # The count stays a content-free transport diagnostic,
+    # telling a live tail whether one POST carried one line or a whole drained queue.
+    message_id = record_message(conn, body.line, body.reply_channel_id)
     logs.get("intake").info("intake — %d line(s)", body.line.count("\n") + 1)
-    return envelope("copy")
+    # Hand back the row's id: the batch crossed the wire with no identity of its own,
+    # so this is the handle the shell keeps to ask /answers, later, what became of it.
+    return envelope(protocol.COPY, {"id": message_id})
 
 
 @app.post("/login")
@@ -154,26 +238,50 @@ def login(
     # the reply never reveals whether that happened,
     # so an attacker learns nothing about who's registered.
     identity.issue_login_code(conn, body.address, email_client)
-    return envelope(LOGIN_REPLY)
+    return envelope(protocol.LOGIN_SENT)
 
 
 @app.post("/login/verify")
 def login_verify(body: VerifyRequest, conn=Depends(db.get_conn)) -> dict:
     token = identity.verify_login_code(conn, body.address, body.code)
     if token is None:
-        return envelope("that code didn't work — try again", None)
+        return envelope(protocol.LOGIN_FAILED, None)
     status = identity.session_status(conn, token)
-    return envelope("logged in", {"token": token, "email": status["email"]})
+    return envelope(protocol.LOGGED_IN, {"token": token, "email": status["email"]})
 
 
 @app.post("/logout")
-def logout(conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)) -> dict:
+def logout(
+    conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)
+) -> dict:
     # Idempotent: no token, or a token already revoked, is a clean no-op.
     identity.logout(conn, token)
-    return envelope("logged out", {"authed": False})
+    return envelope(protocol.LOGGED_OUT, {"authed": False})
+
+
+@app.get("/push/key")
+def push_key() -> dict:
+    # The public application server key the shell subscribes with.
+    # Null when push is unconfigured — the shell reads that as "no push here" and falls back to poll-on-open,
+    # so a kernel without a VAPID key still serves answers, just without the nudge.
+    return envelope(protocol.PUSH_KEY, {"key": push.application_server_key()})
+
+
+@app.post("/push/subscribe")
+def push_subscribe(body: PushSubscriptionRequest, conn=Depends(db.get_conn)) -> dict:
+    # Register (or refresh) a browser's push address as a reply channel, and hand back its id —
+    # the token the shell then threads through /intake so the kernel knows which channel to nudge when that message settles.
+    # Unauthed, like /intake: the right to be answered is never gated on identity,
+    # and a push address is nothing an attacker gains by planting.
+    channel_id = push.save_subscription(
+        conn, body.endpoint, body.keys.p256dh, body.keys.auth
+    )
+    return envelope(protocol.SUBSCRIBED, {"id": channel_id})
 
 
 @app.get("/status")
-def status(conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)) -> dict:
+def status(
+    conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)
+) -> dict:
     st = identity.session_status(conn, token)
-    return envelope("authed" if st["authed"] else "not logged in", st)
+    return envelope(protocol.AUTHED if st["authed"] else protocol.NOT_AUTHED, st)

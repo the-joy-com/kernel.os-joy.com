@@ -72,3 +72,50 @@ RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").strip().lower() not
     "no",
     "off",
 )
+
+# The intake worker (worker.py): the background loop that answers received messages.
+# On by default; the test suite turns it off so it can't race the suite for received
+# rows while the state machine is driven by hand.
+WORKER_ENABLED = os.getenv("WORKER_ENABLED", "true").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+# How many workers run at once.
+# More than one so a single slow or wedged message can't block every message behind it —
+# the others keep draining the queue.
+# When a worker claims a message it locks that row, 
+# and any other worker reaching for it steps over the locked row to the next free one — 
+# so two workers never take the same message.
+# Kept well under the connection pool's size so workers can't starve the API of connections.
+WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "4"))
+
+# The hard ceiling on how long a message's work may run before it is failed.
+# This is what kills dead loops and hangs: no message runs forever, every one reaches an outcome.
+# It bounds both layers of the timeout —
+# the worker kills its own work process at this deadline (execution.run_with_deadline),
+# and the deadline sweep fails any row still 'working' past it as the backstop (worker.run_deadline_sweep).
+# Five minutes is generous for the placeholder work today and a sane default for the real work to come;
+# tune it per the slowest honest job.
+INTAKE_DEADLINE_SECONDS = float(os.getenv("INTAKE_DEADLINE_SECONDS", "300"))
+
+# How many times a message may be attempted before the kernel gives up and parks it in 'abandoned'.
+# A failing message is retried — a transient hiccup shouldn't be a death sentence —
+# but only a bounded number of times, so the retrying itself can't become a new way to loop forever.
+# Counts total attempts, not retries: 3 means one try and two more.
+MAX_INTAKE_ATTEMPTS = int(os.getenv("MAX_INTAKE_ATTEMPTS", "3"))
+
+# Web Push (VAPID): the signing key for the kernel's reply channel —
+# the notification it sends the shell when a message reaches a terminal outcome (answered or abandoned).
+# The private key is the raw 32-octet scalar in base64url;
+# the public application server key the browser subscribes with is derived from it at runtime (push.py),
+# so only the private half is configured here.
+# Unset means push is simply off: answers still store and /answers still serves them,
+# only the out-of-band nudge is skipped —
+# so a missing key degrades the reply channel to poll-on-open rather than breaking anything.
+VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
+# A contact URI (mailto: or https:) the push service can reach the app owner at, sent in
+# every push's VAPID claims. Ignored when there's no key to sign with.
+VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "").strip()

@@ -6,6 +6,56 @@ The kernel — the privileged core behind `kernel.os-joy.com`. The server-side c
 
 It exposes a small HTTP surface: a health probe the shell's connectivity dot reads, a name on the door at `/`, a line-intake endpoint, the identity routes (`/login`, `/login/verify`, `/status`, `/logout`), and auto-generated API docs — see [Routes](#routes) below. Every response wears the same [envelope](#api-response-envelope). State lives in **Postgres**, reached over [psycopg](https://www.psycopg.org/) with **no ORM** — see [Database & migrations](#database--migrations).
 
+## Install & run (local)
+
+Prerequisite: [`uv`](https://docs.astral.sh/uv/getting-started/installation/) installed and on your `PATH`.
+
+The virtualenv is named `venv` (not uv's default `.venv`). uv reads its location from `UV_PROJECT_ENVIRONMENT`, so export that first — every `uv` command below then targets `venv/`:
+
+```bash
+export UV_PROJECT_ENVIRONMENT=venv
+```
+
+1. **Create the virtualenv and install the pinned deps** (exact versions from `uv.lock`):
+
+   ```bash
+   uv sync
+   ```
+
+2. **Start Postgres and create your `.env`:**
+
+   ```bash
+   docker compose up -d        # local Postgres on :5432
+   cp .env.example .env        # then fill in SYMBIOT_EMAIL, KERNEL_SECRET (see Configuration)
+   ```
+
+   The default `DATABASE_URL` already points at this docker-compose Postgres, so a plain clone needs no edits to connect.
+
+3. **Run the kernel locally** — uvicorn bound to localhost:
+
+   ```bash
+   uv run uvicorn main:app --host 127.0.0.1 --port 9713 --reload
+   ```
+
+   (`--reload` is for development; drop it in production.) Migrations and the symbiot seed run automatically on startup against `DATABASE_URL`.
+
+4. **Confirm the round trip:**
+
+   ```bash
+   curl http://127.0.0.1:9713/health
+   # {"msg":"loud and clear","data":{"version":"0.0.1"}}
+   ```
+
+## Managing dependencies
+
+```bash
+uv add <package>            # add a dependency (updates pyproject.toml + uv.lock)
+uv remove <package>         # drop one
+uv sync                     # bring venv in line with uv.lock
+```
+
+Commit `pyproject.toml` and `uv.lock`; never commit `venv/`.
+
 ## API response envelope
 
 Every response the kernel returns wears the same shape:
@@ -14,13 +64,13 @@ Every response the kernel returns wears the same shape:
 { "msg": "string", "data": null }
 ```
 
-- `msg` — a human-legible line about what happened (`"ok"`, an error reason, a status word).
+- `msg` — a human-legible line about what happened (`"loud and clear"`, an error reason, a status word).
 - `data` — the payload to act on: a JSON array, a JSON object, or `null` when there's nothing to carry.
 
 So `GET /health` answers:
 
 ```json
-{ "msg": "ok", "data": { "version": "0.0.1" } }
+{ "msg": "loud and clear", "data": { "version": "0.0.1" } }
 ```
 
 ## Routes
@@ -28,12 +78,12 @@ So `GET /health` answers:
 | Method & path | What it answers |
 | --- | --- |
 | `GET /` | A name on the door — `{ "msg": "the ghost in the shell", "data": { "version": "0.0.1" } }` — so the bare host is legible instead of a 404. |
-| `GET /health` | The probe the shell's connectivity dot reads — `{ "msg": "ok", "data": { "version": "0.0.1" } }`. |
-| `POST /intake` | Takes one line off the shell's prompt — body `{ "line": "<text>" }` — and acknowledges it with `{ "msg": "copy", "data": null }`. `"copy"` means *received*, not *stored*: the line is dropped (holding it in the buffer is a separate concern that layers on top of this round trip). The `line` is required, non-empty, and capped at 4096 chars; anything else is a `422`. The request shape is validated by the `IntakeRequest` DTO in [`dtos.py`](./dtos.py). |
+| `GET /health` | The probe the shell's connectivity dot reads — `{ "msg": "loud and clear", "data": { "version": "0.0.1" } }`. |
+| `POST /intake` | Takes one line off the shell's prompt — body `{ "line": "<text>" }` — and acknowledges it with `{ "msg": "roger", "data": null }`. `"roger"` means *received*, not *stored*: the line is dropped (holding it in the buffer is a separate concern that layers on top of this round trip). The `line` is required, non-empty, and capped at 4096 chars; anything else is a `422`. The request shape is validated by the `IntakeRequest` DTO in [`dtos.py`](./dtos.py). |
 | `POST /login` | Body `{ "address": "<email>" }`. Issues a one-time code **only** on an exact match to a registered symbiot, emailing it to them; otherwise does nothing. The reply is **identical either way** — `{ "msg": "if that address is registered, a login code is on its way", "data": null }` — so it's no oracle for who's registered (an unknown address, a blank one, and a recipient-smuggling string all get the same answer, and never an email). |
 | `POST /login/verify` | Body `{ "address": "<email>", "code": "<code>" }`. Spends a valid (unconsumed, unexpired, latest-issued) code for that address's session: `{ "msg": "logged in", "data": { "token": "…", "email": "…" } }`. A wrong code answers `{ "msg": "that code didn't work — try again", "data": null }` and leaves the caller unauthed, free to retry. The address names whose code the guess is charged against: after `MAX_VERIFY_ATTEMPTS` wrong tries the database burns that code (see [Rate limiting & abuse](#rate-limiting--abuse)). |
 | `GET /status` | Reads `Authorization: Bearer <token>`. Reports `{ "data": { "authed": true, "email": "…" } }` for a live session, else `{ "data": { "authed": false, "email": null } }`. |
-| `POST /logout` | Reads `Authorization: Bearer <token>` and revokes that session. Idempotent — no token, or an already-revoked one, is a clean no-op: `{ "msg": "logged out", "data": { "authed": false } }`. |
+| `POST /logout` | Reads `Authorization: Bearer <token>` and revokes that session. Idempotent — no token, or an already-revoked one, is a clean no-op: `{ "msg": "out", "data": { "authed": false } }`. |
 | `GET /docs` | Interactive API docs (Swagger UI), generated for free by FastAPI from the route signatures. `GET /redoc` and the raw `GET /openapi.json` come along with it. |
 
 ## CORS
@@ -137,59 +187,11 @@ The suite ([`test/`](./test)) is one assertion-per-behaviour over the identity f
 - **[Postgres](https://www.postgresql.org/)** via **[psycopg 3](https://www.psycopg.org/)** (no ORM); migrations are plain SQL run at startup
 - **[uv](https://docs.astral.sh/uv/)** for dependency + virtualenv management (deps pinned in `uv.lock`)
 
-## Install & run (local)
-
-Prerequisite: [`uv`](https://docs.astral.sh/uv/getting-started/installation/) installed and on your `PATH`.
-
-The virtualenv is named `venv` (not uv's default `.venv`). uv reads its location from `UV_PROJECT_ENVIRONMENT`, so export that first — every `uv` command below then targets `venv/`:
-
-```bash
-export UV_PROJECT_ENVIRONMENT=venv
-```
-
-1. **Create the virtualenv and install the pinned deps** (exact versions from `uv.lock`):
-
-   ```bash
-   uv sync
-   ```
-
-2. **Start Postgres and create your `.env`:**
-
-   ```bash
-   docker compose up -d        # local Postgres on :5432
-   cp .env.example .env        # then fill in SYMBIOT_EMAIL, KERNEL_SECRET (see Configuration)
-   ```
-
-   The default `DATABASE_URL` already points at this docker-compose Postgres, so a plain clone needs no edits to connect.
-
-3. **Run the kernel locally** — uvicorn bound to localhost:
-
-   ```bash
-   uv run uvicorn main:app --host 127.0.0.1 --port 9713 --reload
-   ```
-
-   (`--reload` is for development; drop it in production.) Migrations and the symbiot seed run automatically on startup against `DATABASE_URL`.
-
-4. **Confirm the round trip:**
-
-   ```bash
-   curl http://127.0.0.1:9713/health
-   # {"msg":"ok","data":{"version":"0.0.1"}}
-   ```
-
-## Managing dependencies
-
-```bash
-uv add <package>            # add a dependency (updates pyproject.toml + uv.lock)
-uv remove <package>         # drop one
-uv sync                     # bring venv in line with uv.lock
-```
-
-Commit `pyproject.toml` and `uv.lock`; never commit `venv/`.
-
 ## Deploy
 
 The kernel runs on a server as a **systemd unit** — uvicorn bound to `127.0.0.1:9713` — behind **nginx** as a reverse proxy for `kernel.os-joy.com`, with TLS terminated by a **certbot** certificate. The uvicorn port is never exposed to the internet directly; nginx is the only door.
+
+**One uvicorn process, on purpose — do not add `--workers`.** The intake worker pool and the reconcile sweep are background *threads* started inside the single app process (see the lifespan in `main.py`), not uvicorn process workers. Tune their concurrency with `WORKER_CONCURRENCY` (config default 4), never with uvicorn's `--workers`: forking N uvicorn processes would give each its own pool *and* its own reconcile sweep — N redundant sweeps and N×`WORKER_CONCURRENCY` threads all racing the same queue. It stays correct (claims are race-safe, moves are guarded) but it's wasteful and not the intent.
 
 Deployment is by hand from a clone of this repo on the box. **The Joy's apps all live under `~/apps` on the server** — this clone must sit at `~/apps/kernel.os-joy.com`, because the systemd unit resolves the working directory and the venv from that path. Every deploy is one command:
 

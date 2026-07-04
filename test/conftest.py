@@ -21,6 +21,25 @@ os.environ["KERNEL_SECRET"] = "test-secret"
 # The interval has its own focused test that turns it back on (monkeypatching config),
 # where it's the thing under test.
 os.environ["LOGIN_REISSUE_INTERVAL_SECONDS"] = "0"
+# The intake worker would race the suite for received rows;
+# the tests drive the state machine by hand, so the live loop stays off.
+os.environ["WORKER_ENABLED"] = "0"
+# Web push stays off unless a test opts in (by monkeypatching config), so no test can reach a real push service —
+# even though a dev .env might carry a VAPID key, this pins it empty
+# (load_dotenv won't override an env var already set, blank or not).
+os.environ["VAPID_PRIVATE_KEY"] = ""
+
+
+# The front-door lock: refuse a non-test database before the app is even imported,
+# so its startup can't migrate or seed a live kernel on the way in.
+# (The truncate fixture below holds a second, independent lock — it re-checks the
+# *connected* database's own name right before wiping, trusting nothing about the URL.)
+_db_name = os.environ["DATABASE_URL"].split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+if not _db_name.endswith("_test"):
+    raise RuntimeError(
+        f"refusing to run the test suite against database {_db_name!r}: "
+        "its name must end in '_test'. Check DATABASE_URL / TEST_DATABASE_URL."
+    )
 
 from fastapi.testclient import TestClient
 import pytest
@@ -34,13 +53,32 @@ SYMBIOT_EMAIL = "symbiot@example.com"
 _CODE_RE = re.compile(r"\b(\d{6})\b")
 
 
+def _assert_test_database(conn) -> None:
+    # The one hard stop between the suite and a live database.
+    # The fixtures here TRUNCATE before every test, so running them against the real kernel would empty it mid-use.
+    # We don't trust the URL to be the test one — a URL is editable and easy to get wrong —
+    # we ask the *connected* database its own name and refuse unless it ends in '_test' (the suffix config guarantees).
+    # Coupled to the wipe on purpose: the truncate can't run without passing this.
+    name = conn.execute("SELECT current_database()").fetchone()[0]
+    if not name.endswith("_test"):
+        raise RuntimeError(
+            f"refusing to run destructive tests against {name!r}: "
+            "the test database name must end in '_test'. "
+            "Check DATABASE_URL / TEST_DATABASE_URL before retrying."
+        )
+
+
 @pytest.fixture(autouse=True)
 def clean_db(client):
     # A clean slate before every test:
-    # wipe all three tables, re-seed the one symbiot.
+    # wipe every table, re-seed the one symbiot.
     pool = db.get_pool()
     with pool.connection() as conn:
-        conn.execute("TRUNCATE symbiot, login_code, session RESTART IDENTITY CASCADE")
+        _assert_test_database(conn)
+        conn.execute(
+            "TRUNCATE symbiot, login_code, session, intake, reply_channel "
+            "RESTART IDENTITY CASCADE"
+        )
         conn.execute("INSERT INTO symbiot (email) VALUES (%s)", (SYMBIOT_EMAIL,))
     yield
 
