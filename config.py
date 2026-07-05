@@ -47,6 +47,21 @@ KERNEL_SECRET = os.getenv("KERNEL_SECRET", "dev-insecure-secret")
 GMAIL_CREDENTIALS_FILE = os.getenv("GMAIL_CREDENTIALS_FILE", "").strip()
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "").strip()
 
+# The machine symbiot's persona, kept as two files split by who may read them (persona.py).
+# The public half is versioned in the repo — the character and the stance, in the open —
+# and carries a {{ INJECT_SYMBIOSIS_CORE_PRIVATE }} token where the private half is spliced in.
+# The private half is gitignored, never committed: it holds what the symbiot won't share
+# with the World. An absent private file is fine — the token collapses to empty and the
+# public persona stands alone. Paths are anchored to the repo root so they resolve the same
+# whatever the working directory, and can still be pointed elsewhere by the environment.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+PERSONA_PUBLIC_FILE = os.getenv(
+    "PERSONA_PUBLIC_FILE", os.path.join(_REPO_ROOT, "persona", "public.md")
+)
+PERSONA_PRIVATE_FILE = os.getenv(
+    "PERSONA_PRIVATE_FILE", os.path.join(_REPO_ROOT, "persona", "private.md")
+)
+
 # Lifetimes for the two short-lived secrets.
 # Codes are deliberately brief;
 # a session lasts a day — long enough that the shell needn't re-ask for a login on every reload,

@@ -17,3 +17,7 @@ __pycache__/
 gmail-credentials*.json
 *-sa-creds.json
 
+# The private half of the machine symbiot's persona — per-symbiot, never leaves the box.
+# The public half (persona/public.md) is versioned; only the private slot stays local.
+persona/private.md
+
