@@ -21,7 +21,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-# Tests live in test/ and import the kernel's top-level modules (main, db, …),
+# Tests live in test/ and import main plus the kernel's packages (core, services),
 # so the repo root must be importable.
 testpaths = ["test"]
 pythonpath = ["."]

@@ -11,8 +11,8 @@ from datetime import datetime, timedelta, timezone
 import psycopg
 import pytest
 
-import config
-import db
+from core import config
+from core import db
 from conftest import SYMBIOT_EMAIL, count_codes, extract_code
 
 

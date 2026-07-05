@@ -8,8 +8,8 @@ The live round trip (a real POST landing a real row) is proven separately, by ha
 import psycopg
 import pytest
 
-import db
-import intake
+from core import db
+from services import intake
 
 
 def _rows():

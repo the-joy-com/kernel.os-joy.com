@@ -27,13 +27,13 @@ retried a bounded number of times along the way, and never left waiting on an an
 
 import threading
 
-import config
-import db
-import execution
-import intake
-import logs
-import protocol
-import push
+from core import config
+from core import db
+from services import execution
+from services import intake
+from core import logs
+from core import protocol
+from services import push
 
 # How long the loop waits before looking again once it finds nothing to do.
 POLL_INTERVAL_SECONDS = 1.0

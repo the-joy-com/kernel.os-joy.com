@@ -16,7 +16,7 @@ alone rather than raising. The token never survives into the assembled voice eit
 
 from pathlib import Path
 
-import config
+from core import config
 
 # The slot cut into the public persona where the private half is spliced in.
 PLACEHOLDER = "{{ INJECT_SYMBIOSIS_CORE_PRIVATE }}"

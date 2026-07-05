@@ -16,14 +16,14 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
 
-import config
-import db
-import identity
-import logs
-import protocol
-import push
-import worker
-from dtos import (
+from core import config
+from core import db
+from services import identity
+from core import logs
+from core import protocol
+from services import push
+from services import worker
+from core.dtos import (
     DeliveredRequest,
     IntakeRequest,
     LoginRequest,
@@ -34,10 +34,10 @@ from dtos import (
 
 # The /intake handler is named intake(),
 # so the module is reached by its function rather than imported as `intake` (which the handler would shadow).
-from intake import mark_delivered, read_outcome, record_message, recover_orphaned
-from missive import mark_seen, unseen_for_symbiot
-from email_client import EmailClient, GmailEmailClient
-from rate_limit import RateLimitMiddleware
+from services.intake import mark_delivered, read_outcome, record_message, recover_orphaned
+from services.missive import mark_seen, unseen_for_symbiot
+from services.email_client import EmailClient, GmailEmailClient
+from core.rate_limit import RateLimitMiddleware
 
 # The single source the envelope reports.
 # Bump in lockstep with real changes to what the kernel answers.

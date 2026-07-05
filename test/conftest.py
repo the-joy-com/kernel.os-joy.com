@@ -71,10 +71,10 @@ _ensure_test_database()
 from fastapi.testclient import TestClient
 import pytest
 
-import db
-from email_client import FakeEmailClient
+from core import db
+from services.email_client import FakeEmailClient
 from main import app, get_email_client
-from rate_limit import limiter
+from core.rate_limit import limiter
 
 SYMBIOT_EMAIL = "symbiot@example.com"
 _CODE_RE = re.compile(r"\b(\d{6})\b")
@@ -102,8 +102,11 @@ def clean_db(client):
     pool = db.get_pool()
     with pool.connection() as conn:
         _assert_test_database(conn)
+        # schema_ontology and diary_facts CASCADE onto their join and per-model embedding tables;
+        # embedding_model is left alone — it holds the active-model seed the migration wrote, not test data.
         conn.execute(
-            "TRUNCATE symbiot, login_code, session, intake, missive, reply_channel "
+            "TRUNCATE symbiot, login_code, session, intake, missive, reply_channel, "
+            "schema_ontology, diary_facts "
             "RESTART IDENTITY CASCADE"
         )
         conn.execute("INSERT INTO symbiot (email) VALUES (%s)", (SYMBIOT_EMAIL,))

@@ -22,7 +22,7 @@ import traceback
 # a pure-Python Exception subclass if that import fails.
 from queue import Empty
 
-import logs
+from core import logs
 
 # A fresh interpreter per unit of work, never a fork: forking a multi-threaded process
 # (the worker pool is threads) can inherit locks other threads hold and deadlock the

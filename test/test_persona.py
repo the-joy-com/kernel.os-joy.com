@@ -8,8 +8,8 @@ the token's spelling is ever changed. The files are pointed at temp paths so a t
 depends on what's actually on the box.
 """
 
-import config
-import persona
+from core import config
+from services import persona
 
 
 def _point_at(monkeypatch, public_body, private_body, tmp_path):

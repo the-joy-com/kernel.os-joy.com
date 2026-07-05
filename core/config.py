@@ -54,7 +54,8 @@ GMAIL_SENDER = os.getenv("GMAIL_SENDER", "").strip()
 # with the World. An absent private file is fine — the token collapses to empty and the
 # public persona stands alone. Paths are anchored to the repo root so they resolve the same
 # whatever the working directory, and can still be pointed elsewhere by the environment.
-_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+# This module lives in core/, one level down from the repo root, so we climb one directory.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PERSONA_PUBLIC_FILE = os.getenv(
     "PERSONA_PUBLIC_FILE", os.path.join(_REPO_ROOT, "persona", "public.md")
 )
@@ -134,3 +135,32 @@ VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
 # A contact URI (mailto: or https:) the push service can reach the app owner at, sent in
 # every push's VAPID claims. Ignored when there's no key to sign with.
 VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "").strip()
+
+# Ollama and the ontology router (embedding.py, ontology.py).
+# The embedding model runs locally on the box — no external inference API, the same sovereignty
+# stance as the rest of the kernel — so these point at the host's Ollama, not a remote service.
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+# The embedding model the router routes with.
+# Its 768-dimensional output is what the ontology_embedding_nomic tables are typed to,
+# and it is the model seeded active in embedding_model (migration 0010) —
+# the two must agree, or an embedded fact is searched against vectors from a different model.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+# The context window opened on every embed call.
+# Ollama clips nomic-embed-text to 2048 tokens by default and truncates in silence,
+# so a long text embedded at the default would lose its tail with no error;
+# 8192 is the model's native window, so the whole text reaches its own vector.
+EMBEDDING_NUM_CTX = int(os.getenv("EMBEDDING_NUM_CTX", "8192"))
+# How long to wait on Ollama before giving up.
+# Generous, because the first call after a cold model load pays the load time once.
+OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "60"))
+
+# The recall (nominate) pass of the ontology router.
+# How wide a candidate pool the vector search hands the re-ranker:
+# tuned for recall, not precision, so the right type is in the room even if it isn't yet at the front.
+RECALL_POOL = int(os.getenv("RECALL_POOL", "40"))
+# The HNSW working-set width, set per query.
+# The index answers approximately from a set of candidates it walks the graph to fill;
+# a set no wider than the pool we ask back would cap recall from the first fact,
+# so it is opened comfortably above RECALL_POOL — cheap on a store the size of one life's concepts.
+# Invariant: RECALL_EF_SEARCH >= RECALL_POOL, always.
+RECALL_EF_SEARCH = int(os.getenv("RECALL_EF_SEARCH", "100"))

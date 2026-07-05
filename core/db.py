@@ -15,7 +15,8 @@ from psycopg_pool import ConnectionPool
 
 logger = logging.getLogger("kernel.db")
 
-MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+# This module lives in core/, so the migrations directory is one level up at the repo root.
+MIGRATIONS_DIR = Path(__file__).parent.parent / "migrations"
 
 # The single pool for the process,
 # opened at startup (or by the test fixture) and read back by request handlers via get_pool().

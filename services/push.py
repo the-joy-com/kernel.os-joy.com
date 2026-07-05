@@ -29,9 +29,9 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from py_vapid import Vapid02
 from pywebpush import WebPushException, webpush
 
-import config
-import logs
-import protocol
+from core import config
+from core import logs
+from core import protocol
 
 log = logs.get("push")
 

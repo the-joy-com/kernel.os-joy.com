@@ -79,7 +79,7 @@ So `GET /health` answers:
 | --- | --- |
 | `GET /` | A name on the door — `{ "msg": "the ghost in the shell", "data": { "version": "0.0.1" } }` — so the bare host is legible instead of a 404. |
 | `GET /health` | The probe the shell's connectivity dot reads — `{ "msg": "loud and clear", "data": { "version": "0.0.1" } }`. |
-| `POST /intake` | Takes one line off the shell's prompt — body `{ "line": "<text>" }` — and acknowledges it with `{ "msg": "roger", "data": null }`. `"roger"` means *received*, not *stored*: the line is dropped (holding it in the buffer is a separate concern that layers on top of this round trip). The `line` is required, non-empty, and capped at 4096 chars; anything else is a `422`. The request shape is validated by the `IntakeRequest` DTO in [`dtos.py`](./dtos.py). |
+| `POST /intake` | Takes one line off the shell's prompt — body `{ "line": "<text>" }` — and acknowledges it with `{ "msg": "roger", "data": null }`. `"roger"` means *received*, not *stored*: the line is dropped (holding it in the buffer is a separate concern that layers on top of this round trip). The `line` is required, non-empty, and capped at 4096 chars; anything else is a `422`. The request shape is validated by the `IntakeRequest` DTO in [`dtos.py`](./core/dtos.py). |
 | `POST /login` | Body `{ "address": "<email>" }`. Issues a one-time code **only** on an exact match to a registered symbiot, emailing it to them; otherwise does nothing. The reply is **identical either way** — `{ "msg": "if that address is registered, a login code is on its way", "data": null }` — so it's no oracle for who's registered (an unknown address, a blank one, and a recipient-smuggling string all get the same answer, and never an email). |
 | `POST /login/verify` | Body `{ "address": "<email>", "code": "<code>" }`. Spends a valid (unconsumed, unexpired, latest-issued) code for that address's session: `{ "msg": "logged in", "data": { "token": "…", "email": "…" } }`. A wrong code answers `{ "msg": "that code didn't work — try again", "data": null }` and leaves the caller unauthed, free to retry. The address names whose code the guess is charged against: after `MAX_VERIFY_ATTEMPTS` wrong tries the database burns that code (see [Rate limiting & abuse](#rate-limiting--abuse)). |
 | `GET /status` | Reads `Authorization: Bearer <token>`. Reports `{ "data": { "authed": true, "email": "…" } }` for a live session, else `{ "data": { "authed": false, "email": null } }`. |
@@ -97,7 +97,7 @@ The kernel seeds one human — **the symbiot** — from `SYMBIOT_EMAIL` at start
 - **No enumeration oracle.** `/login` issues a code *only* on an exact match to a registered address, and its reply is byte-identical whether or not a match happened. An unknown address, a blank one, or a recipient-smuggling value (`a@x, b@y`, `a@x;b@y`, `a@x.evil`, `a+b@x`, an embedded newline) all get the same reply — and no email goes to anyone.
 - **Nothing sensitive at rest.** Codes and session tokens are HMAC'd with `KERNEL_SECRET` before they touch the database, so a leaked table yields no usable code or token. Codes are single-use, short-lived, and only the latest-issued one verifies; sessions are revoked on `/logout`.
 
-Email goes out through an `EmailClient` interface ([`email_client.py`](./email_client.py)) — the real one sends via the **Gmail API** (see [Email (Gmail API)](#email-gmail-api)); the test suite injects a fake that records messages instead of sending, so the whole flow is exercised without credentials.
+Email goes out through an `EmailClient` interface ([`email_client.py`](./services/email_client.py)) — the real one sends via the **Gmail API** (see [Email (Gmail API)](#email-gmail-api)); the test suite injects a fake that records messages instead of sending, so the whole flow is exercised without credentials.
 
 Address **format** is never validated by the kernel — only matched. A malformed address takes the same no-match path as any unknown one (no code, no email, the one canonical reply), because a `422` on "that's not a valid email" would itself be an enumeration oracle. Catching typos is the shell's job, done locally before the request is sent — a kindness that costs the kernel no safety to omit.
 
@@ -105,14 +105,14 @@ Address **format** is never validated by the kernel — only matched. A malforme
 
 Two layers guard the DB- and email-touching routes, deliberately split by what each can actually promise:
 
-- **A soft edge limiter** ([`rate_limit.py`](./rate_limit.py)) — a small hand-rolled in-memory sliding window, no dependency. It sheds gross volume cheaply before a request reaches a route: `/login` and `/login/verify` get tight per-IP ceilings, every other route a generous one, and `/health` is exempt (throttling the connectivity probe would make a healthy kernel read offline). It's best-effort by nature — per-process, forgotten on restart, keyed by a spoofable/shared IP — so it's the gate, not the guarantee. Toggle with `RATE_LIMIT_ENABLED`. **It keys on the `X-Real-IP` header**, which nginx must set (see [Deploy](#deploy)) — without it every caller collapses into one bucket.
+- **A soft edge limiter** ([`rate_limit.py`](./core/rate_limit.py)) — a small hand-rolled in-memory sliding window, no dependency. It sheds gross volume cheaply before a request reaches a route: `/login` and `/login/verify` get tight per-IP ceilings, every other route a generous one, and `/health` is exempt (throttling the connectivity probe would make a healthy kernel read offline). It's best-effort by nature — per-process, forgotten on restart, keyed by a spoofable/shared IP — so it's the gate, not the guarantee. Toggle with `RATE_LIMIT_ENABLED`. **It keys on the `X-Real-IP` header**, which nginx must set (see [Deploy](#deploy)) — without it every caller collapses into one bucket.
 - **Hard guarantees in the database** — the locks that survive restarts, multiple processes, and IP rotation, because they're rows, not counters. (1) A **re-issue interval** (`LOGIN_REISSUE_INTERVAL_SECONDS`): a fresh code can't be minted while the live one is younger than the window, capping email bombing — and, as a bonus, a double-tap no longer invalidates the code already in the inbox. (2) A **per-code attempt budget** (`MAX_VERIFY_ATTEMPTS`): each live code absorbs a fixed number of wrong guesses, then the row burns itself. This is why `/login/verify` carries the address — so a wrong guess is charged to that symbiot's code and no one else's, making brute force a bounded budget rather than a race against the 1,000,000-code search space.
 
 ## Database & migrations
 
-State lives in **Postgres**, reached with **psycopg 3** and **no ORM** — raw, parameterised SQL ([`db.py`](./db.py), [`identity.py`](./identity.py)).
+State lives in **Postgres**, reached with **psycopg 3** and **no ORM** — raw, parameterised SQL ([`db.py`](./core/db.py), [`identity.py`](./services/identity.py)).
 
-Migrations are **plain ordered `.sql` files** under [`migrations/`](./migrations), applied at app startup: the runner ([`db.py`](./db.py)) creates a `schema_migrations` ledger, applies every file not yet recorded inside its own transaction, then idempotently seeds the symbiot from `SYMBIOT_EMAIL`. There's no separate migrate step and no ORM-generated migrations — startup always brings the schema current. To add a change, drop a new `NNNN_name.sql` beside the existing one; it runs on the next boot.
+Migrations are **plain ordered `.sql` files** under [`migrations/`](./migrations), applied at app startup: the runner ([`db.py`](./core/db.py)) creates a `schema_migrations` ledger, applies every file not yet recorded inside its own transaction, then idempotently seeds the symbiot from `SYMBIOT_EMAIL`. There's no separate migrate step and no ORM-generated migrations — startup always brings the schema current. To add a change, drop a new `NNNN_name.sql` beside the existing one; it runs on the next boot.
 
 **Local** development uses a Postgres in Docker — [`docker-compose.yml`](./docker-compose.yml) ships one matching the default `DATABASE_URL`:
 
@@ -173,7 +173,7 @@ Ollama serves them on `http://127.0.0.1:11434` by default, and the kernel reache
 
 ## Configuration (`.env`)
 
-Config is read from a gitignored `.env` at startup ([`config.py`](./config.py), via `python-dotenv`) — the same file format locally and on the server; only the values differ. Copy the template and fill it in:
+Config is read from a gitignored `.env` at startup ([`config.py`](./core/config.py), via `python-dotenv`) — the same file format locally and on the server; only the values differ. Copy the template and fill it in:
 
 ```bash
 cp .env.example .env
@@ -192,7 +192,7 @@ cp .env.example .env
 
 ## Email (Gmail API)
 
-The real `EmailClient` sends through the **Gmail API** as a Google Workspace mailbox, authenticated by a **GCP service account with domain-wide delegation** (no interactive OAuth, ideal for a headless service). The service account holds no mailbox of its own — it *impersonates* a real Workspace user (`GMAIL_SENDER`) and sends as them, using the narrow `gmail.send` scope (send only, no mailbox read). The account's JSON key lives on each box (gitignored, never committed); `GMAIL_CREDENTIALS_FILE` points at it. Until both are set the client refuses to send rather than pretend, and the test suite never needs them (it uses the fake). The Google libraries and the key are loaded lazily on the first send, so import and tests never touch them ([`email_client.py`](./email_client.py)).
+The real `EmailClient` sends through the **Gmail API** as a Google Workspace mailbox, authenticated by a **GCP service account with domain-wide delegation** (no interactive OAuth, ideal for a headless service). The service account holds no mailbox of its own — it *impersonates* a real Workspace user (`GMAIL_SENDER`) and sends as them, using the narrow `gmail.send` scope (send only, no mailbox read). The account's JSON key lives on each box (gitignored, never committed); `GMAIL_CREDENTIALS_FILE` points at it. Until both are set the client refuses to send rather than pretend, and the test suite never needs them (it uses the fake). The Google libraries and the key are loaded lazily on the first send, so import and tests never touch them ([`email_client.py`](./services/email_client.py)).
 
 ### One-time setup
 
@@ -263,7 +263,7 @@ cp .env.example .env
 #   GMAIL_SENDER=<the Workspace mailbox to send as>
 ```
 
-`.env` is gitignored, so it never ships in the clone — it's created once per box and persists across deploys. The systemd unit runs uvicorn from the clone directory, so `config.py` finds `.env` there with no unit changes.
+`.env` is gitignored, so it never ships in the clone — it's created once per box and persists across deploys. The systemd unit runs uvicorn from the clone directory, so `core/config.py` finds `.env` there with no unit changes.
 
 The nginx server block and the certbot certificate are one-time setup per host: nginx `proxy_pass`es `kernel.os-joy.com` to `http://127.0.0.1:9713`, and `certbot --nginx -d kernel.os-joy.com` issues the certificate and adds the HTTP→HTTPS redirect.
 

@@ -5,11 +5,11 @@ the suite for received rows; here we drive one iteration at a time by calling
 _process_one directly.
 """
 
-import db
-import execution
-import intake
-import protocol
-import worker
+from core import db
+from services import execution
+from services import intake
+from core import protocol
+from services import worker
 
 SEEDED_SYMBIOT_ID = 1  # conftest re-seeds exactly one symbiot with RESTART IDENTITY, so it's always id 1
 

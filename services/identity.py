@@ -14,8 +14,8 @@ import hmac
 import secrets
 from datetime import datetime, timedelta, timezone
 
-import config
-from email_client import EmailClient
+from core import config
+from services.email_client import EmailClient
 
 # Codes are short and human-typed; sessions are long and machine-held.
 _CODE_DIGITS = 6

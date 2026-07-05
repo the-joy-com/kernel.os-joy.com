@@ -8,10 +8,10 @@ The one thing proven against a real key is that the public application server ke
 signing and sending a real push needs a real browser, proven by hand.
 """
 
-import config
-import db
-import intake
-import push
+from core import config
+from core import db
+from services import intake
+from services import push
 from conftest import SYMBIOT_EMAIL, extract_code
 
 # A valid base64url 32-octet private scalar — a throwaway VAPID key for the tests that
