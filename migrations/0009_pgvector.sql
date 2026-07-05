@@ -1,0 +1,28 @@
+-- Enable pgvector in the `joy` database: the `vector` column type and the distance operators
+-- the ontology/embedding store is built on.
+--
+-- Two separate things wear the name "enable pgvector", and this file is only the second:
+--
+--   1. The *binary* — the compiled extension — has to already be installed on the box
+--      before Postgres can load it.
+--      That's an out-of-band, per-box step, and it differs by environment:
+--      locally the docker image (pgvector/pgvector:pg16) ships it baked in;
+--      on the bare-metal server it's `apt install postgresql-16-pgvector`.
+--      See the README's pgvector section.
+--      This migration cannot install a binary and does not try.
+--
+--   2. *Enabling it in the database* — CREATE EXTENSION — which makes the `vector` type
+--      actually available inside `joy`.
+--      That's what this file does, and it's the same everywhere, so it lives in a migration
+--      and runs at startup like every other schema change.
+--
+-- IF NOT EXISTS is what lets this be true in both environments at once.
+-- pgvector is not a "trusted" extension,
+-- so a first-time CREATE EXTENSION needs a Postgres superuser — which the server's
+-- peer-auth service role may not be.
+-- On the server the extension is therefore created once by hand as the `postgres` superuser
+-- (see README); by the time this migration runs, the extension already exists and
+-- IF NOT EXISTS makes it a harmless no-op that needs no superuser.
+-- Locally the `joy` container role *is* a superuser, so the same statement creates it
+-- on the first boot with nothing done ahead of time. One line, both paths.
+CREATE EXTENSION IF NOT EXISTS vector;

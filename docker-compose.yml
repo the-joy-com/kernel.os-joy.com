@@ -5,7 +5,11 @@
 # nothing here runs in production.
 services:
   postgres:
-    image: postgres:16
+    # pgvector's own image: stock Postgres 16 with the `vector` extension binary
+    # already baked in, so the ontology/embedding store works locally out of the box.
+    # It's a drop-in for postgres:16 — same server, same data dir, same everything —
+    # it just ships the extension so `CREATE EXTENSION vector` has something to load.
+    image: pgvector/pgvector:pg16
     # Matches the credentials baked into the default local DATABASE_URL in config.py,
     # so a plain `docker compose up -d` needs no .env to develop against.
     environment:

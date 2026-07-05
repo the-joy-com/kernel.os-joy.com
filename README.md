@@ -122,6 +122,55 @@ docker compose up -d        # start local Postgres on :5432
 
 The **server** does *not* use Docker: it has a native Postgres reached over a unix socket with **peer auth** (tied to the OS user the service runs as), so its `DATABASE_URL` is genuinely different from local — see [Deploy](#deploy).
 
+### pgvector
+
+The ontology and embedding store lives in Postgres too, and it needs the [`pgvector`](https://github.com/pgvector/pgvector) extension — the type that lets a column hold an embedding and be searched by vector distance. There are two separate things here, and it's worth keeping them apart: the **binary** (the compiled extension, which has to be installed on the box before Postgres can load it) and **enabling it in a database** (`CREATE EXTENSION vector`, run once per database, which makes the `vector` type actually available inside `joy`). The binary is what differs between local and server; the `CREATE EXTENSION` is the same everywhere and is carried by a migration, so it runs at startup like every other schema change.
+
+**Local** — nothing to do. The [`docker-compose.yml`](./docker-compose.yml) now runs the `pgvector/pgvector:pg16` image instead of plain `postgres:16`: same Postgres 16, but with the extension binary already baked in. The `joy` user the container creates is a superuser, so the migration's `CREATE EXTENSION vector` just works on the next boot. If you have an *old* `joy_pgdata` volume from before this change, recreate it so you get the new image cleanly:
+
+```bash
+docker compose down -v      # drops the old volume
+docker compose up -d        # comes back up on pgvector/pgvector:pg16
+```
+
+**Server (bare metal, Ubuntu 24.04)** — two steps, once per box:
+
+1. **Install the binary** from the PostgreSQL APT repository (PGDG), matching your server's Postgres major version. For Postgres 16:
+
+   ```bash
+   sudo apt install postgresql-16-pgvector
+   ```
+
+   (Swap `16` for whatever major your box runs — `psql -V` tells you. If `apt` can't find the package, the PGDG repo isn't set up; add it per [apt.postgresql.org](https://wiki.postgresql.org/wiki/Apt), then `sudo apt update`.)
+
+2. **Enable it in the `joy` database, once, as a superuser.** `pgvector` is *not* a "trusted" extension, so creating it requires a Postgres superuser — the service's peer-auth role can't do it itself unless that role happens to be a superuser. Do it by hand as the `postgres` superuser:
+
+   ```bash
+   sudo -u postgres psql -d joy -c 'CREATE EXTENSION IF NOT EXISTS vector;'
+   ```
+
+   Once the extension exists in `joy`, the migration's own `CREATE EXTENSION IF NOT EXISTS vector` is a harmless no-op on every boot after. (If the role the service connects as *is* a superuser, you can skip this and let the migration create it on first startup — but doing it explicitly is the reliable path and costs nothing.)
+
+No extension binary, and Postgres refuses to load the `vector` type — the migration fails at `CREATE EXTENSION` before any table is built. Install the binary first, then let the schema come up.
+
+## Ollama (local models)
+
+The ontology routing that files a diary fact into structure leans on two **local** models, served by [Ollama](https://ollama.com) on the box — no external inference API, the same sovereignty (and cost) stance as the rest of the kernel. One turns text into vectors; the other judges how well a candidate type fits a fact. The routing depends on both:
+
+- **`nomic-embed-text`** — the embedding model, 768-dimensional output. Every ontology definition and every incoming fact is embedded through it for the vector recall pass.
+- **`qllama/bge-reranker-large`** — the cross-encoder re-ranker. It scores a fact against each recalled candidate and is what actually decides the match-or-mint call; the raw vector distance only nominates.
+
+Install Ollama per the [official instructions](https://ollama.com/download), then pull both models once per box:
+
+```bash
+ollama pull nomic-embed-text
+ollama pull qllama/bge-reranker-large
+```
+
+Ollama serves them on `http://127.0.0.1:11434` by default, and the kernel reaches them there. This is the same on local and server — Ollama runs natively on the host in both cases; it is *not* part of [`docker-compose.yml`](./docker-compose.yml).
+
+> **Heads-up on `nomic-embed-text`:** Ollama clips this model's context to 2048 tokens by default (its native window is 8192) and truncates *silently*, so long text must be embedded with `num_ctx: 8192` set — otherwise its tail vanishes from the vector with no error. The model also expects `search_document:` / `search_query:` task prefixes for its distances to mean anything. Both live in how the pipeline calls Ollama, not in the schema.
+
 ## Configuration (`.env`)
 
 Config is read from a gitignored `.env` at startup ([`config.py`](./config.py), via `python-dotenv`) — the same file format locally and on the server; only the values differ. Copy the template and fill it in:
