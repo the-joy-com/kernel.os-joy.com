@@ -141,7 +141,7 @@ VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "").strip()
 # stance as the rest of the kernel — so these point at the host's Ollama, not a remote service.
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 # The embedding model the router routes with.
-# Its 768-dimensional output is what the ontology_embedding_nomic tables are typed to,
+# Its 768-dimensional output is what the ontology_embedding_nomic_embed_text tables are typed to,
 # and it is the model seeded active in embedding_model (migration 0010) —
 # the two must agree, or an embedded fact is searched against vectors from a different model.
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
@@ -164,3 +164,30 @@ RECALL_POOL = int(os.getenv("RECALL_POOL", "40"))
 # so it is opened comfortably above RECALL_POOL — cheap on a store the size of one life's concepts.
 # Invariant: RECALL_EF_SEARCH >= RECALL_POOL, always.
 RECALL_EF_SEARCH = int(os.getenv("RECALL_EF_SEARCH", "100"))
+
+# The generative model behind the router's judgments — the re-rank now (Phase 1b),
+# and later the grey-zone tie-break, the minting, and the JSON-LD synthesis.
+# Reached through Ollama's /api/generate with thinking off and output constrained to JSON (llm.py).
+RERANK_MODEL = os.getenv("RERANK_MODEL", "qwen3.5:4b")
+# How long to wait on a generative call.
+# Longer than an embedding — generation is token by token, and the first call after a cold load
+# pays the load once — but still well inside the intake deadline that bounds a fact's whole run.
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
+
+# The two thresholds that band the top re-rank score into reuse / grey / mint.
+# At or above REUSE_THRESHOLD the top candidate fits well enough to reuse outright;
+# at or below MINT_THRESHOLD nothing fits and a new type is coined;
+# the grey band between the two escalates to the one-shot LLM gate (Phase 1c).
+# Tune against a hand-labelled set: too high mints needless duplicates, too low forces bad reuse.
+REUSE_THRESHOLD = float(os.getenv("REUSE_THRESHOLD", "0.7"))
+MINT_THRESHOLD = float(os.getenv("MINT_THRESHOLD", "0.3"))
+# The bands only make sense with the mint floor strictly below the reuse floor and both inside 0.0–1.0;
+# cross them and the grey zone vanishes and decide() tests MINT before REUSE, so a fact that clearly
+# fits an existing type gets read as a mint and a needless duplicate is coined — silently, forever.
+# Caught at import (before the pool opens or a worker starts), so a fat-fingered .env refuses to boot
+# rather than quietly mis-filing every fact that follows.
+if not 0.0 <= MINT_THRESHOLD < REUSE_THRESHOLD <= 1.0:
+    raise ValueError(
+        "ontology thresholds out of order: need 0.0 <= MINT_THRESHOLD < REUSE_THRESHOLD <= 1.0, "
+        f"got MINT_THRESHOLD={MINT_THRESHOLD}, REUSE_THRESHOLD={REUSE_THRESHOLD}"
+    )

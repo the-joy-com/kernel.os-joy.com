@@ -8,10 +8,12 @@ separately, by hand.
 """
 
 import pytest
+from pydantic import BaseModel, ValidationError
 
 from core import config
 from core import db
 from services import embedding
+from services import llm
 from services import ontology
 
 # The active model's output width; every hand-built vector must match it or the ::vector cast rejects it.
@@ -38,7 +40,7 @@ def _add_type(conn, type_name: str, definition: str, vec: list[float], merged_in
     model_id = conn.execute("SELECT id FROM embedding_model WHERE is_active").fetchone()[0]
     literal = "[" + ",".join(repr(x) for x in vec) + "]"
     conn.execute(
-        "INSERT INTO ontology_embedding_nomic (ontology_id, model_id, embedding) "
+        "INSERT INTO ontology_embedding_nomic_embed_text (ontology_id, model_id, embedding) "
         "VALUES (%s, %s, %s::vector)",
         (oid, model_id, literal),
     )
@@ -155,3 +157,138 @@ def test_embed_raises_when_no_vector_comes_back(monkeypatch):
 
     with pytest.raises(RuntimeError):
         embedding.embed("hit the heavy bag", task="document")
+
+
+# --- the re-rank (decide) pass, with the LLM faked -----------------------------------------
+
+
+def _cand(name: str, definition: str = "a definition") -> ontology.Candidate:
+    # A recall candidate; distance is irrelevant to the re-rank, which scores fit afresh.
+    return ontology.Candidate(ontology_id=1, type_name=name, definition=definition, distance=0.1)
+
+
+def test_rerank_scores_map_back_and_sort_best_first(monkeypatch):
+    # The LLM scores the whole pool in one call; we sort by fit, best first.
+    cands = [_cand("boxing_session"), _cand("phone_call"), _cand("sleep")]
+    body = ('{"scores": [{"type": "phone_call", "score": 0.1}, '
+            '{"type": "boxing_session", "score": 0.9}, {"type": "sleep", "score": 0.4}]}')
+    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse({"response": body}))
+
+    ranked = ontology.rerank_candidates("hit the heavy bag", cands)
+
+    assert [r.candidate.type_name for r in ranked] == ["boxing_session", "sleep", "phone_call"]
+    assert ranked[0].score == 0.9
+
+
+def test_rerank_sends_a_strict_schema_naming_only_the_candidates(monkeypatch):
+    # Structured output: the schema pins `type` to an enum of exactly the candidates offered and
+    # `score` to the 0.0–1.0 band, so Ollama's decoder can't emit an invented type or a wild score.
+    cands = [_cand("boxing_session"), _cand("phone_call")]
+    captured = {}
+
+    def fake_post(url, json, timeout):
+        captured["json"] = json
+        return _FakeResponse({"response": '{"scores": [{"type": "boxing_session", "score": 0.9}, '
+                                          '{"type": "phone_call", "score": 0.1}]}'})
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    ontology.rerank_candidates("hit the heavy bag", cands)
+
+    # The per-entry shape lives in the schema's single $def; grab it without hardcoding its name.
+    (score_def,) = captured["json"]["format"]["$defs"].values()
+    props = score_def["properties"]
+    assert props["type"]["enum"] == ["boxing_session", "phone_call"]
+    assert props["score"]["minimum"] == 0.0
+    assert props["score"]["maximum"] == 1.0
+    assert score_def["required"] == ["type", "score"]
+
+
+def test_rerank_defaults_an_unscored_candidate_to_zero(monkeypatch):
+    # Coverage is the one thing the schema can't compel: a candidate the model leaves out of its
+    # scores defaults to 0.0 in code and simply falls to the bottom.
+    cands = [_cand("a"), _cand("b")]
+    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"response": '{"scores": [{"type": "a", "score": 0.6}]}'}))  # "b" omitted
+
+    ranked = ontology.rerank_candidates("x", cands)
+
+    assert (ranked[0].candidate.type_name, ranked[0].score) == ("a", 0.6)
+    assert (ranked[1].candidate.type_name, ranked[1].score) == ("b", 0.0)
+
+
+def test_rerank_rejects_a_reply_that_breaks_the_schema(monkeypatch):
+    # A reply that invents a type or scores out of the 0.0–1.0 band violates the model and raises,
+    # rather than being quietly coerced — no loose output survives the boundary.
+    cands = [_cand("a")]
+    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"response": '{"scores": [{"type": "ghost", "score": 0.5}]}'}))
+
+    with pytest.raises(ValidationError):
+        ontology.rerank_candidates("x", cands)
+
+
+def test_rerank_empty_pool_never_calls_the_llm(monkeypatch):
+    # Recall found nothing, so there is nothing to score — and no call to spend.
+    # rerank_candidates returns [] on an empty pool *before* it ever reaches the LLM; this proves it.
+    # We prove the skip with a landmine, not an after-the-fact check: swap the real HTTP call for a
+    # fake that explodes the instant it is touched, so if the code did reach the LLM the test fails
+    # loudly here rather than passing quietly.
+    def boom(url, json, timeout):  # pragma: no cover - must never be reached
+        raise AssertionError("re-rank must not call the LLM for an empty pool")
+
+    # llm.httpx.post is the one call generate_json makes to reach Ollama, so this arms the whole path.
+    monkeypatch.setattr(llm.httpx, "post", boom)
+
+    # Passes only if both hold: the result is [] AND boom never fired (it would have thrown first).
+    assert ontology.rerank_candidates("x", []) == []
+
+
+def test_decide_bands_the_top_score(monkeypatch):
+    # The two thresholds carve the top score into reuse / grey / mint; both boundaries are inclusive.
+    monkeypatch.setattr(config, "REUSE_THRESHOLD", 0.7)
+    monkeypatch.setattr(config, "MINT_THRESHOLD", 0.3)
+    one = lambda s: [ontology.Ranked(_cand("a"), s)]
+
+    assert ontology.decide(one(0.9)) == ontology.REUSE
+    assert ontology.decide(one(0.7)) == ontology.REUSE   # at the reuse floor
+    assert ontology.decide(one(0.5)) == ontology.GREY
+    assert ontology.decide(one(0.3)) == ontology.MINT    # at the mint ceiling
+    assert ontology.decide(one(0.1)) == ontology.MINT
+    assert ontology.decide([]) == ontology.MINT          # empty pool → coin the concept
+
+
+# --- the generative client, with Ollama faked ----------------------------------------------
+
+
+class _Scored(BaseModel):
+    # A minimal Pydantic model to exercise generate_json's mandatory-schema contract.
+    score: float
+
+
+def test_generate_json_sends_the_fixed_flags_and_validates(monkeypatch):
+    # Thinking off, deterministic, and output held to the caller's model schema — not loose JSON.
+    captured = {}
+
+    def fake_post(url, json, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        return _FakeResponse({"response": '{"score": 0.5}'})
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+
+    out = llm.generate_json("some prompt", _Scored)
+
+    assert isinstance(out, _Scored) and out.score == 0.5
+    assert captured["json"]["think"] is False
+    assert captured["json"]["stream"] is False
+    assert captured["json"]["format"] == _Scored.model_json_schema()
+    assert captured["json"]["options"]["temperature"] == 0
+    assert captured["url"].endswith("/api/generate")
+
+
+def test_generate_json_raises_on_empty_response(monkeypatch):
+    # An empty generation must fail loud, never pass as a half-read decision.
+    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse({"response": ""}))
+
+    with pytest.raises(RuntimeError):
+        llm.generate_json("some prompt", _Scored)

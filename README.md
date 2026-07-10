@@ -158,18 +158,20 @@ No extension binary, and Postgres refuses to load the `vector` type — the migr
 The ontology routing that files a diary fact into structure leans on two **local** models, served by [Ollama](https://ollama.com) on the box — no external inference API, the same sovereignty (and cost) stance as the rest of the kernel. One turns text into vectors; the other judges how well a candidate type fits a fact. The routing depends on both:
 
 - **`nomic-embed-text`** — the embedding model, 768-dimensional output. Every ontology definition and every incoming fact is embedded through it for the vector recall pass.
-- **`qllama/bge-reranker-large`** — the cross-encoder re-ranker. It scores a fact against each recalled candidate and is what actually decides the match-or-mint call; the raw vector distance only nominates.
+- **`qwen3.5:4b`** — the generative re-ranker. Prompted with the fact and each recalled candidate's definition, it scores in one call how well each candidate categorises the fact, and that score — not the raw vector distance, which only nominates — is what decides the match-or-mint call. It's run with thinking off and its output constrained to JSON (see the heads-up below).
 
 Install Ollama per the [official instructions](https://ollama.com/download), then pull both models once per box:
 
 ```bash
 ollama pull nomic-embed-text
-ollama pull qllama/bge-reranker-large
+ollama pull qwen3.5:4b
 ```
 
 Ollama serves them on `http://127.0.0.1:11434` by default, and the kernel reaches them there. This is the same on local and server — Ollama runs natively on the host in both cases; it is *not* part of [`docker-compose.yml`](./docker-compose.yml).
 
 > **Heads-up on `nomic-embed-text`:** Ollama clips this model's context to 2048 tokens by default (its native window is 8192) and truncates *silently*, so long text must be embedded with `num_ctx: 8192` set — otherwise its tail vanishes from the vector with no error. The model also expects `search_document:` / `search_query:` task prefixes for its distances to mean anything. Both live in how the pipeline calls Ollama, not in the schema.
+
+> **Heads-up on `qwen3.5:4b`:** it's a thinking model, so the router calls it with `think: false` — the re-rank is a fast classification-style judgment, not a problem that wants a visible reasoning trace, and the trace would only cost tokens and latency. The call also sets `format: "json"` and `temperature: 0`, so the reply is a parseable object and the same fact scores the same way twice. These live in how the pipeline calls Ollama ([`services/llm.py`](./services/llm.py)), not in the schema.
 
 ## Configuration (`.env`)
 
@@ -228,6 +230,10 @@ uv run pytest               # runs everything under test/
 ```
 
 The suite ([`test/`](./test)) is one assertion-per-behaviour over the identity flow: code issuance, verification, the anti-enumeration reply, recipient-smuggling, latest-code-only, and logout idempotency. A green suite proves the **state machine** — not the wire; real delivery against the live kernel is verified by hand.
+
+## Code layout
+
+The kernel's Python lives in two packages, split by a single rule: **`core/` is the foundation, `services/` is the work, and imports only ever point one way.** `core/` holds the primitives everything leans on — config, the Postgres pool and migration runner, request DTOs, the wire protocol, logging, the edge limiter — and knows nothing of any feature. `services/` holds the actual work built on those primitives — identity, intake and its worker pool, the ontology router (recall/embedding/re-rank), email, push. The boundary is real because the imports keep it: `services/` imports from `core/` freely, and `core/` never imports from `services/`, so the foundation stays self-contained and cheap to test in isolation. [`main.py`](./main.py) sits above both and wires them into a running app. The full rationale, with each module placed, is in [`doc/architecture.md`](./doc/architecture.md).
 
 ## Stack
 

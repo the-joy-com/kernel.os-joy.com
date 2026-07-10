@@ -1,0 +1,51 @@
+# kernel architecture: the `core` / `services` split
+
+The kernel's Python lives in two packages, and the division between them is the one structural rule worth stating out loud, because the code obeys it everywhere but never says so on its own: **`core/` is the foundation, `services/` is the work, and the dependency arrow only ever points one way.**
+
+## the two layers
+
+**`core/`** holds the primitives every part of the kernel leans on — the substrate, not the features. Nothing in here knows what a diary fact is, how intake works, or that an ontology exists. It is the vocabulary the rest of the codebase is written in:
+
+- [`config.py`](../core/config.py) — every environment-sourced value, read once from `.env` so nothing else touches `os.environ`.
+- [`db.py`](../core/db.py) — the Postgres pool and the migration runner.
+- [`dtos.py`](../core/dtos.py) — the validated shapes of data crossing the HTTP boundary (a request's fields and its rules, no behaviour).
+- [`protocol.py`](../core/protocol.py) — the wire's vocabulary: every `msg` word the kernel speaks to the shell, gathered so the whole contract is legible in one place.
+- [`logs.py`](../core/logs.py) — one timestamped logging stream the whole `kernel.*` tree hangs under.
+- [`rate_limit.py`](../core/rate_limit.py) — the soft in-memory edge limiter that sheds gross volume before a request reaches a route.
+
+**`services/`** holds the actual work — each module a feature or a domain capability, built *on top of* core:
+
+- [`identity.py`](../services/identity.py) — the login/session state machine.
+- [`intake.py`](../services/intake.py) — the intake table's data layer and its state machine.
+- [`worker.py`](../services/worker.py) — the background pool that drains the intake queue, plus the deadline sweep.
+- [`execution.py`](../services/execution.py) — running a message's work under a hard deadline.
+- [`ontology.py`](../services/ontology.py), [`embedding.py`](../services/embedding.py), [`llm.py`](../services/llm.py) — the ontology router: recall, the embedding calls it recalls with, and the generative client it re-ranks and decides through.
+- [`email_client.py`](../services/email_client.py) — the `EmailClient` interface and its Gmail-API implementation (with a fake for tests).
+- [`push.py`](../services/push.py) — the Web Push reply channel.
+- [`missive.py`](../services/missive.py) — the outbound message shaping.
+- [`persona.py`](../services/persona.py) — the machine symbiot's persona, spliced from its public and private halves.
+
+## the rule: one-way imports
+
+The line between the two isn't just where a file sits — it's a real boundary the imports keep:
+
+- **`services/` imports from `core/` freely** — `from core import config`, `db`, `protocol`, `logs`.
+- **`core/` never imports from `services/`** — not once.
+
+That is the whole rationale, and it earns its keep. Because the arrow only points up, `core/` stays self-contained and cheap to reason about: you can import `core.db` or `core.dtos` without dragging in Ollama, the Gmail libraries, or the worker loop. It keeps the foundation testable in isolation and stops the kernel's primitives from quietly growing a dependency on the features that are supposed to depend on *them*. It's the same instinct as a kernel-versus-userland or infrastructure-versus-domain split, scaled down to one repo.
+
+The rule is enforced by convention rather than by tooling today — but it is a convention the code has never once broken, and a new module earns its folder by answering one question: does anything above it depend on this, or does it depend on the work above it? A primitive with no knowledge of any feature belongs in `core/`; a feature belongs in `services/`.
+
+## what sits above both
+
+[`main.py`](../main.py) is the composition root — the FastAPI app, the routes, the outbound envelope, and the lifespan that opens the pool and starts the worker threads. It reaches down into both packages and wires them into a running process; nothing reaches back up into it. Alongside the two packages sit the non-Python siblings each with a single job: [`migrations/`](../migrations) (the ordered `.sql` schema, applied at startup), [`persona/`](../persona) (the persona text), and [`test/`](../test) (the suite).
+
+## how embeddings are stored, and how the store is built to evolve
+
+The ontology router searches by vector similarity, which means the store holds embeddings — but embeddings are the one thing in the schema guaranteed to go stale, because the model that produces them will change. Better embedding models keep arriving, and the day the kernel adopts one, every vector already written is junk: embeddings from two different models don't live in the same space, so a distance measured between them is noise. The whole vector-storage design in [`0010_ontology_store.sql`](../migrations/0010_ontology_store.sql) exists to make that inevitable swap a clean, additive migration rather than a destructive rewrite. Three rules carry it.
+
+**Durable text and disposable vectors live apart.** The concept's identity — its name, its definition, its place in the tree — sits in `schema_ontology`, and a fact's text sits in `diary_facts`, with no vector anywhere near either. The embeddings live in their own tables, one-to-one against the durable row and cascading if it's ever removed. Re-embedding under a new model never touches a single durable row; it only refills the disposable side.
+
+**Vectors are split by model, one table per comparable vector space, named after the model that fills it.** Today that is `ontology_embedding_nomic_embed_text` and `diary_fact_embedding_nomic_embed_text` — the suffix is the full model name, `nomic-embed-text`, so the table says out loud whose vectors it holds. The split follows the *model*, not the *dimension*: two different models can both emit 768-wide vectors, and if they shared a table they would share one HNSW index — a single graph whose edges assume every vector in it is comparable, which across two models is false, so half its links would be nonsense. A separate table per model gives each its own clean index over one coherent space. Every row also carries a `model_id` stamp, so a set can be proven homogeneous and a half-finished re-embed (mixed `model_id`) is caught before it can pollute a search. The boundary the suffix really marks is model *and version* together: a re-pulled model with changed weights is a new space even at the same dimension, so it earns its own suffixed set (e.g. `_nomic_embed_text_v2`) beside the old.
+
+**Reads and writes go through a stable pointer, never a versioned table directly.** Two views — `active_ontology_embedding` and `active_diary_fact_embedding` — resolve to whichever set is live, and all router code names only these. They are plain pass-through views, transparent to the planner, so a distance search through `active_ontology_embedding` still uses the underlying HNSW index. This indirection is what makes a swap cheap: adopting a new model is a later migration that creates its own suffixed tables, re-embeds to fill them, repoints these two views with `CREATE OR REPLACE VIEW`, and flips the `is_active` flag in `embedding_model`. The old set stays queryable the whole time and is dropped only once the new one is trusted — no downtime, no query rewritten, no mutation of anything that already exists. (This same indirection is why renaming the suffix is a one-file change: application code names the views, not the tables.)

@@ -19,7 +19,7 @@
 --
 -- The vocabulary is not poured in from the outside; it is grown from use.
 -- When the router meets a fact it recalls the nearest existing types by vector distance,
--- then a cross-encoder re-ranker — not the raw distance — decides whether any of them truly fits;
+-- then a generative re-ranker — not the raw distance — decides whether any of them truly fits;
 -- only when none does does the model coin a new type, embed it, and file the fact against it.
 -- The distance can't be the judge because it conflates topic with category:
 -- a sprint and a marathon sit close in vector space and are still different kinds of thing,
@@ -178,7 +178,7 @@ VALUES ('nomic-embed-text', 'v1.5', 768, true);
 -- ---------------------------------------------------------------------------------------
 -- Decoupled vector storage, one set of tables per model, named after the model.
 --
--- The suffix names the model that produced the vectors (_nomic here) —
+-- The suffix names the model that produced the vectors (_nomic_embed_text here) —
 -- not a version number, and deliberately not the dimension.
 -- Naming by dimension was the tempting shortcut:
 -- a `vector` column is fixed-dimension and HNSW can only index a fixed dimension,
@@ -201,12 +201,12 @@ VALUES ('nomic-embed-text', 'v1.5', 768, true);
 -- Adopting a second model is a later migration:
 -- it creates its own tables (e.g. _bge at that model's dimension), a re-embed that fills them,
 -- a repoint of the views below, and a flip of the is_active flag above.
--- The _nomic tables stay queryable the whole time and are dropped only once the new set is trusted.
+-- The _nomic_embed_text tables stay queryable the whole time and are dropped only once the new set is trusted.
 -- No downtime, no mutation of what already exists.
 --
 -- The true boundary the suffix stands for is one comparable vector space, which is model *and* version:
 -- a re-pulled nomic with changed weights is a new vector space even at the same 768 dimensions,
--- so it earns its own suffixed set (e.g. _nomic_v2) and is adopted exactly like a different model would be —
+-- so it earns its own suffixed set (e.g. _nomic_embed_text_v2) and is adopted exactly like a different model would be —
 -- the family name here is just today's shorthand for the single version this store has ever held.
 --
 -- ontology vectors are what the router searches to recall a fact's nearest candidate types;
@@ -216,26 +216,28 @@ VALUES ('nomic-embed-text', 'v1.5', 768, true);
 -- so recall stops offering it even though its text row lingers as a redirect.
 -- diary-fact vectors are stored for persistence and for later "facts like this one" search.
 -- Both are keyed one-to-one back to their durable source row and cascade if it's ever removed.
-CREATE TABLE ontology_embedding_nomic (
+CREATE TABLE ontology_embedding_nomic_embed_text (
     ontology_id BIGINT      NOT NULL PRIMARY KEY REFERENCES schema_ontology (id) ON DELETE CASCADE,
     model_id    BIGINT      NOT NULL REFERENCES embedding_model (id),
     embedding   vector(768) NOT NULL
 );
 
-CREATE TABLE diary_fact_embedding_nomic (
+CREATE TABLE diary_fact_embedding_nomic_embed_text (
     diary_fact_id BIGINT      NOT NULL PRIMARY KEY REFERENCES diary_facts (id) ON DELETE CASCADE,
     model_id      BIGINT      NOT NULL REFERENCES embedding_model (id),
     embedding     vector(768) NOT NULL
 );
 
--- HNSW indexes for the approximate-nearest-neighbour search, under cosine distance
--- (vector_cosine_ops) to match the recall pass.
+-- These indexes are what make recall fast: instead of comparing a query vector against every
+-- row, HNSW walks a graph to find the closest ones in roughly constant time, trading a little
+-- accuracy for a lot of speed. vector_cosine_ops tells the index to measure closeness the same
+-- way recall does — by cosine distance — so the index and the query agree on what "nearest" means.
 -- Built on the concrete per-model tables so the pass-through views below inherit them.
-CREATE INDEX ontology_embedding_nomic_hnsw
-    ON ontology_embedding_nomic USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX ontology_embedding_nomic_embed_text_hnsw
+    ON ontology_embedding_nomic_embed_text USING hnsw (embedding vector_cosine_ops);
 
-CREATE INDEX diary_fact_embedding_nomic_hnsw
-    ON diary_fact_embedding_nomic USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX diary_fact_embedding_nomic_embed_text_hnsw
+    ON diary_fact_embedding_nomic_embed_text USING hnsw (embedding vector_cosine_ops);
 
 -- ---------------------------------------------------------------------------------------
 -- The storage-side pointer: stable view names that always resolve to the active set.
@@ -247,7 +249,7 @@ CREATE INDEX diary_fact_embedding_nomic_hnsw
 -- A plain pass-through view is transparent to the planner,
 -- so a distance search through active_ontology_embedding still uses the underlying HNSW index.
 CREATE VIEW active_ontology_embedding AS
-    SELECT ontology_id, model_id, embedding FROM ontology_embedding_nomic;
+    SELECT ontology_id, model_id, embedding FROM ontology_embedding_nomic_embed_text;
 
 CREATE VIEW active_diary_fact_embedding AS
-    SELECT diary_fact_id, model_id, embedding FROM diary_fact_embedding_nomic;
+    SELECT diary_fact_id, model_id, embedding FROM diary_fact_embedding_nomic_embed_text;
