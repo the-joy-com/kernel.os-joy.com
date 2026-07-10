@@ -165,8 +165,8 @@ RECALL_POOL = int(os.getenv("RECALL_POOL", "40"))
 # Invariant: RECALL_EF_SEARCH >= RECALL_POOL, always.
 RECALL_EF_SEARCH = int(os.getenv("RECALL_EF_SEARCH", "100"))
 
-# The generative model behind the router's judgments — the re-rank now (Phase 1b),
-# and later the grey-zone tie-break, the minting, and the JSON-LD synthesis.
+# The generative model behind the router's judgments — re-ranking the recalled candidates,
+# and breaking the tie in the grey zone when their top score is ambiguous.
 # Reached through Ollama's /api/generate with thinking off and output constrained to JSON (llm.py).
 RERANK_MODEL = os.getenv("RERANK_MODEL", "qwen3.5:4b")
 # How long to wait on a generative call.
@@ -177,7 +177,7 @@ LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
 # The two thresholds that band the top re-rank score into reuse / grey / mint.
 # At or above REUSE_THRESHOLD the top candidate fits well enough to reuse outright;
 # at or below MINT_THRESHOLD nothing fits and a new type is coined;
-# the grey band between the two escalates to the one-shot LLM gate (Phase 1c).
+# the grey band between the two escalates to the one-shot LLM gate.
 # Tune against a hand-labelled set: too high mints needless duplicates, too low forces bad reuse.
 REUSE_THRESHOLD = float(os.getenv("REUSE_THRESHOLD", "0.7"))
 MINT_THRESHOLD = float(os.getenv("MINT_THRESHOLD", "0.3"))

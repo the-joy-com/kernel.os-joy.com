@@ -25,8 +25,8 @@ from services import llm
 
 # The three bands the top re-rank score falls into, deciding what happens to the concept.
 REUSE = "reuse"  # a clear enough fit: link the fact to that existing type
-GREY = "grey"  # ambiguous: escalate to the one-shot LLM gate (Phase 1c)
-MINT = "mint"  # nothing fits: coin a new type (Phase 1d)
+GREY = "grey"  # ambiguous: escalate to the one-shot LLM gate
+MINT = "mint"  # nothing fits: coin a new type
 
 
 @dataclass(frozen=True)
@@ -187,7 +187,7 @@ def decide(ranked: list[Ranked]) -> str:
     An empty ranking is MINT: recall offered nothing (an empty or wholly-unrelated store),
     so there is nothing to reuse and the concept is coined.
     Otherwise the best score is read against the two configured thresholds; the band between
-    them is the grey zone the one-shot LLM gate (Phase 1c) resolves.
+    them is the grey zone the one-shot LLM gate resolves.
     """
     if not ranked:
         return MINT
@@ -197,3 +197,40 @@ def decide(ranked: list[Ranked]) -> str:
     if top <= config.MINT_THRESHOLD:
         return MINT
     return GREY
+
+
+class _GreyGateReply(BaseModel):
+    """The grey-zone gate's one-bit verdict: does the candidate type categorise the fact?
+
+    A True reuses that type, a False coins a new one — the two outcomes the grey band defers to.
+    This is a plain, module-level model, not a per-call build like the re-rank's:
+    its shape is fixed at a single boolean, with no candidate names to fold into the grammar,
+    so nothing about it depends on the pool in front of us."""
+
+    fits: bool
+
+
+def _grey_gate_prompt(fact_text: str, candidate: Candidate) -> str:
+    # The one candidate on the fence, offered by name *and definition* so the model judges meaning.
+    return (
+        "You decide whether one existing concept type correctly categorises a personal diary fact.\n"
+        f'Fact: "{fact_text}"\n\n'
+        f"Candidate type: {candidate.type_name} — {candidate.definition}\n\n"
+        "Is the fact clearly an instance of that kind of thing? "
+        "Judge the kind of thing, not mere topical closeness — a sprint and a marathon are related "
+        "yet are different kinds of act.\n\n"
+        'Return JSON only: {"fits": true} if this type categorises the fact, {"fits": false} if not.'
+    )
+
+
+def resolve_grey(fact_text: str, top: Candidate) -> str:
+    """The grey-zone binary gate: reuse-or-mint the top candidate when the re-rank score was ambiguous.
+
+    decide() lands the top score in the grey band when it is neither a clear reuse nor a clear mint.
+    Rather than force one or the other on a shaky score, spend one fast yes/no LLM call on the single
+    best candidate — does this existing type accurately categorise the fact?
+    A yes reuses it (REUSE), a no coins a new type (MINT); this collapses the grey band to one of the
+    two live outcomes, so the caller never has to act on GREY itself.
+    """
+    reply = llm.generate_json(_grey_gate_prompt(fact_text, top), _GreyGateReply)
+    return REUSE if reply.fits else MINT

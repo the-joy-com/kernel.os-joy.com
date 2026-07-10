@@ -162,14 +162,14 @@ def test_embed_raises_when_no_vector_comes_back(monkeypatch):
 # --- the re-rank (decide) pass, with the LLM faked -----------------------------------------
 
 
-def _cand(name: str, definition: str = "a definition") -> ontology.Candidate:
+def _return_recall_candidate(name: str, definition: str = "a definition") -> ontology.Candidate:
     # A recall candidate; distance is irrelevant to the re-rank, which scores fit afresh.
     return ontology.Candidate(ontology_id=1, type_name=name, definition=definition, distance=0.1)
 
 
 def test_rerank_scores_map_back_and_sort_best_first(monkeypatch):
     # The LLM scores the whole pool in one call; we sort by fit, best first.
-    cands = [_cand("boxing_session"), _cand("phone_call"), _cand("sleep")]
+    cands = [_return_recall_candidate("boxing_session"), _return_recall_candidate("phone_call"), _return_recall_candidate("sleep")]
     body = ('{"scores": [{"type": "phone_call", "score": 0.1}, '
             '{"type": "boxing_session", "score": 0.9}, {"type": "sleep", "score": 0.4}]}')
     monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse({"response": body}))
@@ -183,7 +183,7 @@ def test_rerank_scores_map_back_and_sort_best_first(monkeypatch):
 def test_rerank_sends_a_strict_schema_naming_only_the_candidates(monkeypatch):
     # Structured output: the schema pins `type` to an enum of exactly the candidates offered and
     # `score` to the 0.0–1.0 band, so Ollama's decoder can't emit an invented type or a wild score.
-    cands = [_cand("boxing_session"), _cand("phone_call")]
+    cands = [_return_recall_candidate("boxing_session"), _return_recall_candidate("phone_call")]
     captured = {}
 
     def fake_post(url, json, timeout):
@@ -206,7 +206,7 @@ def test_rerank_sends_a_strict_schema_naming_only_the_candidates(monkeypatch):
 def test_rerank_defaults_an_unscored_candidate_to_zero(monkeypatch):
     # Coverage is the one thing the schema can't compel: a candidate the model leaves out of its
     # scores defaults to 0.0 in code and simply falls to the bottom.
-    cands = [_cand("a"), _cand("b")]
+    cands = [_return_recall_candidate("a"), _return_recall_candidate("b")]
     monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
         {"response": '{"scores": [{"type": "a", "score": 0.6}]}'}))  # "b" omitted
 
@@ -219,7 +219,7 @@ def test_rerank_defaults_an_unscored_candidate_to_zero(monkeypatch):
 def test_rerank_rejects_a_reply_that_breaks_the_schema(monkeypatch):
     # A reply that invents a type or scores out of the 0.0–1.0 band violates the model and raises,
     # rather than being quietly coerced — no loose output survives the boundary.
-    cands = [_cand("a")]
+    cands = [_return_recall_candidate("a")]
     monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
         {"response": '{"scores": [{"type": "ghost", "score": 0.5}]}'}))
 
@@ -247,7 +247,7 @@ def test_decide_bands_the_top_score(monkeypatch):
     # The two thresholds carve the top score into reuse / grey / mint; both boundaries are inclusive.
     monkeypatch.setattr(config, "REUSE_THRESHOLD", 0.7)
     monkeypatch.setattr(config, "MINT_THRESHOLD", 0.3)
-    one = lambda s: [ontology.Ranked(_cand("a"), s)]
+    one = lambda s: [ontology.Ranked(_return_recall_candidate("a"), s)]
 
     assert ontology.decide(one(0.9)) == ontology.REUSE
     assert ontology.decide(one(0.7)) == ontology.REUSE   # at the reuse floor
@@ -255,6 +255,53 @@ def test_decide_bands_the_top_score(monkeypatch):
     assert ontology.decide(one(0.3)) == ontology.MINT    # at the mint ceiling
     assert ontology.decide(one(0.1)) == ontology.MINT
     assert ontology.decide([]) == ontology.MINT          # empty pool → coin the concept
+
+
+# --- the grey-zone binary gate, with the LLM faked -----------------------------------------
+
+
+def test_resolve_grey_yes_reuses(monkeypatch):
+    # On the fence, one yes/no call: a "fits" reuses the candidate type rather than minting a twin.
+    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"response": '{"fits": true}'}))
+
+    assert ontology.resolve_grey("hit the heavy bag", _return_recall_candidate("boxing_session")) == ontology.REUSE
+
+
+def test_resolve_grey_no_mints(monkeypatch):
+    # A "does not fit" sends the concept to minting instead of forcing an ill-fitting reuse.
+    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"response": '{"fits": false}'}))
+
+    assert ontology.resolve_grey("hit the heavy bag", _return_recall_candidate("phone_call")) == ontology.MINT
+
+
+def test_resolve_grey_prompts_with_the_fact_and_candidate(monkeypatch):
+    # The gate must see both the fact and the one candidate's name and definition to judge the fit,
+    # and pin the reply to the fixed one-boolean schema so the decoder can't wander off it.
+    captured = {}
+
+    def fake_post(url, json, timeout):
+        captured["json"] = json
+        return _FakeResponse({"response": '{"fits": true}'})
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    ontology.resolve_grey("hit the heavy bag", _return_recall_candidate("boxing_session", "a bout of boxing"))
+
+    prompt = captured["json"]["prompt"]
+    assert "hit the heavy bag" in prompt
+    assert "boxing_session" in prompt and "a bout of boxing" in prompt
+    assert captured["json"]["format"]["properties"]["fits"]["type"] == "boolean"
+
+
+def test_resolve_grey_rejects_a_reply_that_breaks_the_schema(monkeypatch):
+    # A non-boolean verdict violates the model and raises at the boundary rather than being coerced
+    # into a silent reuse-or-mint — the same strict discipline the re-rank holds.
+    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"response": '{"fits": "maybe"}'}))
+
+    with pytest.raises(ValidationError):
+        ontology.resolve_grey("x", _return_recall_candidate("a"))
 
 
 # --- the generative client, with Ollama faked ----------------------------------------------
