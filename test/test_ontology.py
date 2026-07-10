@@ -304,6 +304,103 @@ def test_resolve_grey_rejects_a_reply_that_breaks_the_schema(monkeypatch):
         ontology.resolve_grey("x", _return_recall_candidate("a"))
 
 
+# --- the mint pass, with the LLM and the embedder faked ------------------------------------
+
+
+def _fake_ollama(monkeypatch, *, generate: str, embed: list[float] | None = None):
+    # Mint calls both Ollama endpoints — /api/generate for the reply, /api/embed for the vector —
+    # and llm and embedding share the one httpx module, so a single post dispatches on the URL:
+    # the generative reply for one, the embedding vector for the other.
+    vec = embed if embed is not None else [0.1] * _DIM
+
+    def dispatch(url, json, timeout):
+        if url.endswith("/api/generate"):
+            return _FakeResponse({"response": generate})
+        return _FakeResponse({"embeddings": [vec]})
+
+    monkeypatch.setattr(llm.httpx, "post", dispatch)
+
+
+def _ranked(name: str, ontology_id: int, definition: str = "a definition") -> ontology.Ranked:
+    # A re-ranked candidate; only its name and ontology_id matter to the mint (the parent it may point at).
+    return ontology.Ranked(ontology.Candidate(ontology_id, name, definition, 0.1), 0.5)
+
+
+def test_mint_inserts_a_new_type_and_embedding_as_a_root(client, monkeypatch):
+    # The plain mint: no parent among the neighbours, so a root type with parent_id NULL,
+    # its coined definition embedded and landed in the active model's table for the next recall.
+    _fake_ollama(monkeypatch, generate='{"type_name": "boxing_session", "definition": "a bout of boxing", "parent": "none"}')
+
+    with db.get_pool().connection() as conn:
+        new_id = ontology.mint(conn, "hit the heavy bag", [])
+
+        row = conn.execute(
+            "SELECT type_name, definition, parent_id FROM schema_ontology WHERE id = %s", (new_id,)
+        ).fetchone()
+        assert row == ("boxing_session", "a bout of boxing", None)
+        # The vector landed in the active set, keyed back to the new type.
+        assert conn.execute(
+            "SELECT count(*) FROM active_ontology_embedding WHERE ontology_id = %s", (new_id,)
+        ).fetchone()[0] == 1
+
+
+def test_mint_sets_the_parent_from_the_context(client, monkeypatch):
+    # When the model places the new type under a neighbour, that neighbour's id becomes parent_id —
+    # the sub-type edge that keeps the vocabulary a tree rather than a flat scatter.
+    with db.get_pool().connection() as conn:
+        parent_oid = _add_type(conn, "workout_action", "any bout of physical training", _vec(**{"0": 1.0}))
+        context = [_ranked("workout_action", parent_oid), _ranked("errand", 999)]
+        _fake_ollama(monkeypatch, generate='{"type_name": "boxing_session", "definition": "a bout of boxing", "parent": "workout_action"}')
+
+        new_id = ontology.mint(conn, "hit the heavy bag", context)
+
+        assert conn.execute(
+            "SELECT parent_id FROM schema_ontology WHERE id = %s", (new_id,)
+        ).fetchone()[0] == parent_oid
+
+
+def test_mint_reuses_an_existing_type_on_a_name_collision(client, monkeypatch):
+    # The model names a type that already exists: mint returns that row's id and inserts nothing,
+    # and never even reaches the embedder — a clash resolves to reuse, not a suffixed duplicate.
+    def dispatch(url, json, timeout):
+        if url.endswith("/api/embed"):  # pragma: no cover - must never be reached
+            raise AssertionError("mint must not embed when it reuses an existing type on a name clash")
+        return _FakeResponse({"response": '{"type_name": "boxing_session", "definition": "a fresh definition", "parent": "none"}'})
+
+    monkeypatch.setattr(llm.httpx, "post", dispatch)
+    with db.get_pool().connection() as conn:
+        existing = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
+        before = conn.execute("SELECT count(*) FROM schema_ontology").fetchone()[0]
+
+        got = ontology.mint(conn, "hit the heavy bag", [])
+
+        assert got == existing
+        # No row was added, and the existing definition was left untouched.
+        assert conn.execute("SELECT count(*) FROM schema_ontology").fetchone()[0] == before
+        assert conn.execute(
+            "SELECT definition FROM schema_ontology WHERE id = %s", (existing,)
+        ).fetchone()[0] == "a bout of boxing"
+
+
+def test_mint_parent_grammar_is_locked_to_the_context_plus_none(monkeypatch):
+    # Structured output: the reply's `parent` enum is exactly the neighbour names and "none",
+    # so Ollama's decoder can't hang the new type under a parent that was never offered.
+    captured = {}
+
+    def fake_post(url, json, timeout):
+        if url.endswith("/api/embed"):
+            return _FakeResponse({"embeddings": [[0.1] * _DIM]})
+        captured["json"] = json
+        return _FakeResponse({"response": '{"type_name": "boxing_session", "definition": "a bout", "parent": "none"}'})
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    context = [_ranked("workout_action", 1), _ranked("errand", 2)]
+    with db.get_pool().connection() as conn:
+        ontology.mint(conn, "hit the heavy bag", context)
+
+    assert captured["json"]["format"]["properties"]["parent"]["enum"] == ["workout_action", "errand", "none"]
+
+
 # --- the generative client, with Ollama faked ----------------------------------------------
 
 

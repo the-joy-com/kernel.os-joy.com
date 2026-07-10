@@ -155,9 +155,18 @@ EMBEDDING_NUM_CTX = int(os.getenv("EMBEDDING_NUM_CTX", "8192"))
 OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "60"))
 
 # The recall (nominate) pass of the ontology router.
-# How wide a candidate pool the vector search hands the re-ranker:
-# tuned for recall, not precision, so the right type is in the room even if it isn't yet at the front.
-RECALL_POOL = int(os.getenv("RECALL_POOL", "40"))
+# How wide a candidate pool the vector search hands the re-ranker.
+# Two forces size it.
+# Wide enough that the right type is in the room even when it isn't yet at the front —
+# recall, not precision, is this pass's job.
+# But no wider than the re-ranker can weigh well in one call:
+# it scores the whole pool in a single pass,
+# and a small generative model grows sloppy asked to judge too many candidates at once —
+# leaving some unscored, reading others loosely,
+# the very slip the coverage default in rerank_candidates already absorbs.
+# So the pool is capped where that judgement stays sharp,
+# not opened as wide as the index could answer.
+RECALL_POOL = int(os.getenv("RECALL_POOL", "20"))
 # The HNSW working-set width, set per query.
 # The index answers approximately from a set of candidates it walks the graph to fill;
 # a set no wider than the pool we ask back would cap recall from the first fact,

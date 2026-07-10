@@ -21,12 +21,27 @@ from typing import Literal
 from pydantic import BaseModel, Field, create_model
 
 from core import config
+from services import embedding
 from services import llm
 
 # The three bands the top re-rank score falls into, deciding what happens to the concept.
 REUSE = "reuse"  # a clear enough fit: link the fact to that existing type
 GREY = "grey"  # ambiguous: escalate to the one-shot LLM gate
 MINT = "mint"  # nothing fits: coin a new type
+
+# How many of the nearest existing types the minter is shown when it coins a new one.
+# A type is never coined in a vacuum:
+# the model sees these neighbours and either places the new type under one of them or declares it a root,
+# so the vocabulary grows as a tree, not a scatter.
+# Kept small on purpose — the parent is a single choice among a short list the model can hold in focus,
+# the same short-list discipline that sizes the recall pool.
+MINT_CONTEXT = 3
+
+# The reply value that means "this type has no parent" — it is a root, parent_id NULL.
+# Offered alongside the neighbour names as the one always-legal choice,
+# so the model is never forced to hang a new root under an ill-fitting parent
+# just because the grammar left it no way to say none.
+_MINT_NO_PARENT = "none"
 
 
 @dataclass(frozen=True)
@@ -199,17 +214,6 @@ def decide(ranked: list[Ranked]) -> str:
     return GREY
 
 
-class _GreyGateReply(BaseModel):
-    """The grey-zone gate's one-bit verdict: does the candidate type categorise the fact?
-
-    A True reuses that type, a False coins a new one — the two outcomes the grey band defers to.
-    This is a plain, module-level model, not a per-call build like the re-rank's:
-    its shape is fixed at a single boolean, with no candidate names to fold into the grammar,
-    so nothing about it depends on the pool in front of us."""
-
-    fits: bool
-
-
 def _grey_gate_prompt(fact_text: str, candidate: Candidate) -> str:
     # The one candidate on the fence, offered by name *and definition* so the model judges meaning.
     return (
@@ -223,6 +227,17 @@ def _grey_gate_prompt(fact_text: str, candidate: Candidate) -> str:
     )
 
 
+class _GreyGateReply(BaseModel):
+    """The grey-zone gate's one-bit verdict: does the candidate type categorise the fact?
+
+    A True reuses that type, a False coins a new one — the two outcomes the grey band defers to.
+    This is a plain, module-level model, not a per-call build like the re-rank's:
+    its shape is fixed at a single boolean, with no candidate names to fold into the grammar,
+    so nothing about it depends on the pool in front of us."""
+
+    fits: bool
+
+
 def resolve_grey(fact_text: str, top: Candidate) -> str:
     """The grey-zone binary gate: reuse-or-mint the top candidate when the re-rank score was ambiguous.
 
@@ -234,3 +249,122 @@ def resolve_grey(fact_text: str, top: Candidate) -> str:
     """
     reply = llm.generate_json(_grey_gate_prompt(fact_text, top), _GreyGateReply)
     return REUSE if reply.fits else MINT
+
+
+def _mint_prompt(fact_text: str, context: list[Ranked]) -> str:
+    # The neighbours are the nearest existing types the mint is placed among,
+    # each offered by name *and definition* so the model judges the parent by meaning, not the label.
+    placement = ""
+    if context:
+        lines = "\n".join(f"- {r.candidate.type_name} — {r.candidate.definition}" for r in context)
+        placement += (
+            "Here are the existing types nearest this fact — coin the new one in relation to them:\n"
+            f"{lines}\n\n"
+            "If the new type is a more specific kind of one of these, name that type as its parent; "
+            f'if it stands on its own as a root concept, use "{_MINT_NO_PARENT}".\n\n'
+        )
+    else:
+        # A cold or wholly-unrelated store: there is nothing to place the type under,
+        # so the only honest parent is none and the new type is the first of its line.
+        placement += (
+            "There are no existing types to place this under yet, "
+            f'so its parent is "{_MINT_NO_PARENT}".\n\n'
+        )
+    return (
+        "You are growing a personal diary's vocabulary of concept types.\n"
+        "No existing type fits this fact, so coin a new one for it.\n\n"
+        f'Fact: "{fact_text}"\n\n'
+        f"{placement}"
+        "Name the *kind* of thing the fact is, not this one instance of it — "
+        "the type is what every later fact of the same kind will reuse.\n\n"
+        "Return JSON only: "
+        '{"type_name": "<short snake_case label>", '
+        '"definition": "<one sentence naming that kind of thing>", '
+        f'"parent": "<one of the names above, or {_MINT_NO_PARENT}>"}}'
+    )
+
+
+def _mint_reply_model(context: list[Ranked]) -> type[BaseModel]:
+    """Build — at runtime — the Pydantic model the mint reply must match for *this* neighbour set.
+
+    Like the re-rank's reply model, the legal parent names aren't known until we see the context,
+    so each call constructs a fresh model whose `parent` field is a Literal over exactly this
+    context's names plus the always-present "none" — the same strict-schema-as-decoder-grammar trick.
+    The model can't name a parent we never offered, and it can't fail to answer the parent question:
+    the grammar admits only a real neighbour or an explicit none, so a floating parent is impossible.
+    type_name and definition are free text — what the new type is called and what it means —
+    checked only for being present, since their content is exactly what we are asking the model to coin.
+    """
+    # The closed set the reply's `parent` may take:
+    # the neighbour names, and "none" for a root — nothing else is in the grammar.
+    parents = tuple(r.candidate.type_name for r in context) + (_MINT_NO_PARENT,)
+    return create_model(
+        "_MintReply",
+        type_name=(str, ...),
+        definition=(str, ...),
+        parent=(Literal[parents], ...),
+    )
+
+
+def mint(conn, fact_text: str, ranked: list[Ranked]) -> int:
+    """Coin a new ontology type for a fact nothing existing fits, and return its id.
+
+    Called on the MINT verdict. The new type is placed among its neighbours, never in a vacuum:
+    the model is shown the top MINT_CONTEXT re-ranked types and must give the new type a parent
+    that is one of them or none — a parent grows the tree, a none makes a root (parent_id NULL),
+    which is the normal outcome for a cold store or a genuinely first-of-its-kind concept.
+    The definition it coins is embedded (as a stored document) and its vector lands in the active
+    model's table, so the very next recall can nominate this type like any other.
+
+    The returned id is the type the fact should be filed under — either the freshly minted one, or,
+    on an exact-name collision, the existing type of that name. The name is never duplicated:
+    the UNIQUE type_name is the last-ditch dedup, and a clash resolves to reuse, not a suffixed twin.
+    Two clashes are guarded, for two different reasons:
+      - the model may deliberately name a type that already exists — caught by the pre-check below,
+        which also spares a wasted embedding call for a row we would never insert;
+      - two mints may race to coin the same new name at once — caught by ON CONFLICT in the insert,
+        so the database, not our timing, lets exactly one win and the loser reuses the winner's row.
+    """
+    context = ranked[:MINT_CONTEXT]
+    reply = llm.generate_json(_mint_prompt(fact_text, context), _mint_reply_model(context))
+
+    # The model named a type that already exists: reuse it rather than mint a twin,
+    # and return before embedding — the vector we would compute is for a row we will never write.
+    existing = conn.execute(
+        "SELECT id FROM schema_ontology WHERE type_name = %s", (reply.type_name,)
+    ).fetchone()
+    if existing is not None:
+        return existing[0]
+
+    # The parent is one of the neighbours the grammar allowed, or none for a root.
+    by_name = {r.candidate.type_name: r.candidate.ontology_id for r in context}
+    parent_id = None if reply.parent == _MINT_NO_PARENT else by_name[reply.parent]
+
+    # Embed before opening the transaction — this is a network call to Ollama,
+    # and a slow round trip must not be held across an open transaction pinning a pooled connection.
+    vector = embedding.embed(reply.definition, task="document")
+    # pgvector has no psycopg adapter installed, so the vector crosses as its text literal and casts ::vector.
+    vector_literal = "[" + ",".join(repr(x) for x in vector) + "]"
+
+    with conn.transaction():
+        # ON CONFLICT collapses the concurrent-mint race to a single winner:
+        # the loser's insert returns no row, and we reuse the name that won just below.
+        row = conn.execute(
+            "INSERT INTO schema_ontology (type_name, definition, parent_id) "
+            "VALUES (%s, %s, %s) ON CONFLICT (type_name) DO NOTHING RETURNING id",
+            (reply.type_name, reply.definition, parent_id),
+        ).fetchone()
+        if row is None:
+            return conn.execute(
+                "SELECT id FROM schema_ontology WHERE type_name = %s", (reply.type_name,)
+            ).fetchone()[0]
+        ontology_id = row[0]
+        # Land the vector in the active model's table through the view, so a model swap never has to
+        # touch this write and it never names a versioned table — the same stance recall reads under.
+        model_id = conn.execute("SELECT id FROM embedding_model WHERE is_active").fetchone()[0]
+        conn.execute(
+            "INSERT INTO active_ontology_embedding (ontology_id, model_id, embedding) "
+            "VALUES (%s, %s, %s::vector)",
+            (ontology_id, model_id, vector_literal),
+        )
+    return ontology_id
