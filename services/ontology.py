@@ -13,8 +13,16 @@ so the distance is only allowed to pull the plausible candidates into the room.
 The re-rank that judges which of them truly fits — a generative model reads the fact and each
 candidate's definition together and scores the fit — and the minting that coins a new type when
 none does are the rest of this path, and read the pool recall hands back.
+
+A raw fact enters this path first through naming: an LLM reads the fact and names the distinct
+concepts it expresses, and each named concept then takes that recall / re-rank / mint-if-new trip
+on its own. Once every concept has resolved to a type — reused or freshly coined — the fact is
+rendered into a deliberately thin JSON-LD payload — its `@type` links and its own raw text, with no
+particulars extracted — and persisted once: the fact row, its embedding, and one link per concept
+it earned. `ingest` is the entry point that runs the whole path; the steps below build up to it.
 """
 
+import json
 from dataclasses import dataclass
 from typing import Literal
 
@@ -368,3 +376,133 @@ def mint(conn, fact_text: str, ranked: list[Ranked]) -> int:
             (ontology_id, model_id, vector_literal),
         )
     return ontology_id
+
+
+class _ConceptsReply(BaseModel):
+    """The naming step's answer: the distinct concepts a raw fact expresses.
+
+    A plain, module-level model — its shape never depends on the pool, so nothing is built per call.
+    `min_length=1` is folded into the decoder grammar and re-checked on the way back:
+    a diary fact is always *about* something, so an empty list is a mis-read, not a valid answer,
+    and it fails at the boundary rather than filing a fact under no concept at all."""
+
+    concepts: list[str] = Field(min_length=1)
+
+
+def _extract_concepts_prompt(fact_text: str) -> str:
+    return (
+        "You read a personal diary fact and name the distinct concepts it expresses.\n"
+        f'Fact: "{fact_text}"\n\n'
+        "A single fact is usually several things at once — "
+        '"a boxing session with my friend Jeremy during the heat wave" is at once a boxing session, '
+        "time spent with a friend, and a spell of extreme heat.\n"
+        "Name each distinct *kind of thing* the fact is about, as a short self-contained phrase in "
+        'plain words — the kind, not the particular: "time with a friend", not "Jeremy".\n'
+        "Name only what the fact genuinely expresses; do not invent concepts it doesn't touch.\n\n"
+        'Return JSON only: {"concepts": ["<concept>", ...]}, with at least one.'
+    )
+
+
+def extract_concepts(fact_text: str) -> list[str]:
+    """Name the distinct concepts a raw fact expresses — the fan-out point of the whole path.
+
+    One LLM call reads the fact and returns the *kinds of things* it is about, each a short
+    self-contained phrase, so that everything downstream can route each concept on its own.
+    It names, it does not file: a phrase here is the query the recall pass will embed, never a type.
+    Naming the kind and not the particular ("time with a friend", not "Jeremy") is what keeps the
+    particulars in the raw text, where the thin synthesis deliberately leaves them.
+    """
+    return llm.generate_json(_extract_concepts_prompt(fact_text), _ConceptsReply).concepts
+
+
+def route_concept(conn, concept_text: str) -> int:
+    """Route one named concept to a type id — reuse an existing one or coin a new one.
+
+    The recall / re-rank / mint-if-new trip for a single concept, run in the fact's own words:
+    embed the concept as a query, recall the nearest existing types, re-rank them for true fit,
+    and read the top score's band. A clear enough fit reuses that type; nothing fitting mints a new
+    one; the grey band in between spends one yes/no call to settle reuse-or-mint rather than guess.
+    Returns the id of the type the concept resolved to, whichever way it got there.
+    """
+    vector = embedding.embed(concept_text, task="query")
+    candidates = recall_candidates(conn, vector)
+    ranked = rerank_candidates(concept_text, candidates)
+    verdict = decide(ranked)
+    if verdict == GREY:
+        verdict = resolve_grey(concept_text, ranked[0].candidate)
+    if verdict == REUSE:
+        return ranked[0].candidate.ontology_id
+    return mint(conn, concept_text, ranked)
+
+
+def synthesize(type_names: list[str], raw_text: str) -> dict:
+    """Render a routed fact into its thin JSON-LD payload — deliberately, not an LLM step.
+
+    The payload carries exactly two things: the fact's `@type` links to the types it routed to,
+    and its own raw text verbatim. Nothing is extracted from the text into structured fields —
+    the particulars stay inside `text`, which remains the durable truth (see the build log for why
+    the first synthesis is kept this thin, and why richer structure is an open question, not a plan).
+    Both values are already in hand by the time we get here — the types from routing, the text from
+    the fact itself — so there is nothing for a model to judge, and this is plain assembly, no call.
+    The `@type` links are sorted alphabetically: the concepts a fact resolved to are a set, not a
+    sequence, so a stable order makes the payload deterministic rather than beholden to the order the
+    concepts happened to be named in — the distance- and score-ordered lists upstream keep their order,
+    which there is load-bearing; here it is not.
+    """
+    return {"@type": sorted(type_names), "text": raw_text}
+
+
+def persist(conn, raw_text: str, payload: dict, ontology_ids: list[int]) -> int:
+    """Save the routed fact once — the fact row, its embedding, and one link per concept — and return its id.
+
+    The raw text is embedded (as a stored document) before the transaction opens, the same discipline
+    the minter keeps: a network round trip to Ollama must not be held across an open transaction
+    pinning a pooled connection. Inside one transaction then: the fact and its thin payload land in
+    diary_facts, the vector lands in the active model's set through the view (so a model swap never
+    touches this write), and one diary_fact_ontology row is written per concept the fact resolved to —
+    the many-to-many that lets a single fact be all of its concepts at once. The whole write is atomic:
+    a fact is never left half-filed, with an embedding but no links or a payload but no vector.
+    """
+    vector = embedding.embed(raw_text, task="document")
+    # pgvector has no psycopg adapter installed, so the vector crosses as its text literal and casts ::vector.
+    vector_literal = "[" + ",".join(repr(x) for x in vector) + "]"
+    with conn.transaction():
+        fact_id = conn.execute(
+            "INSERT INTO diary_facts (raw_text, payload) VALUES (%s, %s::jsonb) RETURNING id",
+            (raw_text, json.dumps(payload)),
+        ).fetchone()[0]
+        model_id = conn.execute("SELECT id FROM embedding_model WHERE is_active").fetchone()[0]
+        conn.execute(
+            "INSERT INTO active_diary_fact_embedding (diary_fact_id, model_id, embedding) "
+            "VALUES (%s, %s, %s::vector)",
+            (fact_id, model_id, vector_literal),
+        )
+        for ontology_id in ontology_ids:
+            conn.execute(
+                "INSERT INTO diary_fact_ontology (diary_fact_id, ontology_id) VALUES (%s, %s)",
+                (fact_id, ontology_id),
+            )
+    return fact_id
+
+
+def ingest(conn, raw_text: str) -> int:
+    """The full write path for one raw diary fact, end to end — returns the filed fact's id.
+
+    Name the concepts the fact expresses, route each to a type on its own, then synthesize the thin
+    payload and persist the fact once. The routed ids are de-duplicated first-seen-first: two concepts
+    can resolve to the same type (a fact "with a friend" naming both companionship and the friendship),
+    and a fact is linked to a concept once, not once per phrase that led there — the join table's
+    composite key would reject the second link anyway, so we collapse it here rather than trip it.
+    The payload's `@type` names are read back from the store by id, so a freshly minted type carries
+    the name the store actually holds, and both the payload and the link rows are ordered alphabetically
+    by that name — the concepts are a set, so a stable order beats the order they happened to be named in.
+    """
+    routed = [route_concept(conn, concept) for concept in extract_concepts(raw_text)]
+    ontology_ids = list(dict.fromkeys(routed))
+    rows = conn.execute(
+        "SELECT id, type_name FROM schema_ontology WHERE id = ANY(%s)", (ontology_ids,)
+    ).fetchall()
+    name_by_id = {r[0]: r[1] for r in rows}
+    ontology_ids.sort(key=lambda ontology_id: name_by_id[ontology_id])
+    payload = synthesize([name_by_id[o] for o in ontology_ids], raw_text)
+    return persist(conn, raw_text, payload, ontology_ids)

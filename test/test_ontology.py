@@ -436,3 +436,256 @@ def test_generate_json_raises_on_empty_response(monkeypatch):
 
     with pytest.raises(RuntimeError):
         llm.generate_json("some prompt", _Scored)
+
+
+# --- concept extraction (the naming step), with the LLM faked ------------------------------
+
+
+def test_extract_concepts_names_the_distinct_concepts(monkeypatch):
+    # One call reads the fact and returns the kinds of things it is about, as a plain list.
+    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"response": '{"concepts": ["a boxing session", "time with a friend", "a heat wave"]}'}))
+
+    got = ontology.extract_concepts("boxing with my friend Jeremy during the heat wave")
+
+    assert got == ["a boxing session", "time with a friend", "a heat wave"]
+
+
+def test_extract_concepts_prompts_with_the_fact_and_demands_at_least_one(monkeypatch):
+    # The prompt must carry the fact, and the schema must forbid an empty list — a fact is always
+    # about something, so "no concepts" is a mis-read the decoder grammar refuses up front.
+    captured = {}
+
+    def fake_post(url, json, timeout):
+        captured["json"] = json
+        return _FakeResponse({"response": '{"concepts": ["a nap"]}'})
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    ontology.extract_concepts("dozed off on the couch")
+
+    assert "dozed off on the couch" in captured["json"]["prompt"]
+    assert captured["json"]["format"]["properties"]["concepts"]["minItems"] == 1
+
+
+def test_extract_concepts_rejects_an_empty_list(monkeypatch):
+    # A reply naming no concept breaks the min-length and raises at the boundary rather than
+    # letting a fact through with nothing to file it under.
+    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"response": '{"concepts": []}'}))
+
+    with pytest.raises(ValidationError):
+        ontology.extract_concepts("something happened")
+
+
+# --- routing one concept (recall → re-rank → decide → grey → mint), faked ------------------
+
+
+def test_route_concept_reuses_a_clear_match(client, monkeypatch):
+    # A concept whose nearest type the re-ranker scores well is reused — no new type is coined.
+    def dispatch(url, json, timeout):
+        if url.endswith("/api/embed"):  # the recall query embedding: point it straight at the type
+            return _FakeResponse({"embeddings": [_vec(**{"0": 1.0})]})
+        return _FakeResponse({"response": '{"scores": [{"type": "boxing_session", "score": 0.95}]}'})
+
+    monkeypatch.setattr(llm.httpx, "post", dispatch)
+    with db.get_pool().connection() as conn:
+        existing = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
+        before = conn.execute("SELECT count(*) FROM schema_ontology").fetchone()[0]
+
+        got = ontology.route_concept(conn, "hit the heavy bag")
+
+        assert got == existing
+        assert conn.execute("SELECT count(*) FROM schema_ontology").fetchone()[0] == before
+
+
+def test_route_concept_mints_on_an_empty_store(client, monkeypatch):
+    # Nothing to recall, so nothing to reuse: the concept coins its first type and route returns it.
+    _fake_ollama(monkeypatch, generate='{"type_name": "boxing_session", "definition": "a bout of boxing", "parent": "none"}')
+
+    with db.get_pool().connection() as conn:
+        got = ontology.route_concept(conn, "hit the heavy bag")
+
+        row = conn.execute(
+            "SELECT type_name FROM schema_ontology WHERE id = %s", (got,)
+        ).fetchone()
+        assert row == ("boxing_session",)
+
+
+def test_route_concept_coins_then_reuses_the_same_type(client, monkeypatch):
+    # The acceptance criterion end to end for one concept: the first fact of a novel kind coins a
+    # type; a second fact of the same kind reuses it rather than minting a duplicate.
+    with db.get_pool().connection() as conn:
+        # First concept: empty store → mint. The mint reply names the new type; the embed lands its vector.
+        _fake_ollama(monkeypatch, generate='{"type_name": "boxing_session", "definition": "a bout of boxing", "parent": "none"}')
+        first = ontology.route_concept(conn, "hit the heavy bag")
+
+        # Second concept of the same kind: recall now finds the coined type, and the re-ranker
+        # scores it a clear reuse — so no second type is coined.
+        def dispatch(url, json, timeout):
+            if url.endswith("/api/embed"):
+                return _FakeResponse({"embeddings": [_vec(**{"0": 1.0})]})
+            return _FakeResponse({"response": '{"scores": [{"type": "boxing_session", "score": 0.95}]}'})
+
+        monkeypatch.setattr(llm.httpx, "post", dispatch)
+        second = ontology.route_concept(conn, "three rounds on the bag")
+
+        assert second == first
+        assert conn.execute(
+            "SELECT count(*) FROM schema_ontology WHERE type_name = 'boxing_session'"
+        ).fetchone()[0] == 1
+
+
+def test_route_concept_grey_gate_reuses_on_a_fence_sitting_score(client, monkeypatch):
+    # A top score in the grey band spends one yes/no call; a "fits" reuses rather than mints.
+    monkeypatch.setattr(config, "REUSE_THRESHOLD", 0.7)
+    monkeypatch.setattr(config, "MINT_THRESHOLD", 0.3)
+
+    def dispatch(url, json, timeout):
+        if url.endswith("/api/embed"):
+            return _FakeResponse({"embeddings": [_vec(**{"0": 1.0})]})
+        # Two generative calls share this path: the re-rank asks to score the pool, the grey gate
+        # asks a single yes/no. The re-rank prompt is the one that says "Score each candidate".
+        if "Score each candidate" in json["prompt"]:
+            return _FakeResponse({"response": '{"scores": [{"type": "boxing_session", "score": 0.5}]}'})
+        return _FakeResponse({"response": '{"fits": true}'})
+
+    monkeypatch.setattr(llm.httpx, "post", dispatch)
+    with db.get_pool().connection() as conn:
+        existing = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
+
+        got = ontology.route_concept(conn, "hit the heavy bag")
+
+        assert got == existing
+
+
+# --- the thin synthesis (Phase 2), a pure deterministic assembly ---------------------------
+
+
+def test_synthesize_builds_the_thin_payload_and_nothing_more():
+    # The payload carries exactly two things: the @type links and the raw text verbatim.
+    payload = ontology.synthesize(
+        ["boxing_session", "friends", "heat_wave"],
+        "boxing with my friend Jeremy during the heat wave",
+    )
+
+    assert payload == {
+        "@type": ["boxing_session", "friends", "heat_wave"],
+        "text": "boxing with my friend Jeremy during the heat wave",
+    }
+    # Thin means thin: no particulars are pulled out into structured keys.
+    assert set(payload.keys()) == {"@type", "text"}
+
+
+def test_synthesize_keeps_the_text_verbatim_and_sorts_the_types():
+    # The raw text is not touched; the @type links are sorted alphabetically for a stable payload,
+    # whatever order the caller hands them in.
+    raw = "  weird\tspacing and CASING kept As-Is  "
+    payload = ontology.synthesize(["b_type", "a_type"], raw)
+
+    assert payload["text"] == raw
+    assert payload["@type"] == ["a_type", "b_type"]
+
+
+# --- persistence, against the database with the fact embedding faked -----------------------
+
+
+def test_persist_writes_the_fact_its_payload_embedding_and_links(client, monkeypatch):
+    # One fact, one embedding row, and one link per concept — the whole write, atomic.
+    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"embeddings": [_vec(**{"0": 1.0})]}))
+
+    with db.get_pool().connection() as conn:
+        a = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
+        b = _add_type(conn, "friends", "time spent with a friend", _vec(**{"1": 1.0}))
+        payload = ontology.synthesize(["boxing_session", "friends"], "boxing with a friend")
+
+        fact_id = ontology.persist(conn, "boxing with a friend", payload, [a, b])
+
+        row = conn.execute(
+            "SELECT raw_text, payload FROM diary_facts WHERE id = %s", (fact_id,)
+        ).fetchone()
+        assert row[0] == "boxing with a friend"
+        assert row[1] == {"@type": ["boxing_session", "friends"], "text": "boxing with a friend"}
+        # One embedding row in the active set, keyed back to the fact.
+        assert conn.execute(
+            "SELECT count(*) FROM active_diary_fact_embedding WHERE diary_fact_id = %s", (fact_id,)
+        ).fetchone()[0] == 1
+        # One link per concept.
+        assert {r[0] for r in conn.execute(
+            "SELECT ontology_id FROM diary_fact_ontology WHERE diary_fact_id = %s", (fact_id,)
+        ).fetchall()} == {a, b}
+
+
+def test_persist_payload_is_queryable_by_jsonb_operators(client, monkeypatch):
+    # The point of storing JSON-LD in JSONB: reach into it with Postgres operators.
+    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"embeddings": [_vec(**{"0": 1.0})]}))
+
+    with db.get_pool().connection() as conn:
+        a = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
+        payload = ontology.synthesize(["boxing_session"], "hit the heavy bag")
+        fact_id = ontology.persist(conn, "hit the heavy bag", payload, [a])
+
+        # The @type array and the raw text are both reachable through -> / ->>.
+        got = conn.execute(
+            "SELECT id FROM diary_facts WHERE payload -> '@type' ? 'boxing_session'"
+        ).fetchall()
+        assert [r[0] for r in got] == [fact_id]
+        assert conn.execute(
+            "SELECT payload ->> 'text' FROM diary_facts WHERE id = %s", (fact_id,)
+        ).fetchone()[0] == "hit the heavy bag"
+
+
+# --- the full write path, end to end ------------------------------------------------------
+
+
+def test_ingest_routes_every_concept_links_all_and_files_the_thin_payload(client, monkeypatch):
+    # A fact expressing several concepts is filed against all of them, with a thin payload naming
+    # each type. Routing is stubbed to fixed types (its own tests cover the recall/mint plumbing),
+    # so this proves the orchestration: name → route each → synthesize → persist, once.
+    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"embeddings": [_vec(**{"0": 1.0})]}))
+
+    with db.get_pool().connection() as conn:
+        a = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
+        b = _add_type(conn, "friends", "time spent with a friend", _vec(**{"1": 1.0}))
+        c = _add_type(conn, "heat_wave", "a spell of extreme heat", _vec(**{"2": 1.0}))
+
+        # Name and route the concepts out of alphabetical order, to prove the payload sorts them.
+        monkeypatch.setattr(ontology, "extract_concepts",
+                            lambda text: ["a heat wave", "a boxing session", "time with a friend"])
+        routed = iter([c, a, b])
+        monkeypatch.setattr(ontology, "route_concept", lambda conn, concept: next(routed))
+
+        raw = "boxing with my friend Jeremy during the heat wave"
+        fact_id = ontology.ingest(conn, raw)
+
+        assert conn.execute(
+            "SELECT payload FROM diary_facts WHERE id = %s", (fact_id,)
+        ).fetchone()[0] == {"@type": ["boxing_session", "friends", "heat_wave"], "text": raw}
+        assert {r[0] for r in conn.execute(
+            "SELECT ontology_id FROM diary_fact_ontology WHERE diary_fact_id = %s", (fact_id,)
+        ).fetchall()} == {a, b, c}
+
+
+def test_ingest_dedups_concepts_that_route_to_the_same_type(client, monkeypatch):
+    # Two named concepts can resolve to one type; the fact links to it once, and its @type names it
+    # once — the dedup collapses it before the join table's composite key would reject the second link.
+    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"embeddings": [_vec(**{"0": 1.0})]}))
+
+    with db.get_pool().connection() as conn:
+        a = _add_type(conn, "friends", "time spent with a friend", _vec(**{"0": 1.0}))
+
+        monkeypatch.setattr(ontology, "extract_concepts",
+                            lambda text: ["time with a friend", "the friendship itself"])
+        monkeypatch.setattr(ontology, "route_concept", lambda conn, concept: a)
+
+        fact_id = ontology.ingest(conn, "a long lunch with my friend")
+
+        assert conn.execute(
+            "SELECT payload -> '@type' FROM diary_facts WHERE id = %s", (fact_id,)
+        ).fetchone()[0] == ["friends"]
+        assert conn.execute(
+            "SELECT count(*) FROM diary_fact_ontology WHERE diary_fact_id = %s", (fact_id,)
+        ).fetchone()[0] == 1
