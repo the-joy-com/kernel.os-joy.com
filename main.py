@@ -130,6 +130,24 @@ async def lifespan(app: FastAPI):
         )
         gc_sweep.start()
         worker_threads.append(gc_sweep)
+    # Start the background job that files the symbiot's messages into the long-term diary.
+    # Answering a message and remembering it are two separate jobs:
+    # the reply goes back right away, and this job writes the message into the diary a moment later,
+    # running on its own thread, in parallel, so it never makes the symbiot wait.
+    # That way the diary the replies draw on keeps filling by itself, instead of only when someone runs a script by hand.
+    # It has its own on/off switch, like the garbage collector,
+    # because a machine might reasonably want the replies without this background filing, or the reverse.
+    # The two are independent; they share only the shutdown signal (worker_stop),
+    # so the whole process can be wound down together.
+    if config.INGEST_ENABLED:
+        ingestion_sweep = threading.Thread(
+            target=worker.run_ingestion_sweep,
+            args=(worker_stop,),
+            name="diary-ingestion-sweep",
+            daemon=True,
+        )
+        ingestion_sweep.start()
+        worker_threads.append(ingestion_sweep)
     yield
     worker_stop.set()
     for thread in worker_threads:

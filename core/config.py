@@ -218,3 +218,33 @@ GC_SWEEP_INTERVAL_SECONDS = float(os.getenv("GC_SWEEP_INTERVAL_SECONDS", "86400"
 # the test suite turns it off so the sweep can't race the suite —
 # the GC tests drive run_once by hand, the same stance WORKER_ENABLED takes for the intake workers.
 GC_ENABLED = os.getenv("GC_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+
+# The read path (retrieval.py, reply.py): assembling answer-time context and composing the reply.
+# How many diary facts the fast lexical reach hands back — the fixed retrieval budget.
+# Kept modest: these facts are folded into the reply prompt,
+# so the point is the few that bear most on the question, not a wide net —
+# the wide, meaning-based reach is the deep second pass, not this one.
+RETRIEVAL_LIMIT = int(os.getenv("RETRIEVAL_LIMIT", "10"))
+# The generative model that composes the reply.
+# Defaults to the router's model (a fast local one),
+# but named apart because composing prose is a different job from the router's classification calls,
+# and it may want a larger model without a code change.
+# Reached through the same Ollama /api/generate as the router (llm.generate), thinking off for local speed.
+REPLY_MODEL = os.getenv("REPLY_MODEL", RERANK_MODEL)
+# The headroom the context-budget guard (llm._fit) keeps below a model's optimal window.
+# It covers two slacks at once: tiktoken only approximates qwen's tokeniser, so the count may run a little low,
+# and a generative call spends some of its window on the reply it produces, not just the prompt it reads.
+# A fraction of the optimal, held back from the input budget — 0.1 leaves a tenth of the window as margin.
+CONTEXT_SAFETY_MARGIN = float(os.getenv("CONTEXT_SAFETY_MARGIN", "0.1"))
+
+# Live diary ingestion (worker.run_ingestion_sweep):
+# the background sweep that files each settled message into the diary through the write path,
+# so the store the read path leans on fills itself as messages arrive.
+# On by default; the test suite turns it off so the live sweep can't race the suite —
+# the ingestion tests drive _ingest_one by hand, the same stance WORKER_ENABLED and GC_ENABLED take.
+INGEST_ENABLED = os.getenv("INGEST_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+# How often the ingestion sweep looks for a message to file when idle.
+# It drains back-to-back while a backlog remains;
+# this is only the idle poll, kept short so a just-answered message joins the diary promptly —
+# fresh for the next reply's retrieval — without an idle kernel spinning.
+INGEST_SWEEP_INTERVAL_SECONDS = float(os.getenv("INGEST_SWEEP_INTERVAL_SECONDS", "10"))

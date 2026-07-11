@@ -717,6 +717,29 @@ def test_persist_nulls_happened_at_when_absent(client, monkeypatch):
         ).fetchone()[0] is None
 
 
+def test_persist_files_a_message_exactly_once_by_intake_id(client, monkeypatch):
+    # The exactly-once guarantee at the write boundary (migration 0013): persisting the same message twice
+    # returns the first fact and writes no second — the UNIQUE intake_id makes a re-file a no-op, so an
+    # interrupted or repeated ingestion sweep can never duplicate a fact.
+    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"embeddings": [_vec(**{"0": 1.0})]}))
+
+    with db.get_pool().connection() as conn:
+        message_id = conn.execute(
+            "INSERT INTO intake (message, symbiot_id, status) VALUES ('boxing today', 1, 'answered') RETURNING id"
+        ).fetchone()[0]
+        a = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
+        payload = ontology.synthesize(["boxing_session"], "boxing today")
+
+        first = ontology.persist(conn, "boxing today", payload, [a], intake_id=message_id)
+        second = ontology.persist(conn, "boxing today", payload, [a], intake_id=message_id)
+
+        assert first == second  # the re-file reused the first fact
+        assert conn.execute(
+            "SELECT count(*) FROM diary_facts WHERE intake_id = %s", (message_id,)
+        ).fetchone()[0] == 1
+
+
 # --- the full write path, end to end ------------------------------------------------------
 
 

@@ -44,12 +44,6 @@ is a different thing with a different shape (no question, no walk), so it lives 
 table and module (missive.py), not folded into this one.
 """
 
-# The reason recorded when the deadline sweep — not a worker — fails a row.
-# A worker that fails a message writes a specific reason (a traceback, or that it outran the deadline);
-# the sweep only knows a row overstayed its ceiling with no worker left to speak for it,
-# so it says exactly that, and the two are told apart by their reason.
-SWEEP_REASON = "deadline exceeded (swept: no worker reported an outcome)"
-
 # The reason recorded when restart recovery abandons a message rather than re-queuing it:
 # it was caught mid-work by a kernel that died, re-run as far as its budget allowed, and never once completed —
 # so there is no traceback to keep, only this.
@@ -58,6 +52,12 @@ SWEEP_REASON = "deadline exceeded (swept: no worker reported an outcome)"
 ORPHAN_ABANDON_REASON = (
     "abandoned in restart recovery (caught mid-work, retry budget spent, no attempt completed)"
 )
+
+# The reason recorded when the deadline sweep — not a worker — fails a row.
+# A worker that fails a message writes a specific reason (a traceback, or that it outran the deadline);
+# the sweep only knows a row overstayed its ceiling with no worker left to speak for it,
+# so it says exactly that, and the two are told apart by their reason.
+SWEEP_REASON = "deadline exceeded (swept: no worker reported an outcome)"
 
 
 # The functions below are ordered by the message's lifecycle, not alphabetically:
@@ -308,3 +308,27 @@ def recover_orphaned(conn, max_attempts: int) -> tuple[int, list[int]]:
         (ORPHAN_ABANDON_REASON, max_attempts),
     )
     return requeued, [row[0] for row in cursor.fetchall()]
+
+
+def next_uningested(conn) -> tuple[int, str] | None:
+    """The oldest of the symbiot's messages that has settled but hasn't been filed into the diary yet.
+
+    The ingestion sweep's eligibility read (worker.run_ingestion_sweep):
+    an authed message — the diary is the symbiot's, so an anonymous line is never distilled into it —
+    that has reached a terminal outcome (answered or abandoned),
+    so its reply is done and the message never lands in its own reply's retrieval context,
+    and that has no diary fact yet bearing its id — the mirror of the UNIQUE intake_id that makes filing exactly-once.
+    Returns (id, message), or None when none is waiting.
+    A message just filed is excluded next pass (a fact now bears its id);
+    one whose filing crashed before it committed is still eligible and simply picked up again —
+    so the sweep drops nothing and duplicates nothing.
+    A pure read: it takes no lock and moves nothing, so it never contends with a worker.
+    """
+    row = conn.execute(
+        "SELECT id, message FROM intake "
+        "WHERE symbiot_id IS NOT NULL "
+        "AND status IN ('answered', 'abandoned') "
+        "AND NOT EXISTS (SELECT 1 FROM diary_facts WHERE diary_facts.intake_id = intake.id) "
+        "ORDER BY id LIMIT 1"
+    ).fetchone()
+    return (row[0], row[1]) if row else None

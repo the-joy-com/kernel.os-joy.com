@@ -8,8 +8,10 @@ claim_next is race-safe (FOR UPDATE SKIP LOCKED), so two workers never grab the 
 The reply is computed in a killable child process (execution.run_with_deadline),
 so a worker is never itself pinned by work that hangs —
 the work is killed at the deadline and the message failed, and the worker moves on.
-The reply it produces is a placeholder: the kernel has no real work to perform on a
-message yet, so _produce_reply stands in for that answer until that work exists.
+The reply is real for a recognised symbiot —
+composed from the diary facts the message bears on, and the persona (the read path, Tier 1) —
+while an anonymous caller gets a stand-in, answered without the symbiot's private memory.
+The context is gathered on the worker's own thread; only the composing LLM call runs in the killable child, where the deadline bites.
 
 A message is claimed in its own transaction, so the moment work begins the row is
 durably 'working'; the reply is written in a second transaction once it exists.
@@ -29,11 +31,14 @@ import threading
 
 from core import config
 from core import db
-from services import execution
-from services import intake
 from core import logs
 from core import protocol
+from services import execution
+from services import intake
+from services import ontology
 from services import push
+from services import reply
+from services import retrieval
 
 # How long the loop waits before looking again once it finds nothing to do.
 POLL_INTERVAL_SECONDS = 1.0
@@ -45,21 +50,35 @@ POLL_INTERVAL_SECONDS = 1.0
 SWEEP_INTERVAL_SECONDS = 5.0
 
 
-def _produce_reply(task: tuple[str, int | None]) -> str:
-    """The reply to a message, given the line and who sent it.
+def _gather_context(pool, message: str, symbiot_id: int | None) -> list[retrieval.Fact]:
+    """The diary facts that bear on a message, gathered synchronously before the reply is composed.
 
-    A placeholder: the kernel has nothing real to compute on a message yet,
-    so this stands in for the answer until that work exists.
-    But it already answers a recognized symbiot differently from an anonymous caller —
-    the distinction is real and the server draws it, which is what this rung is for;
-    only the wording is a stand-in, and this is the seam the intelligence layer will grow from.
-    task is (message, symbiot_id): symbiot_id is None when the line came in with no live session.
-    It arrives as one tuple because the work runs in a child process (see run_with_deadline), which passes a single arg.
+    Runs on the worker's own thread, not in the killable child:
+    it is a bounded, indexed read (retrieval.search), so it carries no hang risk to protect against,
+    and doing it here keeps the child — where the deadline bites — to the one call that can run long, the LLM.
+    Only a recognised symbiot's message reaches the diary:
+    an anonymous line is answered without it, so the symbiot's own memory is never read to answer a stranger.
     """
-    _message, symbiot_id = task
+    if symbiot_id is None:
+        return []
+    with pool.connection() as conn:
+        return retrieval.search(conn, message)
+
+
+def _produce_reply(task: tuple[str, int | None, list[retrieval.Fact]]) -> str:
+    """The reply to a message, given the line, who sent it, and the context gathered for it.
+
+    A recognised symbiot gets a real answer, composed from that context and the persona (reply.compose) —
+    the first reply read off the diary rather than a canned line.
+    An anonymous caller gets the stand-in still: the diary is the symbiot's, so a stranger is answered
+    without it, and told to authenticate rather than handed a memory that isn't theirs.
+    task is (message, symbiot_id, context): it arrives as one tuple because the work runs in a child process
+    (see run_with_deadline), which passes a single arg — context is the facts _gather_context already pulled.
+    """
+    message, symbiot_id, context = task
     if symbiot_id is None:
         return protocol.STANDIN_ANSWER_ANON
-    return protocol.STANDIN_ANSWER_AUTHED
+    return reply.compose(message, context)
 
 
 def _process_one() -> bool:
@@ -81,8 +100,11 @@ def _process_one() -> bool:
     if claimed is None:
         return False
     message_id, message, symbiot_id = claimed
+    # Assemble the answer-time context here, on the worker's thread, before the killable child runs:
+    # the read is fast and bounded, so only the composing LLM call needs the deadline's protection.
+    context = _gather_context(pool, message, symbiot_id)
     result = execution.run_with_deadline(
-        _produce_reply, (message, symbiot_id), config.INTAKE_DEADLINE_SECONDS
+        _produce_reply, (message, symbiot_id, context), config.INTAKE_DEADLINE_SECONDS
     )
     answered = False
     with pool.connection() as conn:
@@ -161,3 +183,49 @@ def run_reconcile_sweep(stop: threading.Event) -> None:
             log.exception("reconcile sweep iteration failed")
         stop.wait(SWEEP_INTERVAL_SECONDS)
     log.info("reconcile sweep stopped")
+
+
+def _ingest_one() -> bool:
+    """File the next of the symbiot's settled messages into the diary. True if there was one to file.
+
+    The read that finds an eligible message and the write that files it use separate connections:
+    ontology.ingest is a long run of model calls,
+    and holding the eligibility read's connection across it would pin a pooled slot for no reason.
+    Exactly-once does not depend on holding anything —
+    the UNIQUE intake_id, and the eligibility that mirrors it, make a re-file a no-op —
+    so nothing is lost by letting go between the two.
+    """
+    pool = db.get_pool()
+    with pool.connection() as conn:
+        pending = intake.next_uningested(conn)
+    if pending is None:
+        return False
+    message_id, message = pending
+    with pool.connection() as conn:
+        ontology.ingest(conn, message, intake_id=message_id)
+    return True
+
+
+def run_ingestion_sweep(stop: threading.Event) -> None:
+    """File settled messages into the diary until `stop` is set. Started from the kernel's lifespan.
+
+    The parallel, non-blocking half of the read path's promise:
+    the reply is sent the instant it is ready, and the message is distilled into the diary here, off to the side,
+    on its own thread — so the symbiot never waits on ingestion's several model calls to get their answer.
+    It drains the way the workers do: a filed message means looking again at once, an idle pass waits a beat,
+    so a backlog clears quickly without an idle kernel spinning on the database.
+    One bad message can't take the loop down — a failed filing is logged and left eligible for the next pass,
+    tried again if it was a transient hiccup, or failing harmlessly off the critical path if it is a poison line.
+    """
+    log = logs.get("worker")
+    log.info("ingestion sweep started")
+    while not stop.is_set():
+        try:
+            worked = _ingest_one()
+        except Exception:
+            # Keep the loop alive across a bad filing so one message can't kill it.
+            log.exception("ingestion sweep iteration failed")
+            worked = False
+        if not worked:
+            stop.wait(config.INGEST_SWEEP_INTERVAL_SECONDS)
+    log.info("ingestion sweep stopped")

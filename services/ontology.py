@@ -512,6 +512,7 @@ def persist(
     ontology_ids: list[int],
     *,
     happened_at: datetime | None = None,
+    intake_id: int | None = None,
 ) -> int:
     """Save the routed fact once — the fact row, its embedding, and one link per concept — and return its id.
 
@@ -527,6 +528,10 @@ def persist(
     when the thing occurred, or None when the fact named no moment —
     stored as-is, null and all, with the read path standing created_at in for a null.
     The other clock, created_at, is filled automatically by the row default, so it is not passed here.
+
+    intake_id is the message this fact was distilled from, or None for a fact filed outside the message flow (a by-hand smoke).
+    It is stored under a UNIQUE index, so persisting the same message twice files it once —
+    the second call reuses the first's fact rather than duplicating it, which is how live ingestion stays exactly-once.
     """
     vector = embedding.embed(raw_text, task="document")
     # pgvector has no psycopg adapter installed, so the vector crosses as its text literal and casts ::vector.
@@ -534,11 +539,22 @@ def persist(
     with conn.transaction():
         # happened_at rides through exactly as given, None becoming a SQL NULL for a fact that named no moment;
         # created_at fills itself from the row default — the telling moment for a live write.
-        fact_id = conn.execute(
-            "INSERT INTO diary_facts (raw_text, payload, happened_at) "
-            "VALUES (%s, %s::jsonb, %s) RETURNING id",
-            (raw_text, json.dumps(payload), happened_at),
-        ).fetchone()[0]
+        # intake_id is the message this fact came from (NULL for a by-hand fact),
+        # and its UNIQUE index makes filing exactly-once:
+        # a re-file of an already-filed message conflicts, writes nothing, and reuses the fact the first run committed —
+        # so an interrupted or repeated ingestion sweep never duplicates a fact.
+        row = conn.execute(
+            "INSERT INTO diary_facts (raw_text, payload, happened_at, intake_id) "
+            "VALUES (%s, %s::jsonb, %s, %s) ON CONFLICT (intake_id) DO NOTHING RETURNING id",
+            (raw_text, json.dumps(payload), happened_at, intake_id),
+        ).fetchone()
+        if row is None:
+            # Already filed for this intake_id (only a non-NULL id can conflict — NULLs are always distinct):
+            # reuse the existing fact and write no second embedding or links.
+            return conn.execute(
+                "SELECT id FROM diary_facts WHERE intake_id = %s", (intake_id,)
+            ).fetchone()[0]
+        fact_id = row[0]
         model_id = conn.execute("SELECT id FROM embedding_model WHERE is_active").fetchone()[0]
         conn.execute(
             "INSERT INTO active_diary_fact_embedding (diary_fact_id, model_id, embedding) "
@@ -553,7 +569,7 @@ def persist(
     return fact_id
 
 
-def ingest(conn, raw_text: str) -> int:
+def ingest(conn, raw_text: str, *, intake_id: int | None = None) -> int:
     """The full write path for one raw diary fact, end to end — returns the filed fact's id.
 
     Read the event clock first:
@@ -570,6 +586,10 @@ def ingest(conn, raw_text: str) -> int:
     The payload's `@type` names are read back from the store by id, so a freshly minted type carries
     the name the store actually holds, and both the payload and the link rows are ordered alphabetically
     by that name — the concepts are a set, so a stable order beats the order they happened to be named in.
+
+    intake_id, when given, is the message this fact was distilled from —
+    passed straight to persist, whose UNIQUE index keeps live ingestion exactly-once;
+    a by-hand call omits it and files an unlinked fact.
     """
     happened_at = extract_happened_at(raw_text, reference=datetime.now(timezone.utc))
     routed = [route_concept(conn, concept) for concept in extract_concepts(raw_text)]
@@ -580,4 +600,4 @@ def ingest(conn, raw_text: str) -> int:
     name_by_id = {r[0]: r[1] for r in rows}
     ontology_ids.sort(key=lambda ontology_id: name_by_id[ontology_id])
     payload = synthesize([name_by_id[o] for o in ontology_ids], raw_text)
-    return persist(conn, raw_text, payload, ontology_ids, happened_at=happened_at)
+    return persist(conn, raw_text, payload, ontology_ids, happened_at=happened_at, intake_id=intake_id)
