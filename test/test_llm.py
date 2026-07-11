@@ -129,7 +129,8 @@ def _prompt(fake):
 
 def test_generate_returns_free_text_with_no_schema_grammar(monkeypatch):
     # A spoken reply is prose, not JSON: no `response_format` is sent, thinking is off, streaming is off,
-    # temperature is left to the model, and the model's text comes back as-is.
+    # temperature is pinned to 0 (as for every call through this boundary), the reply is held to the model's
+    # output ceiling, and the model's text comes back as-is.
     fake = _FakeChat(generate="here is a warm reply")
     monkeypatch.setattr(llm, "OpenAI", fake)
 
@@ -139,7 +140,8 @@ def test_generate_returns_free_text_with_no_schema_grammar(monkeypatch):
     assert "response_format" not in fake.captured["json"]  # free prose, unconstrained by a schema
     assert fake.captured["json"]["reasoning_effort"] == "none"  # thinking off, Scaleway's documented way
     assert fake.captured["json"]["stream"] is False
-    assert "temperature" not in fake.captured["json"]  # the reply keeps the model's own warmth
+    assert fake.captured["json"]["temperature"] == 0  # sampling pinned, not left to the provider's default
+    assert fake.captured["json"]["max_tokens"] == llm.models.MODELS["glm-5.2"].max_output_tokens  # the reply's runaway guard
     assert fake.captured["base_url"] == llm.config.SCALEWAY_API_BASE_URL
 
 
@@ -216,6 +218,10 @@ def test_summarise_asks_to_condense_and_caps_the_result(monkeypatch):
     assert "the big context block to shrink" in _prompt(fake)
     assert "42" in _prompt(fake)
     assert out == "CONDENSED<42>"  # the model's summary, truncated to the target
+    # The summariser overrides the ordinary reply ceiling with its own target: it may legitimately need
+    # more room than a reply, so it names the target as its output cap rather than take the model default.
+    assert fake.captured["json"]["max_tokens"] == 42
+    assert fake.captured["json"]["temperature"] == 0  # a condensation is faithful, not warm
 
 
 # --- the fallback ladder: Scaleway → Mistral → local Ollama, per request --------------------
@@ -234,6 +240,9 @@ def test_ladder_falls_over_to_mistral_on_a_scaleway_outage(monkeypatch):
 
     assert out == "mistral answered"
     assert mistral.captured["json"]["model"] == llm.config.GENERATIVE_FALLBACK_MODEL
+    # The output ceiling is resolved per tier, from the model about to answer — so the Mistral tier is held
+    # to Mistral's own ceiling, not the primary's, a cap it is guaranteed to support.
+    assert mistral.captured["json"]["max_tokens"] == llm.models.MODELS[llm.config.GENERATIVE_FALLBACK_MODEL].max_output_tokens
 
 
 def test_ladder_falls_to_local_ollama_when_both_clouds_are_down(monkeypatch):
@@ -248,6 +257,9 @@ def test_ladder_falls_to_local_ollama_when_both_clouds_are_down(monkeypatch):
 
     assert out == "local answered"
     assert local.captured["json"]["model"] == llm.config.GENERATIVE_LOCAL_FALLBACK_MODEL
+    # The local tier caps output through Ollama's `num_predict` (unbounded by default), resolved from the
+    # local model's own ceiling — like the cloud tiers above it, each held to its own.
+    assert local.captured["json"]["options"]["num_predict"] == llm.models.MODELS[llm.config.GENERATIVE_LOCAL_FALLBACK_MODEL].max_output_tokens
 
 
 def test_ladder_surfaces_a_scaleway_4xx_without_falling_over(monkeypatch):

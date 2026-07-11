@@ -22,7 +22,7 @@ is one the intake deadline is sized to absorb (config.INTAKE_DEADLINE_SECONDS cl
 A 4xx (a bad request, a bad key) is *not* an outage: it is our own mistake,
 so it surfaces at once rather than falling through to a provider that would fail identically and hide the bug.
 
-Three call settings are fixed here so no caller has to remember them:
+Four call settings are fixed here so no caller has to remember them:
 thinking is off —
 every call is a fast judgment or a reply the symbiot is waiting on, not a problem that wants a visible reasoning trace —
 so GLM's reasoning is disabled with Scaleway's documented `reasoning_effort="none"`,
@@ -32,8 +32,10 @@ the output is held to the shape the caller demands —
 which binds the decoder to that model's schema, and validates the reply back through the same model,
 so the answer that crosses this boundary is a typed object with its fields already checked,
 and a reply that breaks the schema raises here rather than slipping through as a half-read decision;
-and sampling is at temperature 0 for the router's scored judgments, so the same inputs score the same way twice,
-while the spoken reply is left at the model's own default warmth.
+sampling is at temperature 0 for every call, judgment and reply alike —
+the router wants the same inputs to score the same way twice,
+and the reply may be composed by any tier of the ladder, so pinning 0 strips the sampling randomness rather than stacking it on top of the differences between the models (it doesn't make the tiers speak identically, but it stops adding avoidable variance to whichever one answers);
+and the reply length is held to a per-model output ceiling (services.models), a guard that stops a runaway generation, generous above any real reply.
 There is no loose-JSON mode:
 the model boundary gets the same typed discipline the HTTP boundary already gets from these DTOs (core/dtos.py),
 from the first call rather than tightened later.
@@ -79,7 +81,7 @@ class _Outage(Exception):
     and is left to propagate so it surfaces rather than being masked by a fall-through."""
 
 
-def _scaleway(model_name: str, prompt: str, schema: type[BaseModel] | None, temperature: float | None) -> str:
+def _scaleway(model_name: str, prompt: str, schema: type[BaseModel] | None, temperature: float | None, max_output_tokens: int | None) -> str:
     """One generative call to Scaleway through the OpenAI-compatible client Scaleway advertises.
 
     The client is built fresh per call (fork-safety for the reply's killable child) with retries off,
@@ -108,6 +110,8 @@ def _scaleway(model_name: str, prompt: str, schema: type[BaseModel] | None, temp
     }
     if temperature is not None:
         request["temperature"] = temperature
+    if max_output_tokens is not None:
+        request["max_tokens"] = max_output_tokens
     try:
         if schema is not None:
             completion = client.chat.completions.parse(response_format=schema, **request)
@@ -126,7 +130,7 @@ def _scaleway(model_name: str, prompt: str, schema: type[BaseModel] | None, temp
     return body
 
 
-def _mistral(model_name: str, prompt: str, schema: type[BaseModel] | None, temperature: float | None) -> str:
+def _mistral(model_name: str, prompt: str, schema: type[BaseModel] | None, temperature: float | None, max_output_tokens: int | None) -> str:
     """One generative call to Mistral's own web API through the official mistralai client.
 
     The fallback tier when Scaleway is down —
@@ -146,6 +150,8 @@ def _mistral(model_name: str, prompt: str, schema: type[BaseModel] | None, tempe
     }
     if temperature is not None:
         request["temperature"] = temperature
+    if max_output_tokens is not None:
+        request["max_tokens"] = max_output_tokens
     try:
         if schema is not None:
             completion = client.chat.parse(response_format=schema, **request)
@@ -167,12 +173,13 @@ def _mistral(model_name: str, prompt: str, schema: type[BaseModel] | None, tempe
     return body
 
 
-def _ollama(model_name: str, prompt: str, schema: type[BaseModel] | None, temperature: float | None) -> str:
+def _ollama(model_name: str, prompt: str, schema: type[BaseModel] | None, temperature: float | None, max_output_tokens: int | None) -> str:
     """One generative call to the local Ollama model — the ladder's last resort, and the rollback target.
 
     Reached when both clouds are down, or directly when a model config points at a local name.
     Built fresh per call for fork-safety, as before.
-    A schema becomes Ollama's `format` (its decode-time grammar); temperature 0 rides `options`.
+    A schema becomes Ollama's `format` (its decode-time grammar); temperature and the output ceiling ride `options` —
+    the ceiling as `num_predict`, which Ollama leaves unbounded (-1) by default, so setting it is what actually caps the reply here.
     This is the last tier, so it raises its real errors rather than _Outage —
     there is nothing further to fall through to.
     """
@@ -180,15 +187,31 @@ def _ollama(model_name: str, prompt: str, schema: type[BaseModel] | None, temper
     request = {"model": model_name, "prompt": prompt, "stream": False, "think": False}
     if schema is not None:
         request["format"] = schema.model_json_schema()
+    options = {}
     if temperature is not None:
-        request["options"] = {"temperature": temperature}
+        options["temperature"] = temperature
+    if max_output_tokens is not None:
+        options["num_predict"] = max_output_tokens
+    if options:
+        request["options"] = options
     body = client.generate(**request).response
     if not body:
         raise RuntimeError(f"generative model {model_name!r} on Ollama returned an empty response")
     return body
 
 
-def _call(*, model: str, prompt: str, schema: type[BaseModel] | None = None, temperature: float | None = None) -> str:
+def _output_cap(override: int | None, model_name: str) -> int | None:
+    """The output ceiling to hand one tier: the caller's explicit `override` when it named one —
+    the summariser, which needs room up to its whole target — otherwise that tier's own model figure,
+    resolved from the model about to answer so a fallback is capped at what it supports, not the primary's.
+    An unmapped model has no figure, so it is left uncapped (None), the historical local-Ollama default."""
+    if override is not None:
+        return override
+    spec = models.MODELS.get(model_name)
+    return spec.max_output_tokens if spec is not None else None
+
+
+def _call(*, model: str, prompt: str, schema: type[BaseModel] | None = None, temperature: float | None = None, max_output_tokens: int | None = None) -> str:
     """Run one generative call down the fallback ladder and return its reply text.
 
     The one place the round trip lives, shared by both public calls and the summariser beneath them.
@@ -197,6 +220,10 @@ def _call(*, model: str, prompt: str, schema: type[BaseModel] | None = None, tem
     each next tier tried only when the one above raised _Outage;
     a model named for another provider is called there directly, the one-line rollback path.
     A model not in the map is treated as a local Ollama name (its historical default).
+    The reply is held to an output ceiling (services.models), resolved per tier by _output_cap:
+    the caller's `max_output_tokens` when it passes one — the summariser, which needs its whole target —
+    otherwise the ceiling of the model about to answer, so a fallback is held to a cap it actually supports
+    rather than the primary's, and every ordinary call is capped without the caller naming a number.
     An empty reply raises inside each tier,
     so neither a transport failure nor a blank answer passes as a half-read decision
     or reaches the symbiot as silence.
@@ -205,17 +232,19 @@ def _call(*, model: str, prompt: str, schema: type[BaseModel] | None = None, tem
     provider = spec.provider if spec is not None else "ollama"
     if provider == "scaleway":
         try:
-            return _scaleway(model, prompt, schema, temperature)
+            return _scaleway(model, prompt, schema, temperature, _output_cap(max_output_tokens, model))
         except _Outage:
             pass
         try:
-            return _mistral(config.GENERATIVE_FALLBACK_MODEL, prompt, schema, temperature)
+            return _mistral(config.GENERATIVE_FALLBACK_MODEL, prompt, schema, temperature,
+                            _output_cap(max_output_tokens, config.GENERATIVE_FALLBACK_MODEL))
         except _Outage:
             pass
-        return _ollama(config.GENERATIVE_LOCAL_FALLBACK_MODEL, prompt, schema, temperature)
+        return _ollama(config.GENERATIVE_LOCAL_FALLBACK_MODEL, prompt, schema, temperature,
+                       _output_cap(max_output_tokens, config.GENERATIVE_LOCAL_FALLBACK_MODEL))
     if provider == "mistral":
-        return _mistral(model, prompt, schema, temperature)
-    return _ollama(model, prompt, schema, temperature)
+        return _mistral(model, prompt, schema, temperature, _output_cap(max_output_tokens, model))
+    return _ollama(model, prompt, schema, temperature, _output_cap(max_output_tokens, model))
 
 
 def _fit(prompt: str, context: str | None, model_name: str) -> str:
@@ -258,7 +287,10 @@ def _summarise(context: str, target_tokens: int, model_name: str) -> str:
     names, dates, and numbers a diary answer turns on.
     It calls the boundary directly, bypassing _fit, so a large context can't recurse into fitting itself,
     and it is sent raw — the model accepts more than its optimal even where it reads that much less well.
-    A summariser can overshoot the length it was asked for,
+    Temperature is 0, as for every call through this boundary — a condensation wants to be faithful and reproducible, not warm.
+    The output ceiling is overridden to `target_tokens`: this call legitimately needs room up to its whole target,
+    which can exceed the ordinary per-model reply ceiling, so it names its own rather than take the default cap.
+    A summariser can still overshoot the length it was asked for,
     so the result is truncated to `target_tokens`,
     making the budget a promise the guard keeps rather than a request the model may ignore.
     """
@@ -268,7 +300,7 @@ def _summarise(context: str, target_tokens: int, model_name: str) -> str:
         "Return only the condensed notes, nothing else.\n\n"
         f"{context}"
     )
-    summary = _call(model=model_name, prompt=prompt)
+    summary = _call(model=model_name, prompt=prompt, temperature=0, max_output_tokens=target_tokens)
     return models.truncate_tokens(summary, target_tokens)
 
 
@@ -285,14 +317,15 @@ def generate(prompt: str, *, model: str | None = None, context: str | None = Non
 
     Thinking is off, as for every call through this boundary —
     the reply is the very thing the symbiot is waiting on, so a reasoning trace is latency this call can't spend.
-    Temperature is deliberately *not* pinned to 0 here, unlike the router's calls:
-    a scored judgment wants to land the same way twice,
-    but a spoken reply reads better with the model's own default warmth than with the flattest wording —
-    so this leaves it to the model.
+    Temperature is pinned to 0, as it is for the router's judgments:
+    the reply may be composed by any tier of the fallback ladder, and each provider warms its own default differently,
+    so leaving it unset would stack that sampling randomness on top of the differences between the models themselves.
+    Pinning 0 doesn't make the three tiers speak identically — they are different models with different voices —
+    but it removes the avoidable variance, so each answers as consistently as it can and the same diary tends to reproduce the same reply.
     An empty response raises rather than returning a blank reply that would reach the symbiot as silence.
     """
     model_name = model or config.RERANK_MODEL
-    return _call(model=model_name, prompt=_fit(prompt, context, model_name))
+    return _call(model=model_name, prompt=_fit(prompt, context, model_name), temperature=0)
 
 
 def generate_json(
