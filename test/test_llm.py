@@ -218,10 +218,24 @@ def test_summarise_asks_to_condense_and_caps_the_result(monkeypatch):
     assert "the big context block to shrink" in _prompt(fake)
     assert "42" in _prompt(fake)
     assert out == "CONDENSED<42>"  # the model's summary, truncated to the target
-    # The summariser overrides the ordinary reply ceiling with its own target: it may legitimately need
-    # more room than a reply, so it names the target as its output cap rather than take the model default.
+    # The summariser asks for its own target as the output cap — more room than an ordinary reply — and here
+    # the target (42) is under the tier's ceiling, so it passes through as named rather than the model default.
     assert fake.captured["json"]["max_tokens"] == 42
     assert fake.captured["json"]["temperature"] == 0  # a condensation is faithful, not warm
+
+
+def test_summarise_target_is_clamped_to_the_tier_ceiling(monkeypatch):
+    # A target sized to the context budget can run past what a provider accepts (Scaleway 400s over its cap,
+    # and a 400 does not fall through). So a target above the tier's own ceiling is clamped down to it,
+    # never sent as-is — the clamp only shortens the summary, the truncation after still holds the budget.
+    fake = _FakeChat(generate="CONDENSED")
+    monkeypatch.setattr(llm, "OpenAI", fake)
+    monkeypatch.setattr(llm.models, "truncate_tokens", lambda text, n: text)
+
+    ceiling = llm.models.MODELS["glm-5.2"].max_output_tokens
+    llm._summarise("a context far larger than the tier can emit", ceiling + 50_000, "glm-5.2")
+
+    assert fake.captured["json"]["max_tokens"] == ceiling  # clamped to what Scaleway accepts, not the huge target
 
 
 # --- the fallback ladder: Scaleway → Mistral → local Ollama, per request --------------------

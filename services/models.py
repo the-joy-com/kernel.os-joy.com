@@ -47,11 +47,14 @@ class Model:
     so the budget guard holds a prompt to what the model answers well, not merely to what it swallows.
 
     max_output_tokens is the ceiling on a single reply's length, not a quality figure like the one above:
-    unlike the input window it has no degradation curve to sit below —
-    it is purely a guard that stops a runaway generation before it burns the latency and cost budget,
-    set generously above any real reply so the symbiot is never truncated mid-thought,
-    yet far below the model's architectural maximum so a haywire loop can't run away.
-    The summariser overrides it when it legitimately needs more room (llm._summarise)."""
+    unlike the input window it has no degradation curve to sit below (a reply is not worse for being allowed to run longer),
+    so it is not sized below an optimum but set to the highest a provider actually permits —
+    a guard that stops a runaway generation before it burns the latency and free-generation budget,
+    while never truncating a real reply the provider would have let finish.
+    The figure is the *verified* ceiling, not the model card's: Scaleway hard-caps glm-5.2's output well below its architectural maximum,
+    and that verified cap is the number held here (see the note above MODELS).
+    The summariser asks for more room when it legitimately needs it (llm._summarise),
+    but that request is clamped to this ceiling so it can never exceed what the tier accepts."""
 
     provider: str
     name: str
@@ -65,13 +68,19 @@ class Model:
 # The generative windows are each the model's *optimal*, deliberately below the advertised maximum:
 # glm-5.2 and mistral-large-latest both advertise ~256K but recall frays past roughly half that,
 # so 131072 (128K) is held for each — the same figure qwen3.5:4b (advertised ~262K) carries.
-# The output ceiling is one figure for all three, and for the opposite reason to the window:
-# it isn't an optimal below a degradation point, it's a runaway guard, so it's sized to the *work*, not the model.
-# All three generative tiers advertise a far larger output ceiling than we'd ever want
-# (glm-5.2 allows 131072, mistral-large-latest and qwen3.5:4b allow their whole windows),
-# and a diary reply is a few hundred tokens while a router verdict is a small JSON object,
-# so 8192 clears any real reply with generous headroom yet stops a runaway an order of magnitude short of the advertised cap —
-# and because every tier clears it, one figure fits all, the same way the shared window lets a prompt fitted for one tier fit them all.
+# The output ceiling works the opposite way to the window: it isn't an optimal below a degradation point
+# (a reply doesn't get worse because we let it run longer), it's a guard that stops a runaway generation
+# before it burns the latency and free-generation budget. So it isn't sized below a quality curve — it's
+# sized to the highest a provider actually permits, verified against each live endpoint rather than the
+# architectural spec sheet, which is far larger and misleading:
+#   glm-5.2's model card says ~131K output, but Scaleway hard-caps max_completion_tokens at 16384 for it
+#     (its 5-minute-response rule), and a request over that is a 400 we would never fall through — so 16384 is the true ceiling;
+#   mistral-large-latest enforces no request-time output cap at all (it accepts an absurd max_tokens and just stops when done),
+#     so the guard there is entirely ours to set;
+#   qwen3.5:4b caps output only through Ollama's num_predict, unbounded by default.
+# 16384 is Scaleway's verified maximum, and the same figure is held for the other two so a fallback never
+# truncates a reply shorter than the primary would have given — one ceiling across all three, at the highest
+# the most-constrained tier allows, the way the shared window lets a prompt fitted for one tier fit them all.
 # The keys are the exact ids each provider answers to:
 # "glm-5.2" is Scaleway's Generative APIs id (not the "zai-org/GLM-5.2" the model card uses),
 # and "mistral-large-latest" is Mistral's own web-API id.
@@ -79,10 +88,10 @@ class Model:
 # it caps its own input via num_ctx (embedding.py) and never generates a reply,
 # so its windows are listed for the map's completeness (0 output — never consulted) but are not the budget guard's concern.
 MODELS = {
-    "glm-5.2": Model("scaleway", "glm-5.2", 131072, 8192),
-    "mistral-large-latest": Model("mistral", "mistral-large-latest", 131072, 8192),
+    "glm-5.2": Model("scaleway", "glm-5.2", 131072, 16384),
+    "mistral-large-latest": Model("mistral", "mistral-large-latest", 131072, 16384),
     "nomic-embed-text": Model("ollama", "nomic-embed-text", 8192, 0),
-    "qwen3.5:4b": Model("ollama", "qwen3.5:4b", 131072, 8192),
+    "qwen3.5:4b": Model("ollama", "qwen3.5:4b", 131072, 16384),
 }
 
 

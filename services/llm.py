@@ -201,14 +201,22 @@ def _ollama(model_name: str, prompt: str, schema: type[BaseModel] | None, temper
 
 
 def _output_cap(override: int | None, model_name: str) -> int | None:
-    """The output ceiling to hand one tier: the caller's explicit `override` when it named one —
-    the summariser, which needs room up to its whole target — otherwise that tier's own model figure,
-    resolved from the model about to answer so a fallback is capped at what it supports, not the primary's.
-    An unmapped model has no figure, so it is left uncapped (None), the historical local-Ollama default."""
-    if override is not None:
-        return override
+    """The output ceiling to hand one tier, resolved from the model about to answer so a fallback is capped
+    at what it supports rather than the primary's figure.
+
+    An ordinary call names no `override`, so it takes that tier's own model figure (services.models).
+    The summariser names one — the room it needs up to its whole target — but that request is *clamped* to
+    the tier's figure rather than winning outright: a target sized to the context budget can run far past
+    what a provider accepts (Scaleway 400s over its cap, and a 400 does not fall through), so the clamp keeps
+    even a huge-context summary a request the tier can honour. Clamping only shortens the summary, never the
+    budget it must fit — the truncation after it (llm._summarise) still holds the promise.
+    An unmapped model has no figure, so its `override` passes through and an ordinary call is left uncapped
+    (None), the historical local-Ollama default."""
     spec = models.MODELS.get(model_name)
-    return spec.max_output_tokens if spec is not None else None
+    cap = spec.max_output_tokens if spec is not None else None
+    if override is not None:
+        return min(override, cap) if cap is not None else override
+    return cap
 
 
 def _call(*, model: str, prompt: str, schema: type[BaseModel] | None = None, temperature: float | None = None, max_output_tokens: int | None = None) -> str:
@@ -221,9 +229,10 @@ def _call(*, model: str, prompt: str, schema: type[BaseModel] | None = None, tem
     a model named for another provider is called there directly, the one-line rollback path.
     A model not in the map is treated as a local Ollama name (its historical default).
     The reply is held to an output ceiling (services.models), resolved per tier by _output_cap:
-    the caller's `max_output_tokens` when it passes one — the summariser, which needs its whole target —
-    otherwise the ceiling of the model about to answer, so a fallback is held to a cap it actually supports
-    rather than the primary's, and every ordinary call is capped without the caller naming a number.
+    the ceiling of the model about to answer, so a fallback is held to a cap it actually supports rather than
+    the primary's, and every ordinary call is capped without the caller naming a number.
+    A caller that passes `max_output_tokens` — the summariser — asks for more room, but that request is clamped
+    to the answering tier's cap, never exceeding what the provider accepts.
     An empty reply raises inside each tier,
     so neither a transport failure nor a blank answer passes as a half-read decision
     or reaches the symbiot as silence.
@@ -288,8 +297,10 @@ def _summarise(context: str, target_tokens: int, model_name: str) -> str:
     It calls the boundary directly, bypassing _fit, so a large context can't recurse into fitting itself,
     and it is sent raw — the model accepts more than its optimal even where it reads that much less well.
     Temperature is 0, as for every call through this boundary — a condensation wants to be faithful and reproducible, not warm.
-    The output ceiling is overridden to `target_tokens`: this call legitimately needs room up to its whole target,
-    which can exceed the ordinary per-model reply ceiling, so it names its own rather than take the default cap.
+    The output ceiling is raised toward `target_tokens`: this call legitimately needs room up to its whole target,
+    more than an ordinary reply, so it names its own rather than take the default cap —
+    but the ceiling is clamped to what the answering tier accepts (_output_cap), since a target sized to the
+    context budget can outrun a provider's own cap, and asking Scaleway for more than it allows is a 400, not a longer reply.
     A summariser can still overshoot the length it was asked for,
     so the result is truncated to `target_tokens`,
     making the budget a promise the guard keeps rather than a request the model may ignore.
