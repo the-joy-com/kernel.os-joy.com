@@ -191,6 +191,9 @@ cp .env.example .env
 | `LOGIN_REISSUE_INTERVAL_SECONDS` | Override; minimum gap between two issued codes for one symbiot. Default `60`. A second `/login` inside the window keeps the existing code and emails nothing. |
 | `MAX_VERIFY_ATTEMPTS` | Override; wrong guesses a single live code absorbs before the database burns it. Default `5`. |
 | `RATE_LIMIT_ENABLED` | Override; the edge limiter. Default on; set `0`/`false`/`no`/`off` to disable. |
+| `GC_ENABLED` | Override; the offline ontology duplicate-merge sweep, run in-process on a slow cadence. Default on; set `0`/`false`/`no`/`off` to disable. No external cron — it rides the app the way the intake reconcile sweep does. |
+| `GC_SWEEP_INTERVAL_SECONDS` | Override; how often that sweep wakes. Default `86400` (daily) — duplicates accrue slowly and the merge never sits on the read path. |
+| `GC_DISTANCE` | Override; the cosine-distance pre-filter the sweep uses to nominate near-twin type pairs before the model confirms them. Default `0.2`. Loosen to catch synonyms that embed further apart; the by-hand smoke (`test/qa/0002_*`) prints real distances to tune against. |
 
 ## Email (Gmail API)
 
@@ -233,7 +236,7 @@ The suite ([`test/`](./test)) is one assertion-per-behaviour over the identity f
 
 ## Code layout
 
-The kernel's Python lives in two packages, split by a single rule: **`core/` is the foundation, `services/` is the work, and imports only ever point one way.** `core/` holds the primitives everything leans on — config, the Postgres pool and migration runner, request DTOs, the wire protocol, logging, the edge limiter — and knows nothing of any feature. `services/` holds the actual work built on those primitives — identity, intake and its worker pool, the ontology router (recall/embedding/re-rank), email, push. The boundary is real because the imports keep it: `services/` imports from `core/` freely, and `core/` never imports from `services/`, so the foundation stays self-contained and cheap to test in isolation. [`main.py`](./main.py) sits above both and wires them into a running app. The full rationale, with each module placed, is in [`doc/architecture.md`](./doc/architecture.md).
+The kernel's Python lives in two packages, split by a single rule: **`core/` is the foundation, `services/` is the work, and imports only ever point one way.** `core/` holds the primitives everything leans on — config, the Postgres pool and migration runner, request DTOs, the wire protocol, logging, the edge limiter — and knows nothing of any feature. `services/` holds the actual work built on those primitives — identity, intake and its worker pool, the ontology router (recall/embedding/re-rank) and its offline duplicate garbage collector, email, push. The boundary is real because the imports keep it: `services/` imports from `core/` freely, and `core/` never imports from `services/`, so the foundation stays self-contained and cheap to test in isolation. [`main.py`](./main.py) sits above both and wires them into a running app. The full rationale, with each module placed, is in [`doc/architecture.md`](./doc/architecture.md).
 
 ## Stack
 

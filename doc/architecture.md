@@ -20,6 +20,7 @@ The kernel's Python lives in two packages, and the division between them is the 
 - [`worker.py`](../services/worker.py) — the background pool that drains the intake queue, plus the deadline sweep.
 - [`execution.py`](../services/execution.py) — running a message's work under a hard deadline.
 - [`ontology.py`](../services/ontology.py), [`embedding.py`](../services/embedding.py), [`llm.py`](../services/llm.py) — the ontology router: recall, the embedding calls it recalls with, and the generative client it re-ranks and decides through.
+- [`ontology_gc.py`](../services/ontology_gc.py) — the offline duplicate garbage collector: the background sweep that finds the semantic-duplicate types lazy minting breeds, confirms them with the model, and collapses each set into one survivor.
 - [`email_client.py`](../services/email_client.py) — the `EmailClient` interface and its Gmail-API implementation (with a fake for tests).
 - [`push.py`](../services/push.py) — the Web Push reply channel.
 - [`missive.py`](../services/missive.py) — the outbound message shaping.
@@ -38,7 +39,7 @@ The rule is enforced by convention rather than by tooling today — but it is a 
 
 ## what sits above both
 
-[`main.py`](../main.py) is the composition root — the FastAPI app, the routes, the outbound envelope, and the lifespan that opens the pool and starts the worker threads. It reaches down into both packages and wires them into a running process; nothing reaches back up into it. Alongside the two packages sit the non-Python siblings each with a single job: [`migrations/`](../migrations) (the ordered `.sql` schema, applied at startup), [`persona/`](../persona) (the persona text), and [`test/`](../test) (the suite).
+[`main.py`](../main.py) is the composition root — the FastAPI app, the routes, the outbound envelope, and the lifespan that opens the pool and starts the background threads (the intake worker pool and its reconcile sweep, and the offline ontology GC sweep). It reaches down into both packages and wires them into a running process; nothing reaches back up into it. Alongside the two packages sit the non-Python siblings each with a single job: [`migrations/`](../migrations) (the ordered `.sql` schema, applied at startup), [`persona/`](../persona) (the persona text), and [`test/`](../test) (the suite).
 
 ## how embeddings are stored, and how the store is built to evolve
 

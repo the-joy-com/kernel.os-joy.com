@@ -28,6 +28,9 @@ os.environ["LOGIN_REISSUE_INTERVAL_SECONDS"] = "0"
 # The intake worker would race the suite for received rows;
 # the tests drive the state machine by hand, so the live loop stays off.
 os.environ["WORKER_ENABLED"] = "0"
+# The ontology GC sweep likewise stays off under test — its tests drive run_once by hand,
+# and a live sweep would race them for the ontology store.
+os.environ["GC_ENABLED"] = "0"
 # Web push stays off unless a test opts in (by monkeypatching config), so no test can reach a real push service —
 # even though a dev .env might carry a VAPID key, this pins it empty
 # (load_dotenv won't override an env var already set, blank or not).

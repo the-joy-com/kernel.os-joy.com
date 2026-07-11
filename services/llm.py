@@ -5,9 +5,9 @@ re-ranking the recalled candidates, and breaking a tie in the grey zone when the
 Both are the same shape — a prompt in, JSON out — so they share this one client.
 
 Three call settings are fixed here so no caller has to remember them:
-thinking is off (`think=false`) —
-these are fast classification-style calls, not problems that want a visible reasoning trace,
-and the trace would only cost tokens and latency;
+thinking is off — every call is a fast classification-style judgment on hardware that has to answer quickly,
+not a problem that wants a visible reasoning trace,
+and the trace would only cost tokens and latency we can't spare locally;
 the output is held to the exact shape the caller demands —
 every call names a Pydantic model, whose schema becomes Ollama's `format`,
 which Ollama compiles to a decode-time grammar so the model can only emit tokens that keep the reply conforming,
@@ -35,6 +35,7 @@ def generate_json(prompt: str, schema: type[M], *, model: str | None = None) -> 
 
     schema is mandatory and is a Pydantic model class:
     its JSON Schema is handed to Ollama as the output grammar,
+    which Ollama compiles to a decode-time grammar so the model can only emit tokens that keep the reply conforming,
     and the reply is parsed and validated back through the same model —
     so the answer that crosses this boundary is a typed object with its fields already checked,
     never a loose dict a caller has to second-guess.
@@ -42,17 +43,23 @@ def generate_json(prompt: str, schema: type[M], *, model: str | None = None) -> 
     rather than slipping through as a half-read decision that would quietly mis-file a fact.
     model defaults to the router's generative model (config.RERANK_MODEL);
     a caller that wants a different model passes its own.
+
+    Thinking is off, and not offered:
+    every call through here is a fast classification-style judgment on hardware that has to answer quickly,
+    so we take the decode-time grammar — which the model can only have with thinking off —
+    over a reasoning trace we can't afford.
     """
+    payload = {
+        "model": model or config.RERANK_MODEL,
+        "prompt": prompt,
+        "think": False,
+        "stream": False,
+        "format": schema.model_json_schema(),
+        "options": {"temperature": 0},
+    }
     resp = httpx.post(
         f"{config.OLLAMA_BASE_URL}/api/generate",
-        json={
-            "model": model or config.RERANK_MODEL,
-            "prompt": prompt,
-            "think": False,
-            "stream": False,
-            "format": schema.model_json_schema(),
-            "options": {"temperature": 0},
-        },
+        json=payload,
         timeout=config.LLM_TIMEOUT_SECONDS,
     )
     resp.raise_for_status()

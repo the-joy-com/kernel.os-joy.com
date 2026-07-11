@@ -24,6 +24,7 @@ it earned. `ingest` is the entry point that runs the whole path; the steps below
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field, create_model
@@ -415,6 +416,58 @@ def extract_concepts(fact_text: str) -> list[str]:
     return llm.generate_json(_extract_concepts_prompt(fact_text), _ConceptsReply).concepts
 
 
+class _TemporalReply(BaseModel):
+    """When the event a fact describes actually happened, or null when the fact gives no cue.
+
+    A plain module-level model — its shape never depends on the pool, so nothing is built per call.
+    `happened_at` is an optional timestamp:
+    the model returns a resolved ISO 8601 instant when the fact carries a temporal cue,
+    and null when it names no moment at all, in which case the fact's time collapses to `created_at` at read time.
+    Pydantic parses the string back into a datetime and raises on a malformed one,
+    so a bad date fails loud at the boundary rather than being filed as a quietly wrong instant."""
+
+    happened_at: datetime | None = None
+
+
+def _temporal_prompt(fact_text: str, reference: datetime) -> str:
+    # The reference instant — now, the moment the fact is being recorded —
+    # is given ONLY so relative cues ("yesterday", "last Tuesday") can be resolved to concrete instants.
+    # It is deliberately not a default:
+    # a fact with no time expression must come back null, never fall back to this moment,
+    # or the nullable column that lets happened_at collapse to created_at at read time is pointless.
+    return (
+        "You read a personal diary fact and decide when the event it describes actually happened.\n"
+        f'Fact: "{fact_text}"\n\n'
+        f"For reference, now is {reference.isoformat()} (UTC). "
+        "Use this reference ONLY to resolve a relative time cue in the fact — "
+        '"yesterday", "last Tuesday", "this morning" each become a concrete instant relative to it.\n'
+        "The reference is NOT a default answer. If the fact contains no time expression at all — no "
+        "date, no relative cue, no time of day, it simply states something with no *when* (e.g. "
+        '"I live in Strasbourg") — return null. Do not substitute the reference moment for a missing '
+        "time, and never invent one.\n"
+        "When the fact does give a time, return it as a full ISO 8601 timestamp in UTC; "
+        "if it names only a day with no time of day, use 00:00:00 of that day.\n\n"
+        'Return JSON only: {"happened_at": "<ISO 8601 UTC timestamp>"} or {"happened_at": null}.'
+    )
+
+
+def extract_happened_at(fact_text: str, *, reference: datetime) -> datetime | None:
+    """Read the one time a fact happened out of its raw text, or None when it names no moment.
+
+    Time is the single particular the deliberately-thin write path promotes out of the raw text into structure
+    (see the build log):
+    one LLM call reads the fact against a reference instant — now, the moment it is being recorded —
+    so a relative cue like "yesterday" resolves to a concrete instant, and returns that event time or None.
+    None is the honest answer for a fact with no temporal cue:
+    the column stays empty and the read path stands `created_at` in for it,
+    rather than fabricating a precision the fact never carried.
+    It reads the fact whole, once, like the naming step — not per concept —
+    because a fact happens at one time whatever kinds it touches.
+    """
+    reply = llm.generate_json(_temporal_prompt(fact_text, reference), _TemporalReply)
+    return reply.happened_at
+
+
 def route_concept(conn, concept_text: str) -> int:
     """Route one named concept to a type id — reuse an existing one or coin a new one.
 
@@ -452,7 +505,14 @@ def synthesize(type_names: list[str], raw_text: str) -> dict:
     return {"@type": sorted(type_names), "text": raw_text}
 
 
-def persist(conn, raw_text: str, payload: dict, ontology_ids: list[int]) -> int:
+def persist(
+    conn,
+    raw_text: str,
+    payload: dict,
+    ontology_ids: list[int],
+    *,
+    happened_at: datetime | None = None,
+) -> int:
     """Save the routed fact once — the fact row, its embedding, and one link per concept — and return its id.
 
     The raw text is embedded (as a stored document) before the transaction opens, the same discipline
@@ -462,14 +522,22 @@ def persist(conn, raw_text: str, payload: dict, ontology_ids: list[int]) -> int:
     touches this write), and one diary_fact_ontology row is written per concept the fact resolved to —
     the many-to-many that lets a single fact be all of its concepts at once. The whole write is atomic:
     a fact is never left half-filed, with an embedding but no links or a payload but no vector.
+
+    happened_at is the fact's event clock (migration 0011):
+    when the thing occurred, or None when the fact named no moment —
+    stored as-is, null and all, with the read path standing created_at in for a null.
+    The other clock, created_at, is filled automatically by the row default, so it is not passed here.
     """
     vector = embedding.embed(raw_text, task="document")
     # pgvector has no psycopg adapter installed, so the vector crosses as its text literal and casts ::vector.
     vector_literal = "[" + ",".join(repr(x) for x in vector) + "]"
     with conn.transaction():
+        # happened_at rides through exactly as given, None becoming a SQL NULL for a fact that named no moment;
+        # created_at fills itself from the row default — the telling moment for a live write.
         fact_id = conn.execute(
-            "INSERT INTO diary_facts (raw_text, payload) VALUES (%s, %s::jsonb) RETURNING id",
-            (raw_text, json.dumps(payload)),
+            "INSERT INTO diary_facts (raw_text, payload, happened_at) "
+            "VALUES (%s, %s::jsonb, %s) RETURNING id",
+            (raw_text, json.dumps(payload), happened_at),
         ).fetchone()[0]
         model_id = conn.execute("SELECT id FROM embedding_model WHERE is_active").fetchone()[0]
         conn.execute(
@@ -488,8 +556,14 @@ def persist(conn, raw_text: str, payload: dict, ontology_ids: list[int]) -> int:
 def ingest(conn, raw_text: str) -> int:
     """The full write path for one raw diary fact, end to end — returns the filed fact's id.
 
-    Name the concepts the fact expresses, route each to a type on its own, then synthesize the thin
-    payload and persist the fact once. The routed ids are de-duplicated first-seen-first: two concepts
+    Read the event clock first:
+    happened_at is pulled off the raw text (None when it names no moment),
+    resolved against now — the moment we record it, which the row's own created_at also captures —
+    so a relative cue like "yesterday" lands on a concrete instant.
+    It is the one temporal particular this thin path promotes into structure.
+
+    Then name the concepts the fact expresses, route each to a type on its own, synthesize the thin
+    payload, and persist the fact once. The routed ids are de-duplicated first-seen-first: two concepts
     can resolve to the same type (a fact "with a friend" naming both companionship and the friendship),
     and a fact is linked to a concept once, not once per phrase that led there — the join table's
     composite key would reject the second link anyway, so we collapse it here rather than trip it.
@@ -497,6 +571,7 @@ def ingest(conn, raw_text: str) -> int:
     the name the store actually holds, and both the payload and the link rows are ordered alphabetically
     by that name — the concepts are a set, so a stable order beats the order they happened to be named in.
     """
+    happened_at = extract_happened_at(raw_text, reference=datetime.now(timezone.utc))
     routed = [route_concept(conn, concept) for concept in extract_concepts(raw_text)]
     ontology_ids = list(dict.fromkeys(routed))
     rows = conn.execute(
@@ -505,4 +580,4 @@ def ingest(conn, raw_text: str) -> int:
     name_by_id = {r[0]: r[1] for r in rows}
     ontology_ids.sort(key=lambda ontology_id: name_by_id[ontology_id])
     payload = synthesize([name_by_id[o] for o in ontology_ids], raw_text)
-    return persist(conn, raw_text, payload, ontology_ids)
+    return persist(conn, raw_text, payload, ontology_ids, happened_at=happened_at)

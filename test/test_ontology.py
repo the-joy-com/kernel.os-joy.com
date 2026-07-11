@@ -7,6 +7,8 @@ The live round trip (real Ollama embeddings ranked against real stored vectors) 
 separately, by hand.
 """
 
+from datetime import datetime, timezone
+
 import pytest
 from pydantic import BaseModel, ValidationError
 
@@ -477,6 +479,50 @@ def test_extract_concepts_rejects_an_empty_list(monkeypatch):
         ontology.extract_concepts("something happened")
 
 
+# --- temporal extraction (the one particular the thin path promotes), with the LLM faked ---
+
+
+def test_extract_happened_at_resolves_a_cue_against_the_reference(monkeypatch):
+    # The fact carries a relative cue; the model resolves it to an instant, which we parse to a datetime.
+    # The prompt must carry both the fact and the reference moment cues resolve against.
+    captured = {}
+
+    def fake_post(url, json, timeout):
+        captured["json"] = json
+        return _FakeResponse({"response": '{"happened_at": "2026-07-10T00:00:00Z"}'})
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    reference = datetime(2026, 7, 11, 21, 0, tzinfo=timezone.utc)
+
+    got = ontology.extract_happened_at("boxing yesterday", reference=reference)
+
+    assert got == datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc)
+    assert "boxing yesterday" in captured["json"]["prompt"]
+    assert reference.isoformat() in captured["json"]["prompt"]
+
+
+def test_extract_happened_at_returns_none_when_the_fact_names_no_moment(monkeypatch):
+    # A fact with no temporal cue is answered with null, and null becomes None — not a guessed time.
+    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"response": '{"happened_at": null}'}))
+
+    got = ontology.extract_happened_at(
+        "I live in Strasbourg", reference=datetime(2026, 7, 11, tzinfo=timezone.utc)
+    )
+
+    assert got is None
+
+
+def test_extract_happened_at_rejects_a_malformed_timestamp(monkeypatch):
+    # A reply that isn't a parseable instant violates the model and raises at the boundary
+    # rather than filing a fact under a quietly wrong time — the same strict discipline the router holds.
+    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"response": '{"happened_at": "some tuesday"}'}))
+
+    with pytest.raises(ValidationError):
+        ontology.extract_happened_at("x", reference=datetime(2026, 7, 11, tzinfo=timezone.utc))
+
+
 # --- routing one concept (recall → re-rank → decide → grey → mint), faked ------------------
 
 
@@ -558,7 +604,7 @@ def test_route_concept_grey_gate_reuses_on_a_fence_sitting_score(client, monkeyp
         assert got == existing
 
 
-# --- the thin synthesis (Phase 2), a pure deterministic assembly ---------------------------
+# --- the thin synthesis, a pure deterministic assembly -------------------------------------
 
 
 def test_synthesize_builds_the_thin_payload_and_nothing_more():
@@ -636,6 +682,41 @@ def test_persist_payload_is_queryable_by_jsonb_operators(client, monkeypatch):
         ).fetchone()[0] == "hit the heavy bag"
 
 
+def test_persist_stores_happened_at_when_given(client, monkeypatch):
+    # A fact with a known event time stores it on the event clock; created_at fills itself.
+    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"embeddings": [_vec(**{"0": 1.0})]}))
+
+    with db.get_pool().connection() as conn:
+        a = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
+        payload = ontology.synthesize(["boxing_session"], "boxing yesterday")
+        happened = datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc)
+
+        fact_id = ontology.persist(conn, "boxing yesterday", payload, [a], happened_at=happened)
+
+        row = conn.execute(
+            "SELECT happened_at, created_at FROM diary_facts WHERE id = %s", (fact_id,)
+        ).fetchone()
+        assert row[0] == happened
+        assert row[1] is not None  # created_at is the telling clock, filled by the row default
+
+
+def test_persist_nulls_happened_at_when_absent(client, monkeypatch):
+    # A fact that named no moment stores happened_at NULL, to collapse to created_at at read time.
+    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
+        {"embeddings": [_vec(**{"0": 1.0})]}))
+
+    with db.get_pool().connection() as conn:
+        a = _add_type(conn, "home", "where the symbiot lives", _vec(**{"0": 1.0}))
+        payload = ontology.synthesize(["home"], "I live in Strasbourg")
+
+        fact_id = ontology.persist(conn, "I live in Strasbourg", payload, [a])
+
+        assert conn.execute(
+            "SELECT happened_at FROM diary_facts WHERE id = %s", (fact_id,)
+        ).fetchone()[0] is None
+
+
 # --- the full write path, end to end ------------------------------------------------------
 
 
@@ -651,6 +732,8 @@ def test_ingest_routes_every_concept_links_all_and_files_the_thin_payload(client
         b = _add_type(conn, "friends", "time spent with a friend", _vec(**{"1": 1.0}))
         c = _add_type(conn, "heat_wave", "a spell of extreme heat", _vec(**{"2": 1.0}))
 
+        # Temporal extraction is its own step with its own tests; stub it so this proves orchestration.
+        monkeypatch.setattr(ontology, "extract_happened_at", lambda text, *, reference: None)
         # Name and route the concepts out of alphabetical order, to prove the payload sorts them.
         monkeypatch.setattr(ontology, "extract_concepts",
                             lambda text: ["a heat wave", "a boxing session", "time with a friend"])
@@ -677,6 +760,7 @@ def test_ingest_dedups_concepts_that_route_to_the_same_type(client, monkeypatch)
     with db.get_pool().connection() as conn:
         a = _add_type(conn, "friends", "time spent with a friend", _vec(**{"0": 1.0}))
 
+        monkeypatch.setattr(ontology, "extract_happened_at", lambda text, *, reference: None)
         monkeypatch.setattr(ontology, "extract_concepts",
                             lambda text: ["time with a friend", "the friendship itself"])
         monkeypatch.setattr(ontology, "route_concept", lambda conn, concept: a)

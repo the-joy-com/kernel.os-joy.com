@@ -200,3 +200,21 @@ if not 0.0 <= MINT_THRESHOLD < REUSE_THRESHOLD <= 1.0:
         "ontology thresholds out of order: need 0.0 <= MINT_THRESHOLD < REUSE_THRESHOLD <= 1.0, "
         f"got MINT_THRESHOLD={MINT_THRESHOLD}, REUSE_THRESHOLD={REUSE_THRESHOLD}"
     )
+
+# The offline duplicate garbage-collection pass (services/ontology_gc.py) that merges
+# the semantic duplicates forward-only minting breeds — workout_action coined Tuesday, training_session Friday.
+# GC_DISTANCE is the cosine-distance pre-filter:
+# only type pairs nearer than this are even offered to the model as possible twins.
+# It is a loose net, not the verdict — the model, reading both full definitions, makes the real same-or-not call —
+# so it is set wide enough to catch true synonyms that embed a little apart,
+# and tight enough not to ask the model about every unrelated pair.
+# Tune against the store as it fills; the by-hand smoke prints the pairs it caught so it can be eyeballed.
+GC_DISTANCE = float(os.getenv("GC_DISTANCE", "0.2"))
+# How often the sweep wakes.
+# Duplicates accrue slowly and the merge never sits on the read path,
+# so this is a day, not the seconds the intake reconcile sweep runs on. 24 hours by default.
+GC_SWEEP_INTERVAL_SECONDS = float(os.getenv("GC_SWEEP_INTERVAL_SECONDS", "86400"))
+# On by default;
+# the test suite turns it off so the sweep can't race the suite —
+# the GC tests drive run_once by hand, the same stance WORKER_ENABLED takes for the intake workers.
+GC_ENABLED = os.getenv("GC_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")

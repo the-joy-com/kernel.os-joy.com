@@ -21,6 +21,7 @@ from core import db
 from services import identity
 from core import logs
 from core import protocol
+from services import ontology_gc
 from services import push
 from services import worker
 from core.dtos import (
@@ -112,6 +113,23 @@ async def lifespan(app: FastAPI):
         )
         sweep.start()
         worker_threads.append(sweep)
+    # The ontology garbage collector —
+    # the offline merge pass that collapses the semantic duplicates lazy minting breeds.
+    # Its own slow cadence (hours), off the read path,
+    # and gated on its own flag rather than WORKER_ENABLED:
+    # the intake workers and the GC are independent background jobs,
+    # and a box could reasonably want one without the other.
+    # The one thing it has in common with the intake workers is worker_stop —
+    # not because they're coupled, but because that Event is how the whole process is told to wind down at once.
+    if config.GC_ENABLED:
+        gc_sweep = threading.Thread(
+            target=ontology_gc.run_sweep,
+            args=(worker_stop,),
+            name="ontology-gc-sweep",
+            daemon=True,
+        )
+        gc_sweep.start()
+        worker_threads.append(gc_sweep)
     yield
     worker_stop.set()
     for thread in worker_threads:
