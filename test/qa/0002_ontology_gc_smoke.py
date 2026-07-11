@@ -1,13 +1,13 @@
-"""By-hand smoke test: the offline duplicate garbage-collection pass against the *live* local models.
+"""By-hand smoke test: the offline duplicate garbage-collection pass against the *live* models.
 
-The pytest suite (test/test_ontology_gc.py) fakes Ollama at the network boundary,
+The pytest suite (test/test_ontology_gc.py) fakes the model clients at the network boundary,
 so it proves the detection SQL, the idempotent re-point, the parent guards, the tombstone and the dropped vector —
 but never that the real embedder places true synonyms near each other,
 nor that the real generative model confirms them the same kind and picks a sane survivor.
 This script is the other half:
-it seeds a few types with *real* `nomic-embed-text` vectors,
+it seeds a few types with *real* `nomic-embed-text` vectors (the embedder is still local),
 then runs the whole merge pass — detect → confirm → cluster → pick → collapse —
-against real `nomic-embed-text` and real `qwen3.5:4b`,
+against real `nomic-embed-text` and the real generative model (`glm-5.2` on Scaleway),
 and prints what the models decided so a human can eyeball it.
 
 It doubles as the distance-calibration tool GC_DISTANCE needs:

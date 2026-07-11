@@ -3,15 +3,18 @@
 The pytest suite (test/test_retrieval.py, test/test_reply.py, test/test_llm.py) proves the search SQL and
 the composer's wiring with the model faked, but never that a real reply actually reads well off the diary.
 This script is the other half: it seeds a small diary, runs the librarian (retrieval.search) over it, and
-composes a real reply with live `qwen3.5:4b` through the persona, printing what came back for a human to judge.
+composes a real reply with the live reply model (`glm-5.2` on Scaleway) through the persona,
+printing what came back for a human to judge.
 
 It is direct-run, not a pytest test, because it needs the live box:
 
     python test/qa/0003_read_path_smoke.py            # rolls back at the end (default)
     python test/qa/0003_read_path_smoke.py --keep     # commits, so you can inspect the rows
 
-Prerequisites (see README, "Ollama (local models)" and "Database & migrations"):
-  - Ollama running on the box with `qwen3.5:4b` pulled (the reply model). The librarian needs no model at all.
+Prerequisites (see README, "Models" and "Database & migrations"):
+  - A generative provider reachable for the reply: `SCALEWAY_API_KEY` set in .env for the primary (`glm-5.2`),
+    or the ladder falls back to Mistral, then to a local `qwen3.5:4b`.
+    The librarian (the lexical reach) needs no model at all.
   - A reachable Postgres — this connects to config.DATABASE_URL (your dev database).
 
 The seeded facts are written straight into diary_facts, not filed through the write path (ingestion has its

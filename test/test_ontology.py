@@ -1,13 +1,16 @@
-"""Ontology routing: the recall (nominate) pass, and the embedding client under it.
+"""Ontology routing: the recall (nominate) pass, and the model clients under it.
 
-Everything here runs against the test database with hand-built vectors and a faked Ollama,
+Everything here runs against the test database with hand-built vectors and faked model clients,
 so a passing suite proves the recall SQL — its ordering, its bounds, its exclusions —
-and the embedding client's contract, without a single call to a real model.
-The live round trip (real Ollama embeddings ranked against real stored vectors) is proven
+and the client contracts, without a single call to a real model.
+The generative calls go through the cloud client (llm.OpenAI, Scaleway's) and the embedding calls
+through the local one (embedding.ollama.Client); the two are faked separately, at their own boundaries.
+The live round trip (real embeddings ranked against real stored vectors, a real reply) is proven
 separately, by hand.
 """
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -108,46 +111,104 @@ def test_recall_defaults_its_pool_width_to_config(client, monkeypatch):
     assert [c.type_name for c in got] == ["a"]
 
 
+# --- the two faked model boundaries -------------------------------------------------------
+
+
+class _FakeChat:
+    """Callable stand-in for llm.OpenAI (the Scaleway generative client): records each
+    chat.completions.create payload in captured["json"] and answers generate calls from canned data.
+    The prompt sits at messages[-1]["content"]; a schema's grammar at response_format (see _schema).
+    `generate` may be a value or a callable(kwargs); a raising callable is a landmine for a path that
+    must never run.
+    """
+
+    def __init__(self, *, generate=None):
+        self._generate = generate
+        self.captured = {}
+
+    def __call__(self, *, base_url=None, api_key=None, timeout=None, max_retries=None):
+        self.captured["base_url"] = base_url
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create, parse=self._parse))
+        return self
+
+    def _create(self, **kwargs):
+        # The free-text path (no schema).
+        self.captured["json"] = kwargs
+        text = self._generate(kwargs) if callable(self._generate) else self._generate
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+
+    def _parse(self, **kwargs):
+        # The structured path: response_format is the Pydantic model class the caller passed.
+        self.captured["json"] = kwargs
+        text = self._generate(kwargs) if callable(self._generate) else self._generate
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+
+
+class _FakeEmbed:
+    """Callable stand-in for embedding.ollama.Client: records each embed() call's keyword payload in
+    captured["embed"] and the client host in captured["host"], and answers from canned vectors.
+    `embeddings` (the list of vectors a reply carries) may be a value or a callable(kwargs); a raising
+    callable is a landmine for a path that must never embed.
+    """
+
+    def __init__(self, *, embeddings=None):
+        self._embeddings = embeddings
+        self.captured = {}
+
+    def __call__(self, host, timeout=None):
+        self.captured["host"] = host
+        return self
+
+    def embed(self, **kwargs):
+        self.captured["embed"] = kwargs
+        vecs = self._embeddings(kwargs) if callable(self._embeddings) else self._embeddings
+        return SimpleNamespace(embeddings=vecs)
+
+
+def _never(msg):
+    # A handler that fails the test if the boundary it guards is ever reached.
+    def _raise(kwargs):  # pragma: no cover - must never be reached
+        raise AssertionError(msg)
+
+    return _raise
+
+
+def _prompt(fake):
+    # The single user message's content — where the prompt lands in an OpenAI chat request.
+    return fake.captured["json"]["messages"][-1]["content"]
+
+
+def _prompt_of(kwargs):
+    # The same, off a create() call's kwargs — for fakes that dispatch on the prompt.
+    return kwargs["messages"][-1]["content"]
+
+
+def _schema(fake):
+    # The JSON schema a generate_json call bound the decoder to — the Pydantic model handed to `parse`.
+    return fake.captured["json"]["response_format"].model_json_schema()
+
+
 # --- the embedding client, with Ollama faked ---------------------------------------------
-
-
-class _FakeResponse:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def raise_for_status(self):
-        return None
-
-    def json(self):
-        return self._payload
 
 
 def test_embed_sends_the_task_prefix_and_full_window(monkeypatch):
     # The two traps the client exists to carry: the search_query:/search_document: prefix,
     # and the num_ctx that stops Ollama silently truncating a long text.
-    captured = {}
-
-    def fake_post(url, json, timeout):
-        captured["url"] = url
-        captured["json"] = json
-        return _FakeResponse({"embeddings": [[0.1] * _DIM]})
-
-    monkeypatch.setattr(embedding.httpx, "post", fake_post)
+    fake = _FakeEmbed(embeddings=[[0.1] * _DIM])
+    monkeypatch.setattr(embedding.ollama, "Client", fake)
 
     vec = embedding.embed("hit the heavy bag", task="query")
 
     assert len(vec) == _DIM
-    assert captured["json"]["input"] == "search_query: hit the heavy bag"
-    assert captured["json"]["options"]["num_ctx"] == config.EMBEDDING_NUM_CTX
-    assert captured["url"].endswith("/api/embed")
+    assert fake.captured["embed"]["input"] == "search_query: hit the heavy bag"
+    assert fake.captured["embed"]["options"]["num_ctx"] == config.EMBEDDING_NUM_CTX
+    assert fake.captured["host"] == embedding.config.OLLAMA_BASE_URL
 
 
 def test_embed_rejects_an_unknown_task(monkeypatch):
     # A caller must declare document-or-query; anything else is a bug, caught before the network.
-    def fake_post(url, json, timeout):  # pragma: no cover - must never be reached
-        raise AssertionError("embed must not call Ollama for an unknown task")
-
-    monkeypatch.setattr(embedding.httpx, "post", fake_post)
+    monkeypatch.setattr(embedding.ollama, "Client",
+                        _FakeEmbed(embeddings=_never("embed must not call Ollama for an unknown task")))
 
     with pytest.raises(ValueError):
         embedding.embed("whatever", task="banana")
@@ -155,7 +216,7 @@ def test_embed_rejects_an_unknown_task(monkeypatch):
 
 def test_embed_raises_when_no_vector_comes_back(monkeypatch):
     # An empty answer must fail loud, never return a quietly wrong vector.
-    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse({"embeddings": []}))
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[]))
 
     with pytest.raises(RuntimeError):
         embedding.embed("hit the heavy bag", task="document")
@@ -174,7 +235,7 @@ def test_rerank_scores_map_back_and_sort_best_first(monkeypatch):
     cands = [_return_recall_candidate("boxing_session"), _return_recall_candidate("phone_call"), _return_recall_candidate("sleep")]
     body = ('{"scores": [{"type": "phone_call", "score": 0.1}, '
             '{"type": "boxing_session", "score": 0.9}, {"type": "sleep", "score": 0.4}]}')
-    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse({"response": body}))
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate=body))
 
     ranked = ontology.rerank_candidates("hit the heavy bag", cands)
 
@@ -184,20 +245,15 @@ def test_rerank_scores_map_back_and_sort_best_first(monkeypatch):
 
 def test_rerank_sends_a_strict_schema_naming_only_the_candidates(monkeypatch):
     # Structured output: the schema pins `type` to an enum of exactly the candidates offered and
-    # `score` to the 0.0–1.0 band, so Ollama's decoder can't emit an invented type or a wild score.
+    # `score` to the 0.0–1.0 band, so the decoder can't emit an invented type or a wild score.
     cands = [_return_recall_candidate("boxing_session"), _return_recall_candidate("phone_call")]
-    captured = {}
-
-    def fake_post(url, json, timeout):
-        captured["json"] = json
-        return _FakeResponse({"response": '{"scores": [{"type": "boxing_session", "score": 0.9}, '
-                                          '{"type": "phone_call", "score": 0.1}]}'})
-
-    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    fake = _FakeChat(generate='{"scores": [{"type": "boxing_session", "score": 0.9}, '
+                              '{"type": "phone_call", "score": 0.1}]}')
+    monkeypatch.setattr(llm, "OpenAI", fake)
     ontology.rerank_candidates("hit the heavy bag", cands)
 
     # The per-entry shape lives in the schema's single $def; grab it without hardcoding its name.
-    (score_def,) = captured["json"]["format"]["$defs"].values()
+    (score_def,) = _schema(fake)["$defs"].values()
     props = score_def["properties"]
     assert props["type"]["enum"] == ["boxing_session", "phone_call"]
     assert props["score"]["minimum"] == 0.0
@@ -209,8 +265,8 @@ def test_rerank_defaults_an_unscored_candidate_to_zero(monkeypatch):
     # Coverage is the one thing the schema can't compel: a candidate the model leaves out of its
     # scores defaults to 0.0 in code and simply falls to the bottom.
     cands = [_return_recall_candidate("a"), _return_recall_candidate("b")]
-    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"response": '{"scores": [{"type": "a", "score": 0.6}]}'}))  # "b" omitted
+    monkeypatch.setattr(llm, "OpenAI",
+                        _FakeChat(generate='{"scores": [{"type": "a", "score": 0.6}]}'))  # "b" omitted
 
     ranked = ontology.rerank_candidates("x", cands)
 
@@ -222,8 +278,8 @@ def test_rerank_rejects_a_reply_that_breaks_the_schema(monkeypatch):
     # A reply that invents a type or scores out of the 0.0–1.0 band violates the model and raises,
     # rather than being quietly coerced — no loose output survives the boundary.
     cands = [_return_recall_candidate("a")]
-    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"response": '{"scores": [{"type": "ghost", "score": 0.5}]}'}))
+    monkeypatch.setattr(llm, "OpenAI",
+                        _FakeChat(generate='{"scores": [{"type": "ghost", "score": 0.5}]}'))
 
     with pytest.raises(ValidationError):
         ontology.rerank_candidates("x", cands)
@@ -232,16 +288,13 @@ def test_rerank_rejects_a_reply_that_breaks_the_schema(monkeypatch):
 def test_rerank_empty_pool_never_calls_the_llm(monkeypatch):
     # Recall found nothing, so there is nothing to score — and no call to spend.
     # rerank_candidates returns [] on an empty pool *before* it ever reaches the LLM; this proves it.
-    # We prove the skip with a landmine, not an after-the-fact check: swap the real HTTP call for a
-    # fake that explodes the instant it is touched, so if the code did reach the LLM the test fails
-    # loudly here rather than passing quietly.
-    def boom(url, json, timeout):  # pragma: no cover - must never be reached
-        raise AssertionError("re-rank must not call the LLM for an empty pool")
+    # We prove the skip with a landmine, not an after-the-fact check: swap the real call for a fake
+    # that explodes the instant it is touched, so if the code did reach the LLM the test fails loudly
+    # here rather than passing quietly.
+    monkeypatch.setattr(llm, "OpenAI",
+                        _FakeChat(generate=_never("re-rank must not call the LLM for an empty pool")))
 
-    # llm.httpx.post is the one call generate_json makes to reach Ollama, so this arms the whole path.
-    monkeypatch.setattr(llm.httpx, "post", boom)
-
-    # Passes only if both hold: the result is [] AND boom never fired (it would have thrown first).
+    # Passes only if both hold: the result is [] AND the landmine never fired (it would have thrown first).
     assert ontology.rerank_candidates("x", []) == []
 
 
@@ -264,16 +317,14 @@ def test_decide_bands_the_top_score(monkeypatch):
 
 def test_resolve_grey_yes_reuses(monkeypatch):
     # On the fence, one yes/no call: a "fits" reuses the candidate type rather than minting a twin.
-    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"response": '{"fits": true}'}))
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate='{"fits": true}'))
 
     assert ontology.resolve_grey("hit the heavy bag", _return_recall_candidate("boxing_session")) == ontology.REUSE
 
 
 def test_resolve_grey_no_mints(monkeypatch):
     # A "does not fit" sends the concept to minting instead of forcing an ill-fitting reuse.
-    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"response": '{"fits": false}'}))
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate='{"fits": false}'))
 
     assert ontology.resolve_grey("hit the heavy bag", _return_recall_candidate("phone_call")) == ontology.MINT
 
@@ -281,26 +332,20 @@ def test_resolve_grey_no_mints(monkeypatch):
 def test_resolve_grey_prompts_with_the_fact_and_candidate(monkeypatch):
     # The gate must see both the fact and the one candidate's name and definition to judge the fit,
     # and pin the reply to the fixed one-boolean schema so the decoder can't wander off it.
-    captured = {}
-
-    def fake_post(url, json, timeout):
-        captured["json"] = json
-        return _FakeResponse({"response": '{"fits": true}'})
-
-    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    fake = _FakeChat(generate='{"fits": true}')
+    monkeypatch.setattr(llm, "OpenAI", fake)
     ontology.resolve_grey("hit the heavy bag", _return_recall_candidate("boxing_session", "a bout of boxing"))
 
-    prompt = captured["json"]["prompt"]
+    prompt = _prompt(fake)
     assert "hit the heavy bag" in prompt
     assert "boxing_session" in prompt and "a bout of boxing" in prompt
-    assert captured["json"]["format"]["properties"]["fits"]["type"] == "boolean"
+    assert _schema(fake)["properties"]["fits"]["type"] == "boolean"
 
 
 def test_resolve_grey_rejects_a_reply_that_breaks_the_schema(monkeypatch):
     # A non-boolean verdict violates the model and raises at the boundary rather than being coerced
     # into a silent reuse-or-mint — the same strict discipline the re-rank holds.
-    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"response": '{"fits": "maybe"}'}))
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate='{"fits": "maybe"}'))
 
     with pytest.raises(ValidationError):
         ontology.resolve_grey("x", _return_recall_candidate("a"))
@@ -309,18 +354,12 @@ def test_resolve_grey_rejects_a_reply_that_breaks_the_schema(monkeypatch):
 # --- the mint pass, with the LLM and the embedder faked ------------------------------------
 
 
-def _fake_ollama(monkeypatch, *, generate: str, embed: list[float] | None = None):
-    # Mint calls both Ollama endpoints — /api/generate for the reply, /api/embed for the vector —
-    # and llm and embedding share the one httpx module, so a single post dispatches on the URL:
-    # the generative reply for one, the embedding vector for the other.
+def _fake_models(monkeypatch, *, generate: str, embed: list[float] | None = None):
+    # Mint and route call both boundaries — the generative client for the reply, the embedding client
+    # for the vector — so each is faked at its own module: llm.OpenAI and embedding.ollama.Client.
     vec = embed if embed is not None else [0.1] * _DIM
-
-    def dispatch(url, json, timeout):
-        if url.endswith("/api/generate"):
-            return _FakeResponse({"response": generate})
-        return _FakeResponse({"embeddings": [vec]})
-
-    monkeypatch.setattr(llm.httpx, "post", dispatch)
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate=generate))
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[vec]))
 
 
 def _ranked(name: str, ontology_id: int, definition: str = "a definition") -> ontology.Ranked:
@@ -331,7 +370,7 @@ def _ranked(name: str, ontology_id: int, definition: str = "a definition") -> on
 def test_mint_inserts_a_new_type_and_embedding_as_a_root(client, monkeypatch):
     # The plain mint: no parent among the neighbours, so a root type with parent_id NULL,
     # its coined definition embedded and landed in the active model's table for the next recall.
-    _fake_ollama(monkeypatch, generate='{"type_name": "boxing_session", "definition": "a bout of boxing", "parent": "none"}')
+    _fake_models(monkeypatch, generate='{"type_name": "boxing_session", "definition": "a bout of boxing", "parent": "none"}')
 
     with db.get_pool().connection() as conn:
         new_id = ontology.mint(conn, "hit the heavy bag", [])
@@ -352,7 +391,7 @@ def test_mint_sets_the_parent_from_the_context(client, monkeypatch):
     with db.get_pool().connection() as conn:
         parent_oid = _add_type(conn, "workout_action", "any bout of physical training", _vec(**{"0": 1.0}))
         context = [_ranked("workout_action", parent_oid), _ranked("errand", 999)]
-        _fake_ollama(monkeypatch, generate='{"type_name": "boxing_session", "definition": "a bout of boxing", "parent": "workout_action"}')
+        _fake_models(monkeypatch, generate='{"type_name": "boxing_session", "definition": "a bout of boxing", "parent": "workout_action"}')
 
         new_id = ontology.mint(conn, "hit the heavy bag", context)
 
@@ -364,12 +403,10 @@ def test_mint_sets_the_parent_from_the_context(client, monkeypatch):
 def test_mint_reuses_an_existing_type_on_a_name_collision(client, monkeypatch):
     # The model names a type that already exists: mint returns that row's id and inserts nothing,
     # and never even reaches the embedder — a clash resolves to reuse, not a suffixed duplicate.
-    def dispatch(url, json, timeout):
-        if url.endswith("/api/embed"):  # pragma: no cover - must never be reached
-            raise AssertionError("mint must not embed when it reuses an existing type on a name clash")
-        return _FakeResponse({"response": '{"type_name": "boxing_session", "definition": "a fresh definition", "parent": "none"}'})
-
-    monkeypatch.setattr(llm.httpx, "post", dispatch)
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(
+        generate='{"type_name": "boxing_session", "definition": "a fresh definition", "parent": "none"}'))
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(
+        embeddings=_never("mint must not embed when it reuses an existing type on a name clash")))
     with db.get_pool().connection() as conn:
         existing = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
         before = conn.execute("SELECT count(*) FROM schema_ontology").fetchone()[0]
@@ -386,24 +423,18 @@ def test_mint_reuses_an_existing_type_on_a_name_collision(client, monkeypatch):
 
 def test_mint_parent_grammar_is_locked_to_the_context_plus_none(monkeypatch):
     # Structured output: the reply's `parent` enum is exactly the neighbour names and "none",
-    # so Ollama's decoder can't hang the new type under a parent that was never offered.
-    captured = {}
-
-    def fake_post(url, json, timeout):
-        if url.endswith("/api/embed"):
-            return _FakeResponse({"embeddings": [[0.1] * _DIM]})
-        captured["json"] = json
-        return _FakeResponse({"response": '{"type_name": "boxing_session", "definition": "a bout", "parent": "none"}'})
-
-    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    # so the decoder can't hang the new type under a parent that was never offered.
+    fake = _FakeChat(generate='{"type_name": "boxing_session", "definition": "a bout", "parent": "none"}')
+    monkeypatch.setattr(llm, "OpenAI", fake)
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[[0.1] * _DIM]))
     context = [_ranked("workout_action", 1), _ranked("errand", 2)]
     with db.get_pool().connection() as conn:
         ontology.mint(conn, "hit the heavy bag", context)
 
-    assert captured["json"]["format"]["properties"]["parent"]["enum"] == ["workout_action", "errand", "none"]
+    assert _schema(fake)["properties"]["parent"]["enum"] == ["workout_action", "errand", "none"]
 
 
-# --- the generative client, with Ollama faked ----------------------------------------------
+# --- the generative client, with the LLM faked ---------------------------------------------
 
 
 class _Scored(BaseModel):
@@ -413,28 +444,21 @@ class _Scored(BaseModel):
 
 def test_generate_json_sends_the_fixed_flags_and_validates(monkeypatch):
     # Thinking off, deterministic, and output held to the caller's model schema — not loose JSON.
-    captured = {}
-
-    def fake_post(url, json, timeout):
-        captured["url"] = url
-        captured["json"] = json
-        return _FakeResponse({"response": '{"score": 0.5}'})
-
-    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    fake = _FakeChat(generate='{"score": 0.5}')
+    monkeypatch.setattr(llm, "OpenAI", fake)
 
     out = llm.generate_json("some prompt", _Scored)
 
     assert isinstance(out, _Scored) and out.score == 0.5
-    assert captured["json"]["think"] is False
-    assert captured["json"]["stream"] is False
-    assert captured["json"]["format"] == _Scored.model_json_schema()
-    assert captured["json"]["options"]["temperature"] == 0
-    assert captured["url"].endswith("/api/generate")
+    assert fake.captured["json"]["reasoning_effort"] == "none"  # thinking off
+    assert _schema(fake) == _Scored.model_json_schema()  # the caller's model bound the decoder
+    assert fake.captured["json"]["temperature"] == 0  # deterministic for a scored judgment
+    assert fake.captured["base_url"] == llm.config.SCALEWAY_API_BASE_URL
 
 
 def test_generate_json_raises_on_empty_response(monkeypatch):
     # An empty generation must fail loud, never pass as a half-read decision.
-    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse({"response": ""}))
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate=""))
 
     with pytest.raises(RuntimeError):
         llm.generate_json("some prompt", _Scored)
@@ -445,8 +469,8 @@ def test_generate_json_raises_on_empty_response(monkeypatch):
 
 def test_extract_concepts_names_the_distinct_concepts(monkeypatch):
     # One call reads the fact and returns the kinds of things it is about, as a plain list.
-    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"response": '{"concepts": ["a boxing session", "time with a friend", "a heat wave"]}'}))
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(
+        generate='{"concepts": ["a boxing session", "time with a friend", "a heat wave"]}'))
 
     got = ontology.extract_concepts("boxing with my friend Jeremy during the heat wave")
 
@@ -456,24 +480,18 @@ def test_extract_concepts_names_the_distinct_concepts(monkeypatch):
 def test_extract_concepts_prompts_with_the_fact_and_demands_at_least_one(monkeypatch):
     # The prompt must carry the fact, and the schema must forbid an empty list — a fact is always
     # about something, so "no concepts" is a mis-read the decoder grammar refuses up front.
-    captured = {}
-
-    def fake_post(url, json, timeout):
-        captured["json"] = json
-        return _FakeResponse({"response": '{"concepts": ["a nap"]}'})
-
-    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    fake = _FakeChat(generate='{"concepts": ["a nap"]}')
+    monkeypatch.setattr(llm, "OpenAI", fake)
     ontology.extract_concepts("dozed off on the couch")
 
-    assert "dozed off on the couch" in captured["json"]["prompt"]
-    assert captured["json"]["format"]["properties"]["concepts"]["minItems"] == 1
+    assert "dozed off on the couch" in _prompt(fake)
+    assert _schema(fake)["properties"]["concepts"]["minItems"] == 1
 
 
 def test_extract_concepts_rejects_an_empty_list(monkeypatch):
     # A reply naming no concept breaks the min-length and raises at the boundary rather than
     # letting a fact through with nothing to file it under.
-    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"response": '{"concepts": []}'}))
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate='{"concepts": []}'))
 
     with pytest.raises(ValidationError):
         ontology.extract_concepts("something happened")
@@ -485,26 +503,20 @@ def test_extract_concepts_rejects_an_empty_list(monkeypatch):
 def test_extract_happened_at_resolves_a_cue_against_the_reference(monkeypatch):
     # The fact carries a relative cue; the model resolves it to an instant, which we parse to a datetime.
     # The prompt must carry both the fact and the reference moment cues resolve against.
-    captured = {}
-
-    def fake_post(url, json, timeout):
-        captured["json"] = json
-        return _FakeResponse({"response": '{"happened_at": "2026-07-10T00:00:00Z"}'})
-
-    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    fake = _FakeChat(generate='{"happened_at": "2026-07-10T00:00:00Z"}')
+    monkeypatch.setattr(llm, "OpenAI", fake)
     reference = datetime(2026, 7, 11, 21, 0, tzinfo=timezone.utc)
 
     got = ontology.extract_happened_at("boxing yesterday", reference=reference)
 
     assert got == datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc)
-    assert "boxing yesterday" in captured["json"]["prompt"]
-    assert reference.isoformat() in captured["json"]["prompt"]
+    assert "boxing yesterday" in _prompt(fake)
+    assert reference.isoformat() in _prompt(fake)
 
 
 def test_extract_happened_at_returns_none_when_the_fact_names_no_moment(monkeypatch):
     # A fact with no temporal cue is answered with null, and null becomes None — not a guessed time.
-    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"response": '{"happened_at": null}'}))
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate='{"happened_at": null}'))
 
     got = ontology.extract_happened_at(
         "I live in Strasbourg", reference=datetime(2026, 7, 11, tzinfo=timezone.utc)
@@ -516,8 +528,7 @@ def test_extract_happened_at_returns_none_when_the_fact_names_no_moment(monkeypa
 def test_extract_happened_at_rejects_a_malformed_timestamp(monkeypatch):
     # A reply that isn't a parseable instant violates the model and raises at the boundary
     # rather than filing a fact under a quietly wrong time — the same strict discipline the router holds.
-    monkeypatch.setattr(llm.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"response": '{"happened_at": "some tuesday"}'}))
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate='{"happened_at": "some tuesday"}'))
 
     with pytest.raises(ValidationError):
         ontology.extract_happened_at("x", reference=datetime(2026, 7, 11, tzinfo=timezone.utc))
@@ -528,12 +539,10 @@ def test_extract_happened_at_rejects_a_malformed_timestamp(monkeypatch):
 
 def test_route_concept_reuses_a_clear_match(client, monkeypatch):
     # A concept whose nearest type the re-ranker scores well is reused — no new type is coined.
-    def dispatch(url, json, timeout):
-        if url.endswith("/api/embed"):  # the recall query embedding: point it straight at the type
-            return _FakeResponse({"embeddings": [_vec(**{"0": 1.0})]})
-        return _FakeResponse({"response": '{"scores": [{"type": "boxing_session", "score": 0.95}]}'})
-
-    monkeypatch.setattr(llm.httpx, "post", dispatch)
+    # The recall query embedding points straight at the type; the re-rank scores it a clear reuse.
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(
+        generate='{"scores": [{"type": "boxing_session", "score": 0.95}]}'))
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[_vec(**{"0": 1.0})]))
     with db.get_pool().connection() as conn:
         existing = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
         before = conn.execute("SELECT count(*) FROM schema_ontology").fetchone()[0]
@@ -546,7 +555,7 @@ def test_route_concept_reuses_a_clear_match(client, monkeypatch):
 
 def test_route_concept_mints_on_an_empty_store(client, monkeypatch):
     # Nothing to recall, so nothing to reuse: the concept coins its first type and route returns it.
-    _fake_ollama(monkeypatch, generate='{"type_name": "boxing_session", "definition": "a bout of boxing", "parent": "none"}')
+    _fake_models(monkeypatch, generate='{"type_name": "boxing_session", "definition": "a bout of boxing", "parent": "none"}')
 
     with db.get_pool().connection() as conn:
         got = ontology.route_concept(conn, "hit the heavy bag")
@@ -562,17 +571,14 @@ def test_route_concept_coins_then_reuses_the_same_type(client, monkeypatch):
     # type; a second fact of the same kind reuses it rather than minting a duplicate.
     with db.get_pool().connection() as conn:
         # First concept: empty store → mint. The mint reply names the new type; the embed lands its vector.
-        _fake_ollama(monkeypatch, generate='{"type_name": "boxing_session", "definition": "a bout of boxing", "parent": "none"}')
+        _fake_models(monkeypatch, generate='{"type_name": "boxing_session", "definition": "a bout of boxing", "parent": "none"}')
         first = ontology.route_concept(conn, "hit the heavy bag")
 
         # Second concept of the same kind: recall now finds the coined type, and the re-ranker
         # scores it a clear reuse — so no second type is coined.
-        def dispatch(url, json, timeout):
-            if url.endswith("/api/embed"):
-                return _FakeResponse({"embeddings": [_vec(**{"0": 1.0})]})
-            return _FakeResponse({"response": '{"scores": [{"type": "boxing_session", "score": 0.95}]}'})
-
-        monkeypatch.setattr(llm.httpx, "post", dispatch)
+        monkeypatch.setattr(llm, "OpenAI", _FakeChat(
+            generate='{"scores": [{"type": "boxing_session", "score": 0.95}]}'))
+        monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[_vec(**{"0": 1.0})]))
         second = ontology.route_concept(conn, "three rounds on the bag")
 
         assert second == first
@@ -586,16 +592,15 @@ def test_route_concept_grey_gate_reuses_on_a_fence_sitting_score(client, monkeyp
     monkeypatch.setattr(config, "REUSE_THRESHOLD", 0.7)
     monkeypatch.setattr(config, "MINT_THRESHOLD", 0.3)
 
-    def dispatch(url, json, timeout):
-        if url.endswith("/api/embed"):
-            return _FakeResponse({"embeddings": [_vec(**{"0": 1.0})]})
-        # Two generative calls share this path: the re-rank asks to score the pool, the grey gate
-        # asks a single yes/no. The re-rank prompt is the one that says "Score each candidate".
-        if "Score each candidate" in json["prompt"]:
-            return _FakeResponse({"response": '{"scores": [{"type": "boxing_session", "score": 0.5}]}'})
-        return _FakeResponse({"response": '{"fits": true}'})
+    # Two generative calls share this path: the re-rank asks to score the pool, the grey gate asks a
+    # single yes/no. The re-rank prompt is the one that says "Score each candidate".
+    def generate(kwargs):
+        if "Score each candidate" in _prompt_of(kwargs):
+            return '{"scores": [{"type": "boxing_session", "score": 0.5}]}'
+        return '{"fits": true}'
 
-    monkeypatch.setattr(llm.httpx, "post", dispatch)
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate=generate))
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[_vec(**{"0": 1.0})]))
     with db.get_pool().connection() as conn:
         existing = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
 
@@ -637,8 +642,7 @@ def test_synthesize_keeps_the_text_verbatim_and_sorts_the_types():
 
 def test_persist_writes_the_fact_its_payload_embedding_and_links(client, monkeypatch):
     # One fact, one embedding row, and one link per concept — the whole write, atomic.
-    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"embeddings": [_vec(**{"0": 1.0})]}))
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[_vec(**{"0": 1.0})]))
 
     with db.get_pool().connection() as conn:
         a = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
@@ -664,8 +668,7 @@ def test_persist_writes_the_fact_its_payload_embedding_and_links(client, monkeyp
 
 def test_persist_payload_is_queryable_by_jsonb_operators(client, monkeypatch):
     # The point of storing JSON-LD in JSONB: reach into it with Postgres operators.
-    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"embeddings": [_vec(**{"0": 1.0})]}))
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[_vec(**{"0": 1.0})]))
 
     with db.get_pool().connection() as conn:
         a = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
@@ -684,8 +687,7 @@ def test_persist_payload_is_queryable_by_jsonb_operators(client, monkeypatch):
 
 def test_persist_stores_happened_at_when_given(client, monkeypatch):
     # A fact with a known event time stores it on the event clock; created_at fills itself.
-    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"embeddings": [_vec(**{"0": 1.0})]}))
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[_vec(**{"0": 1.0})]))
 
     with db.get_pool().connection() as conn:
         a = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
@@ -703,8 +705,7 @@ def test_persist_stores_happened_at_when_given(client, monkeypatch):
 
 def test_persist_nulls_happened_at_when_absent(client, monkeypatch):
     # A fact that named no moment stores happened_at NULL, to collapse to created_at at read time.
-    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"embeddings": [_vec(**{"0": 1.0})]}))
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[_vec(**{"0": 1.0})]))
 
     with db.get_pool().connection() as conn:
         a = _add_type(conn, "home", "where the symbiot lives", _vec(**{"0": 1.0}))
@@ -721,8 +722,7 @@ def test_persist_files_a_message_exactly_once_by_intake_id(client, monkeypatch):
     # The exactly-once guarantee at the write boundary (migration 0013): persisting the same message twice
     # returns the first fact and writes no second — the UNIQUE intake_id makes a re-file a no-op, so an
     # interrupted or repeated ingestion sweep can never duplicate a fact.
-    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"embeddings": [_vec(**{"0": 1.0})]}))
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[_vec(**{"0": 1.0})]))
 
     with db.get_pool().connection() as conn:
         message_id = conn.execute(
@@ -747,8 +747,7 @@ def test_ingest_routes_every_concept_links_all_and_files_the_thin_payload(client
     # A fact expressing several concepts is filed against all of them, with a thin payload naming
     # each type. Routing is stubbed to fixed types (its own tests cover the recall/mint plumbing),
     # so this proves the orchestration: name → route each → synthesize → persist, once.
-    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"embeddings": [_vec(**{"0": 1.0})]}))
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[_vec(**{"0": 1.0})]))
 
     with db.get_pool().connection() as conn:
         a = _add_type(conn, "boxing_session", "a bout of boxing", _vec(**{"0": 1.0}))
@@ -777,8 +776,7 @@ def test_ingest_routes_every_concept_links_all_and_files_the_thin_payload(client
 def test_ingest_dedups_concepts_that_route_to_the_same_type(client, monkeypatch):
     # Two named concepts can resolve to one type; the fact links to it once, and its @type names it
     # once — the dedup collapses it before the join table's composite key would reject the second link.
-    monkeypatch.setattr(embedding.httpx, "post", lambda url, json, timeout: _FakeResponse(
-        {"embeddings": [_vec(**{"0": 1.0})]}))
+    monkeypatch.setattr(embedding.ollama, "Client", _FakeEmbed(embeddings=[_vec(**{"0": 1.0})]))
 
     with db.get_pool().connection() as conn:
         a = _add_type(conn, "friends", "time spent with a friend", _vec(**{"0": 1.0}))

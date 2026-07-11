@@ -1,18 +1,22 @@
-"""By-hand smoke test: the diary ingestion path against the *live* local models.
+"""By-hand smoke test: the diary ingestion path against the *live* models.
 
-The pytest suite (test/test_ontology.py) fakes Ollama at the network boundary, so it proves the
-SQL, the schema constraints, and the control flow — but never that the real embedder and the real
-re-ranker actually behave. This script is the other half: it runs the whole write path — name the
-concepts, route each, synthesize the thin payload, persist — against real `nomic-embed-text` and
-real `qwen3.5:4b`, and prints what the models decided so a human can eyeball it.
+The pytest suite (test/test_ontology.py) fakes the model clients at the network boundary,
+so it proves the SQL, the schema constraints, and the control flow —
+but never that the real embedder and the real re-ranker actually behave.
+This script is the other half:
+it runs the whole write path — name the concepts, route each, synthesize the thin payload, persist —
+against the real embedder (`nomic-embed-text`, local) and the real re-ranker (`glm-5.2` on Scaleway),
+and prints what the models decided so a human can eyeball it.
 
 It is direct-run, not a pytest test, because it needs the live box:
 
     python test/qa/0001_ontology_ingestion_smoke.py            # rolls back at the end (default)
     python test/qa/0001_ontology_ingestion_smoke.py --keep     # commits, so you can inspect the rows
 
-Prerequisites (see README, "Ollama (local models)" and "Database & migrations"):
-  - Ollama running on the box with both models pulled: `nomic-embed-text` and `qwen3.5:4b`.
+Prerequisites (see README, "Models" and "Database & migrations"):
+  - Ollama running on the box with `nomic-embed-text` pulled (the embedder is still local).
+  - A generative provider reachable: `SCALEWAY_API_KEY` set in .env for the primary (`glm-5.2`),
+    or the ladder falls back to Mistral, then to a local `qwen3.5:4b` if you have it pulled.
   - A reachable Postgres with pgvector — this connects to config.DATABASE_URL (your dev database).
 
 By default every write is wrapped in one transaction that is rolled back at the end, so the run

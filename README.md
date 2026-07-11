@@ -153,25 +153,30 @@ docker compose up -d        # comes back up on pgvector/pgvector:pg16
 
 No extension binary, and Postgres refuses to load the `vector` type — the migration fails at `CREATE EXTENSION` before any table is built. Install the binary first, then let the schema come up.
 
-## Ollama (local models)
+## Models: embedding (local) and generation (cloud, with a local fallback)
 
-The ontology routing that files a diary fact into structure leans on two **local** models, served by [Ollama](https://ollama.com) on the box — no external inference API, the same sovereignty (and cost) stance as the rest of the kernel. One turns text into vectors; the other judges how well a candidate type fits a fact. The routing depends on both:
+The kernel uses models in two roles, split by where they run.
 
-- **`nomic-embed-text`** — the embedding model, 768-dimensional output. Every ontology definition and every incoming fact is embedded through it for the vector recall pass.
-- **`qwen3.5:4b`** — the generative re-ranker. Prompted with the fact and each recalled candidate's definition, it scores in one call how well each candidate categorises the fact, and that score — not the raw vector distance, which only nominates — is what decides the match-or-mint call. It's run with thinking off and its output constrained to JSON (see the heads-up below).
-
-Install Ollama per the [official instructions](https://ollama.com/download), then pull both models once per box:
+**Embedding stays on the box**, served by [Ollama](https://ollama.com) — its vector width is what the pgvector tables are typed to, so it can't move without a re-embed. **`nomic-embed-text`** (768-dimensional output) turns every ontology definition and every incoming fact into the vector the recall pass ranks by. Install Ollama per the [official instructions](https://ollama.com/download) and pull it once per box:
 
 ```bash
 ollama pull nomic-embed-text
-ollama pull qwen3.5:4b
+ollama pull qwen3.5:4b        # the generative fallback — see below
 ```
 
-Ollama serves them on `http://127.0.0.1:11434` by default, and the kernel reaches them there. This is the same on local and server — Ollama runs natively on the host in both cases; it is *not* part of [`docker-compose.yml`](./docker-compose.yml).
+Ollama serves on `http://127.0.0.1:11434` by default, native on both local and server; it is *not* part of [`docker-compose.yml`](./docker-compose.yml).
 
-> **Heads-up on `nomic-embed-text`:** Ollama clips this model's context to 2048 tokens by default (its native window is 8192) and truncates *silently*, so long text must be embedded with `num_ctx: 8192` set — otherwise its tail vanishes from the vector with no error. The model also expects `search_document:` / `search_query:` task prefixes for its distances to mean anything. Both live in how the pipeline calls Ollama, not in the schema.
+> **Heads-up on `nomic-embed-text`:** Ollama clips this model's context to 2048 tokens by default (its native window is 8192) and truncates *silently*, so long text must be embedded with `num_ctx: 8192` set — otherwise its tail vanishes from the vector with no error. The model also expects `search_document:` / `search_query:` task prefixes for its distances to mean anything. Both live in how the pipeline calls Ollama ([`services/embedding.py`](./services/embedding.py)), not in the schema.
 
-> **Heads-up on `qwen3.5:4b`:** it's a thinking model, so the router calls it with `think: false` — the re-rank is a fast classification-style judgment, not a problem that wants a visible reasoning trace, and the trace would only cost tokens and latency. The call also sets `format: "json"` and `temperature: 0`, so the reply is a parseable object and the same fact scores the same way twice. These live in how the pipeline calls Ollama ([`services/llm.py`](./services/llm.py)), not in the schema.
+**Generation runs in the cloud**, on a bigger, faster model than the box can serve. Every generative call — the router's judgments (re-rank, the grey-zone gate, the GC same-kind and survivor calls, concept and time extraction) *and* the composed reply — goes through a **fallback ladder**, tried per request ([`services/llm.py`](./services/llm.py)):
+
+1. **Scaleway — `glm-5.2`** (primary), reached through the OpenAI-compatible client Scaleway advertises.
+2. **Mistral — `mistral-large-latest`** (fallback), reached at Mistral's *own* web API through the official `mistralai` client — deliberately not Scaleway's Mistral, since the point is surviving Scaleway being down.
+3. **Local Ollama — `qwen3.5:4b`** (last resort), the old on-box engine, kept wired so a double cloud outage still gets an answer.
+
+A call tries the primary and falls to the next tier only on an *outage-class* failure (transport error, timeout, 5xx, 429); a 4xx (a bad request, a bad key) surfaces at once rather than being masked. This crosses the kernel's former strictly-local stance on purpose: generation sends the symbiot's own diary content to an external provider, a deliberate trade for capability and speed. Pointing `RERANK_MODEL`/`REPLY_MODEL` at a local model name (via `.env`) is the one-line rollback to on-box generation.
+
+> **Heads-up on the generative calls:** thinking is off on every one — on Scaleway with `reasoning_effort="none"` (Scaleway's documented control; the z.ai `chat_template_kwargs`/`thinking` fields their Generative APIs do *not* support), and on the Ollama fallback with `think: false`. Structured output (the router's typed JSON) goes through each SDK's official `parse` structured-output helper, which binds the decoder to the caller's Pydantic schema; temperature is 0 for the router's scored judgments and the model's own default warmth for the spoken reply. These live in how [`services/llm.py`](./services/llm.py) calls each provider, not in the schema.
 
 ## Configuration (`.env`)
 
@@ -194,6 +199,9 @@ cp .env.example .env
 | `GC_ENABLED` | Override; the offline ontology duplicate-merge sweep, run in-process on a slow cadence. Default on; set `0`/`false`/`no`/`off` to disable. No external cron — it rides the app the way the intake reconcile sweep does. |
 | `GC_SWEEP_INTERVAL_SECONDS` | Override; how often that sweep wakes. Default `86400` (daily) — duplicates accrue slowly and the merge never sits on the read path. |
 | `GC_DISTANCE` | Override; the cosine-distance pre-filter the sweep uses to nominate near-twin type pairs before the model confirms them. Default `0.2`. Loosen to catch synonyms that embed further apart; the by-hand smoke (`test/qa/0002_*`) prints real distances to tune against. |
+| `SCALEWAY_API_KEY`, `SCALEWAY_API_BASE_URL` | The primary generative provider (see [Models](#models-embedding-local-and-generation-cloud-with-a-local-fallback)). Base URL defaults to `https://api.scaleway.ai/v1`. An empty key just means the primary tier can't answer and the ladder falls through to Mistral. |
+| `MISTRAL_API_KEY` | The fallback generative provider, reached at Mistral's own web API. Empty means that tier is skipped and the ladder falls through to the local Ollama model. |
+| `RERANK_MODEL`, `REPLY_MODEL` | Override; the router's and the reply's generative model. Both default to `glm-5.2` (Scaleway). Point either at a local name (e.g. `qwen3.5:4b`) to roll that path back to on-box generation. `GENERATIVE_FALLBACK_MODEL` (`mistral-large-latest`) and `GENERATIVE_LOCAL_FALLBACK_MODEL` (`qwen3.5:4b`) name the two fallback tiers. |
 
 ## Email (Gmail API)
 

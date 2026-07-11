@@ -113,9 +113,13 @@ WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "4"))
 # It bounds both layers of the timeout —
 # the worker kills its own work process at this deadline (execution.run_with_deadline),
 # and the deadline sweep fails any row still 'working' past it as the backstop (worker.run_deadline_sweep).
-# Five minutes is generous for the placeholder work today and a sane default for the real work to come;
-# tune it per the slowest honest job.
-INTAKE_DEADLINE_SECONDS = float(os.getenv("INTAKE_DEADLINE_SECONDS", "300"))
+# It must clear the generative fallback ladder's worst case:
+# a single reply can try Scaleway, then Mistral, then local Ollama in sequence,
+# each bounded by LLM_TIMEOUT_SECONDS,
+# so a full three-tier fall-through of hard timeouts alone is 3 x LLM_TIMEOUT_SECONDS before any tokens are generated.
+# Ten minutes keeps that chain (plus the composition it precedes) comfortably inside the deadline,
+# while still killing an honest hang; tune it per the slowest honest job.
+INTAKE_DEADLINE_SECONDS = float(os.getenv("INTAKE_DEADLINE_SECONDS", "600"))
 
 # How many times a message may be attempted before the kernel gives up and parks it in 'abandoned'.
 # A failing message is retried — a transient hiccup shouldn't be a death sentence —
@@ -136,9 +140,12 @@ VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
 # every push's VAPID claims. Ignored when there's no key to sign with.
 VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "").strip()
 
-# Ollama and the ontology router (embedding.py, ontology.py).
-# The embedding model runs locally on the box — no external inference API, the same sovereignty
-# stance as the rest of the kernel — so these point at the host's Ollama, not a remote service.
+# Ollama on the box (embedding.py, and the generative ladder's last-resort tier in llm.py).
+# The embedding model runs locally — no external inference API for it —
+# so these point at the host's Ollama, not a remote service.
+# Generation now leans on the cloud (see the provider block below),
+# and only falls back here when both cloud providers are down,
+# but it reaches Ollama through this same base.
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 # The embedding model the router routes with.
 # Its 768-dimensional output is what the ontology_embedding_nomic_embed_text tables are typed to,
@@ -174,13 +181,31 @@ RECALL_POOL = int(os.getenv("RECALL_POOL", "20"))
 # Invariant: RECALL_EF_SEARCH >= RECALL_POOL, always.
 RECALL_EF_SEARCH = int(os.getenv("RECALL_EF_SEARCH", "100"))
 
+# The cloud generative providers and the fallback ladder behind every generative call (llm.py).
+# Generation runs on a bigger, faster model than the box can serve:
+# Scaleway (GPU-backed) is primary, reached through the OpenAI-compatible client Scaleway advertises;
+# a call that hits an outage-class failure there falls to Mistral's own web API,
+# and then — only if both clouds are down — to the local Ollama model,
+# the last resort that keeps the loop answering.
+# The keys and base URL come from .env;
+# an empty key simply means that tier can't answer and the ladder falls through it.
+SCALEWAY_API_BASE_URL = os.getenv("SCALEWAY_API_BASE_URL", "https://api.scaleway.ai/v1")
+SCALEWAY_API_KEY = os.getenv("SCALEWAY_API_KEY", "").strip()
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
+# The two fallback models, tried in order after the primary (a Scaleway model) fails outage-class.
+GENERATIVE_FALLBACK_MODEL = os.getenv("GENERATIVE_FALLBACK_MODEL", "mistral-large-latest")
+GENERATIVE_LOCAL_FALLBACK_MODEL = os.getenv("GENERATIVE_LOCAL_FALLBACK_MODEL", "qwen3.5:4b")
+
 # The generative model behind the router's judgments — re-ranking the recalled candidates,
 # and breaking the tie in the grey zone when their top score is ambiguous.
-# Reached through Ollama's /api/generate with thinking off and output constrained to JSON (llm.py).
-RERANK_MODEL = os.getenv("RERANK_MODEL", "qwen3.5:4b")
-# How long to wait on a generative call.
-# Longer than an embedding — generation is token by token, and the first call after a cold load
-# pays the load once — but still well inside the intake deadline that bounds a fact's whole run.
+# Its provider (Scaleway, Mistral, or local Ollama) is looked up from the model map (services.models),
+# so pointing this at a local model name is the one-line rollback to on-box generation.
+# Reached with thinking off and output constrained to the caller's JSON schema (llm.py).
+RERANK_MODEL = os.getenv("RERANK_MODEL", "glm-5.2")
+# How long to wait on a single generative attempt, applied per tier of the fallback ladder.
+# Longer than an embedding — generation is token by token,
+# and the first call after a cold load pays the load once.
+# The intake deadline is sized to clear three of these in sequence (see it above).
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
 
 # The two thresholds that band the top re-rank score into reuse / grey / mint.
@@ -226,10 +251,11 @@ GC_ENABLED = os.getenv("GC_ENABLED", "true").strip().lower() not in ("0", "false
 # the wide, meaning-based reach is the deep second pass, not this one.
 RETRIEVAL_LIMIT = int(os.getenv("RETRIEVAL_LIMIT", "10"))
 # The generative model that composes the reply.
-# Defaults to the router's model (a fast local one),
+# Defaults to the router's model (the primary cloud model),
 # but named apart because composing prose is a different job from the router's classification calls,
-# and it may want a larger model without a code change.
-# Reached through the same Ollama /api/generate as the router (llm.generate), thinking off for local speed.
+# and it may want a different model without a code change.
+# Reached through the same fallback ladder as the router (llm.generate), thinking off;
+# the reply keeps the model's own default warmth rather than the router's temperature 0.
 REPLY_MODEL = os.getenv("REPLY_MODEL", RERANK_MODEL)
 # The headroom the context-budget guard (llm._fit) keeps below a model's optimal window.
 # It covers two slacks at once: tiktoken only approximates qwen's tokeniser, so the count may run a little low,

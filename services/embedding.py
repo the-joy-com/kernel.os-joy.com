@@ -22,7 +22,7 @@ No external inference API — Ollama serves the model on the box (see README, "O
 the same sovereignty stance as the rest of the kernel.
 """
 
-import httpx
+import ollama
 
 from core import config
 
@@ -41,25 +41,24 @@ def embed(text: str, *, task: str) -> list[float]:
     it picks the mandatory nomic prefix, the one thing the caller has to declare.
     The context window is opened to config.EMBEDDING_NUM_CTX so a long text is embedded whole,
     never silently truncated to the model's clipped default.
+    The call goes through the client Ollama's Python docs advertise, built fresh per call,
+    rather than a hand-rolled POST to /api/embed,
+    so this stays on the maintained boundary rather than a private endpoint contract.
     Raises on anything but a clean response carrying a vector:
-    a bad embedding must fail loud, never return a quietly wrong vector that would poison every distance measured against it.
+    a bad embedding must fail loud,
+    never return a quietly wrong vector that would poison every distance measured against it.
     """
     if task not in _PREFIX:
         raise ValueError(f"unknown embed task {task!r}: expected 'document' or 'query'")
-    resp = httpx.post(
-        f"{config.OLLAMA_BASE_URL}/api/embed",
-        json={
-            "model": config.EMBEDDING_MODEL,
-            "input": _PREFIX[task] + text,
-            "options": {"num_ctx": config.EMBEDDING_NUM_CTX},
-        },
-        timeout=config.OLLAMA_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
+    client = ollama.Client(host=config.OLLAMA_BASE_URL, timeout=config.OLLAMA_TIMEOUT_SECONDS)
     # /api/embed answers with a list of vectors, one per input; we send one text, so we want the first.
-    embeddings = resp.json().get("embeddings")
+    embeddings = client.embed(
+        model=config.EMBEDDING_MODEL,
+        input=_PREFIX[task] + text,
+        options={"num_ctx": config.EMBEDDING_NUM_CTX},
+    ).embeddings
     if not embeddings or not embeddings[0]:
         raise RuntimeError(
             f"embedding model {config.EMBEDDING_MODEL!r} returned no vector for a {task!r} text"
         )
-    return embeddings[0]
+    return list(embeddings[0])
