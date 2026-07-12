@@ -34,6 +34,9 @@ os.environ["GC_ENABLED"] = "0"
 # The live diary ingestion sweep stays off under test too — its tests drive _ingest_one by hand,
 # and a live sweep would race them for the intake and ontology tables.
 os.environ["INGEST_ENABLED"] = "0"
+# The conversation compression sweep stays off under test as well — its tests drive _compress_one
+# by hand, and a live sweep would race them for the conversation stream and its Gist.
+os.environ["COMPRESS_ENABLED"] = "0"
 # Web push stays off unless a test opts in (by monkeypatching config), so no test can reach a real push service —
 # even though a dev .env might carry a VAPID key, this pins it empty
 # (load_dotenv won't override an env var already set, blank or not).
@@ -114,7 +117,7 @@ def clean_db(client):
         # embedding_model is left alone — it holds the active-model seed the migration wrote, not test data.
         conn.execute(
             "TRUNCATE symbiot, login_code, session, intake, missive, reply_channel, "
-            "schema_ontology, diary_facts "
+            "schema_ontology, diary_facts, conversation_item, conversation_gist "
             "RESTART IDENTITY CASCADE"
         )
         conn.execute("INSERT INTO symbiot (email) VALUES (%s)", (SYMBIOT_EMAIL,))

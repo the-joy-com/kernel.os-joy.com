@@ -1,20 +1,29 @@
 """Composing the reply, with the persona and the model faked.
 
-The composer's job is to fold three things — the persona's voice, the gathered facts, and the message —
-into one prompt and hand it to the free-text model path, marking the facts as the summarisable context.
-So the persona load and llm.generate are faked, and the assertions are about what reaches the model:
-the voice, the dated facts, the message, and which slice is passed as context.
+The composer's job is to fold four things — the persona's voice, the diary facts (long-term memory),
+the recent conversation (short-term memory, the Gist then the verbatim tail), and the message —
+into one prompt and hand it to the free-text model path.
+Two of those are sacred and never marked summarisable — the persona and the live message;
+everything the reply remembers (diary + Gist + tail) is assembled into the one compressible context block.
+So the persona load and llm.generate are faked,
+and the assertions are about what reaches the model: the voice, the dated facts, the conversation, the message,
+and that the summarisable region is exactly the remembered block — never the persona or the message.
 """
 
 from datetime import datetime, timezone
 
 from core import config
+from services import conversation
 from services import reply
 from services import retrieval
 
 
 def _fact(id: int, raw_text: str, effective_at: datetime, rank: float = 0.5) -> retrieval.Fact:
     return retrieval.Fact(id=id, raw_text=raw_text, payload={}, effective_at=effective_at, rank=rank)
+
+
+def _convo(gist=None, tail=()) -> conversation.Conversation:
+    return conversation.Conversation(gist=gist, tail=list(tail))
 
 
 def test_compose_folds_persona_facts_and_message_into_the_prompt(monkeypatch):
@@ -31,7 +40,7 @@ def test_compose_folds_persona_facts_and_message_into_the_prompt(monkeypatch):
         _fact(2, "I live in Strasbourg", datetime(2026, 7, 1, tzinfo=timezone.utc), rank=0.5),
     ]
 
-    out = reply.compose("how have I been?", facts)
+    out = reply.compose("how have I been?", facts, _convo())
 
     assert out == "here is your answer"
     # The persona, the message, and each fact (with its effective date) are all in the prompt.
@@ -45,8 +54,73 @@ def test_compose_folds_persona_facts_and_message_into_the_prompt(monkeypatch):
     assert "boxing with Jeremy" in captured["context"]
 
 
-def test_compose_over_an_empty_diary_says_so_and_marks_nothing_summarisable(monkeypatch):
-    # No facts: the diary block reads the honest no-facts line, and nothing is offered as summarisable context.
+def test_compose_folds_short_term_memory_gist_then_verbatim_tail(monkeypatch):
+    # Short-term memory reaches the prompt as the Gist followed by the role-tagged verbatim tail,
+    # and it is part of the one compressible context block — diary and conversation alike.
+    monkeypatch.setattr(reply.persona, "load", lambda: "VOICE")
+    captured = {}
+    monkeypatch.setattr(
+        reply.llm, "generate",
+        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt, context=context) or "ok",
+    )
+    conv = _convo(
+        gist="Earlier they told me about two projects.",
+        tail=[
+            conversation.Turn(role="symbiot", text="show me the projects"),
+            conversation.Turn(role="machine", text="here are Alpha and Beta"),
+        ],
+    )
+    facts = [_fact(1, "a fact", datetime(2026, 7, 1, tzinfo=timezone.utc))]
+
+    reply.compose("and the second one?", facts, conv)
+
+    prompt = captured["prompt"]
+    assert "Earlier they told me about two projects." in prompt
+    assert "show me the projects" in prompt and "here are Alpha and Beta" in prompt
+    # The gist precedes the verbatim tail, which precedes the current message.
+    assert prompt.index("Earlier they told me") < prompt.index("show me the projects")
+    assert prompt.index("here are Alpha and Beta") < prompt.index("and the second one?")
+    # Each turn is tagged with who spoke.
+    assert f"{conversation._speaker('symbiot')}: show me the projects" in prompt
+    assert f"{conversation._speaker('machine')}: here are Alpha and Beta" in prompt
+    # The whole remembered block is the compressible context — the conversation belongs to it too now.
+    assert "here are Alpha and Beta" in captured["context"]
+    assert "a fact" in captured["context"]
+
+
+def test_compose_marks_the_whole_memory_summarisable_and_never_the_persona_or_message(monkeypatch):
+    # The uniform rule: everything remembered (diary + Gist + tail) is the one compressible region;
+    # the persona and the live message are sacred and never reach the summarisable context.
+    monkeypatch.setattr(reply.persona, "load", lambda: "SACRED PERSONA VOICE")
+    captured = {}
+    monkeypatch.setattr(
+        reply.llm, "generate",
+        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt, context=context) or "ok",
+    )
+    conv = _convo(
+        gist="a summarised backstory",
+        tail=[conversation.Turn(role="symbiot", text="a recent verbatim turn")],
+    )
+    facts = [_fact(1, "a dated fact", datetime(2026, 7, 1, tzinfo=timezone.utc))]
+
+    reply.compose("THE LIVE MESSAGE", facts, conv)
+
+    context = captured["context"]
+    # Everything remembered is inside the compressible block...
+    assert "a dated fact" in context
+    assert "a summarised backstory" in context
+    assert "a recent verbatim turn" in context
+    # ...and the two sacred parts never are.
+    assert "SACRED PERSONA VOICE" not in context
+    assert "THE LIVE MESSAGE" not in context
+    # The block sits verbatim in the prompt, so the guard can splice a condensed version back in its place.
+    assert context in captured["prompt"]
+
+
+def test_compose_over_an_empty_diary_and_no_conversation_still_composes_over_the_honest_empty(monkeypatch):
+    # No facts and no conversation yet:
+    # the memory block reads its honest empty lines and is still the compressible region (tiny, so the guard never fires) —
+    # the persona and the message stay out of it.
     monkeypatch.setattr(reply.persona, "load", lambda: "VOICE")
     captured = {}
     monkeypatch.setattr(
@@ -54,8 +128,12 @@ def test_compose_over_an_empty_diary_says_so_and_marks_nothing_summarisable(monk
         lambda prompt, *, model=None, context=None: captured.update(prompt=prompt, context=context) or "ok",
     )
 
-    reply.compose("hello there", [])
+    reply.compose("hello there", [], _convo())
 
     assert reply._NO_FACTS in captured["prompt"]
+    assert conversation._NO_GIST in captured["prompt"]
+    assert conversation._NO_TAIL in captured["prompt"]
     assert "hello there" in captured["prompt"]
-    assert captured["context"] is None
+    # The memory block is the context even when empty; the honest-empty lines are what it carries.
+    assert reply._NO_FACTS in captured["context"]
+    assert "hello there" not in captured["context"]

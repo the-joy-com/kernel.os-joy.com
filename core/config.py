@@ -50,10 +50,10 @@ GMAIL_SENDER = os.getenv("GMAIL_SENDER", "").strip()
 # The machine symbiot's persona, kept as two files split by who may read them (persona.py).
 # The public half is versioned in the repo — the character and the stance, in the open —
 # and carries a {{ INJECT_SYMBIOSIS_CORE_PRIVATE }} token where the private half is spliced in.
-# The private half is gitignored, never committed: it holds what the symbiot won't share
-# with the World. An absent private file is fine — the token collapses to empty and the
-# public persona stands alone. Paths are anchored to the repo root so they resolve the same
-# whatever the working directory, and can still be pointed elsewhere by the environment.
+# The private half is gitignored, never committed: it holds what the symbiot won't share with the World.
+# An absent private file is fine — the token collapses to empty and the public persona stands alone.
+# Paths are anchored to the repo root so they resolve the same whatever the working directory,
+# and can still be pointed elsewhere by the environment.
 # This module lives in core/, one level down from the repo root, so we climb one directory.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PERSONA_PUBLIC_FILE = os.getenv(
@@ -90,8 +90,8 @@ RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").strip().lower() not
 )
 
 # The intake worker (worker.py): the background loop that answers received messages.
-# On by default; the test suite turns it off so it can't race the suite for received
-# rows while the state machine is driven by hand.
+# On by default; the test suite turns it off so it can't race the suite for received rows
+# while the state machine is driven by hand.
 WORKER_ENABLED = os.getenv("WORKER_ENABLED", "true").strip().lower() not in (
     "0",
     "false",
@@ -102,8 +102,8 @@ WORKER_ENABLED = os.getenv("WORKER_ENABLED", "true").strip().lower() not in (
 # How many workers run at once.
 # More than one so a single slow or wedged message can't block every message behind it —
 # the others keep draining the queue.
-# When a worker claims a message it locks that row, 
-# and any other worker reaching for it steps over the locked row to the next free one — 
+# When a worker claims a message it locks that row,
+# and any other worker reaching for it steps over the locked row to the next free one —
 # so two workers never take the same message.
 # Kept well under the connection pool's size so workers can't starve the API of connections.
 WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "4"))
@@ -136,8 +136,8 @@ MAX_INTAKE_ATTEMPTS = int(os.getenv("MAX_INTAKE_ATTEMPTS", "3"))
 # only the out-of-band nudge is skipped —
 # so a missing key degrades the reply channel to poll-on-open rather than breaking anything.
 VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
-# A contact URI (mailto: or https:) the push service can reach the app owner at, sent in
-# every push's VAPID claims. Ignored when there's no key to sign with.
+# A contact URI (mailto: or https:) the push service can reach the app owner at,
+# sent in every push's VAPID claims. Ignored when there's no key to sign with.
 VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "").strip()
 
 # Ollama on the box (embedding.py, and the generative ladder's last-resort tier in llm.py).
@@ -216,18 +216,18 @@ LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
 REUSE_THRESHOLD = float(os.getenv("REUSE_THRESHOLD", "0.7"))
 MINT_THRESHOLD = float(os.getenv("MINT_THRESHOLD", "0.3"))
 # The bands only make sense with the mint floor strictly below the reuse floor and both inside 0.0–1.0;
-# cross them and the grey zone vanishes and decide() tests MINT before REUSE, so a fact that clearly
-# fits an existing type gets read as a mint and a needless duplicate is coined — silently, forever.
-# Caught at import (before the pool opens or a worker starts), so a fat-fingered .env refuses to boot
-# rather than quietly mis-filing every fact that follows.
+# cross them and the grey zone vanishes and decide() tests MINT before REUSE,
+# so a fact that clearly fits an existing type gets read as a mint and a needless duplicate is coined — silently, forever.
+# Caught at import (before the pool opens or a worker starts),
+# so a fat-fingered .env refuses to boot rather than quietly mis-filing every fact that follows.
 if not 0.0 <= MINT_THRESHOLD < REUSE_THRESHOLD <= 1.0:
     raise ValueError(
         "ontology thresholds out of order: need 0.0 <= MINT_THRESHOLD < REUSE_THRESHOLD <= 1.0, "
         f"got MINT_THRESHOLD={MINT_THRESHOLD}, REUSE_THRESHOLD={REUSE_THRESHOLD}"
     )
 
-# The offline duplicate garbage-collection pass (services/ontology_gc.py) that merges
-# the semantic duplicates forward-only minting breeds — workout_action coined Tuesday, training_session Friday.
+# The offline duplicate garbage-collection pass (services/ontology_gc.py) that merges the semantic duplicates forward-only minting breeds —
+# workout_action coined Tuesday, training_session Friday.
 # GC_DISTANCE is the cosine-distance pre-filter:
 # only type pairs nearer than this are even offered to the model as possible twins.
 # It is a loose net, not the verdict — the model, reading both full definitions, makes the real same-or-not call —
@@ -262,6 +262,52 @@ REPLY_MODEL = os.getenv("REPLY_MODEL", RERANK_MODEL)
 # and a generative call spends some of its window on the reply it produces, not just the prompt it reads.
 # A fraction of the optimal, held back from the input budget — 0.1 leaves a tenth of the window as margin.
 CONTEXT_SAFETY_MARGIN = float(os.getenv("CONTEXT_SAFETY_MARGIN", "0.1"))
+
+# Short-term conversational memory (services/conversation.py, worker.run_compression_sweep):
+# the recent back-and-forth a reply sits inside, held as a gradient — near turns verbatim, far turns folded into one running summary.
+# Two budgets size its share of the reply model's optimal window,
+# each a fraction rather than an absolute so it "travels with" the model the way the rest of the prompt's budget does (llm._fit):
+# if a provider drops and the fallback ladder switches models, the reserved share is recomputed against whichever model answers.
+# In practice all three generative tiers share one optimal window (131072),
+# so the figures are stable across a fallback.
+# Neither budget caps a read — the reader carries the whole verbatim tail back to the Gist's cutoff, uncapped, so the two buckets never gap.
+# The verbatim fraction (Bucket 1) is the *trigger* the background fold fires at, and the size it trims the tail back to:
+# it carries whole turns, word-for-word, so it is the larger.
+# The gist fraction (Bucket 2) is the *cap* on the single summary paragraph, re-compressed to this size every fold so it cannot creep upward;
+# smaller than the verbatim slice, but not tiny — it must hold the concrete facts and open threads of an ever-longer history.
+# The two, plus the persona, the diary facts, the current message, the instruction, and the output headroom, all sum to well under the window.
+# On the rare overrun, the post-hoc backstop (llm._fit) condenses the whole remembered block (diary + conversation), never the persona, the instructions, or the live message.
+CONVERSATION_VERBATIM_BUDGET_FRACTION = float(
+    os.getenv("CONVERSATION_VERBATIM_BUDGET_FRACTION", "0.25")
+)
+CONVERSATION_GIST_BUDGET_FRACTION = float(
+    os.getenv("CONVERSATION_GIST_BUDGET_FRACTION", "0.10")
+)
+# The model that folds the overflowed turns into the Gist.
+# The same heavy hitter that composes the replies (REPLY_MODEL), not a cheap local tier —
+# the Gist is load-bearing for the conversation:
+# once a turn ages out of the verbatim tail, the Gist is all a later reply has to reach back through,
+# so a weak fold that bloats the summary or garbles a fact quietly degrades every reply that leans on it.
+# The local tier proved exactly that unreliable in practice (see the by-hand fold smoke),
+# and the symbiot lives inside the result, so quality wins over saving the metered call —
+# the fold is still background work no one waits on, and it fires only when a tail overflows, so it is far from every turn.
+# It is looked up in the model map (services.models) the same way every generative model is,
+# so pointing it back at the local name is a one-line change if the cost ever outweighs the quality.
+CONVERSATION_COMPRESS_MODEL = os.getenv("CONVERSATION_COMPRESS_MODEL", REPLY_MODEL)
+# On by default; the test suite turns it off so the live sweep can't race the suite —
+# the compression tests drive _compress_one by hand, the same stance WORKER_ENABLED,
+# GC_ENABLED, and INGEST_ENABLED take for their own background loops.
+COMPRESS_ENABLED = os.getenv("COMPRESS_ENABLED", "true").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+# How often the compression sweep looks for a symbiot whose overflow it can fold when idle.
+# It drains back-to-back while folds remain; this is only the idle poll, kept relaxed —
+# a turn that overflows the verbatim tail sits in the "pending" band until the next fold,
+# and the band staying small is a matter of the sweep chasing it closely, not instantly.
+COMPRESS_SWEEP_INTERVAL_SECONDS = float(os.getenv("COMPRESS_SWEEP_INTERVAL_SECONDS", "10"))
 
 # Live diary ingestion (worker.run_ingestion_sweep):
 # the background sweep that files each settled message into the diary through the write path,

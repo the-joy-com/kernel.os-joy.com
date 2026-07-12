@@ -37,6 +37,7 @@ import psycopg
 
 from core import config
 from core import db
+from services import conversation
 from services import models
 from services import reply
 from services import retrieval
@@ -150,7 +151,9 @@ def main() -> None:
             print(f"  reply model optimal: {spec.optimal_context_tokens} tokens; "
                   f"retrieved-context block: {context_tokens} tokens — guard will not fire")
 
-            answer = reply.compose(QUESTION, hits)
+            # This smoke isolates the diary reach, so it composes with an empty conversation —
+            # short-term memory has its own smoke (0004). compose now takes it as a third argument.
+            answer = reply.compose(QUESTION, hits, conversation.Conversation(gist=None, tail=[]))
             print(f"\n=== the composed reply (live {config.REPLY_MODEL}) ===")
             print(f"  question : {QUESTION!r}")
             print(f"  reply    : {answer}")

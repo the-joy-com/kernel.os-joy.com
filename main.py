@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core import config
 from core import db
+from services import conversation
 from services import identity
 from core import logs
 from core import protocol
@@ -148,6 +149,23 @@ async def lifespan(app: FastAPI):
         )
         ingestion_sweep.start()
         worker_threads.append(ingestion_sweep)
+    # Start the background job that folds aged-out turns into each symbiot's Gist —
+    # the far end of the short-term memory gradient.
+    # A reply carries the recent turns verbatim;
+    # once they age past that budget this sweep summarises them into the running Gist, off the critical path,
+    # so nothing is lost and the reply never waits on a fold.
+    # Its own on/off switch, like the ingestion sweep and the GC,
+    # because a machine might want the verbatim tail without the folding, or the reverse;
+    # it shares only worker_stop, so the whole process winds down together.
+    if config.COMPRESS_ENABLED:
+        compression_sweep = threading.Thread(
+            target=worker.run_compression_sweep,
+            args=(worker_stop,),
+            name="conversation-compression-sweep",
+            daemon=True,
+        )
+        compression_sweep.start()
+        worker_threads.append(compression_sweep)
     yield
     worker_stop.set()
     for thread in worker_threads:
@@ -353,6 +371,13 @@ def intake(
     # We stamp that on the row so the worker can answer by it later; the shell can't assert identity, only the token proves it.
     symbiot_id = identity.authenticated_symbiot_id(conn, token)
     message_id = record_message(conn, body.line, body.reply_channel_id, symbiot_id)
+    # Mirror a recognised symbiot's line onto the conversation stream,
+    # in the same transaction as the intake row so the two commit together and the stream row points at the durable words.
+    # Only an authed line: the conversation is the symbiot's, the same boundary the diary keeps,
+    # so an anonymous caller adds nothing to a short-term memory that isn't theirs.
+    # The reply to this line joins the stream later, when the worker marks it answered (worker._process_one).
+    if symbiot_id is not None:
+        conversation.record_utterance(conn, symbiot_id, "symbiot", body.line, intake_id=message_id)
     logs.get("intake").info("intake — %d line(s)", body.line.count("\n") + 1)
     # Hand back the row's id: the batch crossed the wire with no identity of its own,
     # so this is the handle the shell keeps to ask /answers, later, what became of it.

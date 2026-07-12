@@ -6,12 +6,14 @@ _process_one directly.
 """
 
 from core import db
+from services import conversation
 from services import execution
 from services import intake
 from core import protocol
 from services import worker
 
 SEEDED_SYMBIOT_ID = 1  # conftest re-seeds exactly one symbiot with RESTART IDENTITY, so it's always id 1
+_EMPTY_CONVO = conversation.Conversation(gist=None, tail=[])
 
 
 def _state_of(message_id):
@@ -33,18 +35,18 @@ def test_worker_answers_a_received_message(client):
 
     status, answer, failed_reason = _state_of(message_id)
     assert status == "answered"
-    assert answer == worker._produce_reply(("hello", None, []))  # the produced reply, stored
+    assert answer == worker._produce_reply(("hello", None, [], _EMPTY_CONVO))  # the produced reply, stored
     assert failed_reason is None  # a success carries no failure reason
 
 
 def test_produce_reply_distinguishes_the_caller(client, monkeypatch):
     # The whole point of this rung: a recognized symbiot and an anonymous caller get different replies,
     # and it's the kernel that draws the line — the reply turns on symbiot_id, nothing the caller sends.
-    # A recognized symbiot gets a real reply composed off the diary (reply.compose, faked here);
+    # A recognized symbiot gets a real reply composed off memory (reply.compose, faked here);
     # an anonymous caller gets the stand-in, answered without the symbiot's memory.
-    monkeypatch.setattr(worker.reply, "compose", lambda message, context: f"composed:{message}")
-    assert worker._produce_reply(("hi", SEEDED_SYMBIOT_ID, [])) == "composed:hi"
-    assert worker._produce_reply(("hi", None, [])) == protocol.STANDIN_ANSWER_ANON
+    monkeypatch.setattr(worker.reply, "compose", lambda message, facts, conv: f"composed:{message}")
+    assert worker._produce_reply(("hi", SEEDED_SYMBIOT_ID, [], _EMPTY_CONVO)) == "composed:hi"
+    assert worker._produce_reply(("hi", None, [], _EMPTY_CONVO)) == protocol.STANDIN_ANSWER_ANON
 
 
 def test_worker_answers_an_authed_line_as_the_symbiot(client, monkeypatch):
@@ -52,7 +54,7 @@ def test_worker_answers_an_authed_line_as_the_symbiot(client, monkeypatch):
     # proving symbiot_id survives record → claim → gather → produce, not just the branch in isolation.
     # The composition is faked (reply.compose), and the work is run in-process (not the killable child)
     # so that fake takes effect — the child spawn is proven separately in test_execution.
-    monkeypatch.setattr(worker.reply, "compose", lambda message, context: f"reply to {message!r}")
+    monkeypatch.setattr(worker.reply, "compose", lambda message, facts, conv: f"reply to {message!r}")
     monkeypatch.setattr(
         worker.execution, "run_with_deadline",
         lambda fn, arg, deadline: execution.Result(execution.COMPLETED, fn(arg)),

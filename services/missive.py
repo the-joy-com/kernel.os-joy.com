@@ -17,6 +17,7 @@ complete act of the kernel reaching out — record the missive, then nudge — a
 producer (or a QA session) calls to send one.
 """
 
+from services import conversation
 from services import push
 
 
@@ -88,5 +89,11 @@ def deliver(pool, symbiot_id: int, body: str) -> int:
     """
     with pool.connection() as conn:
         missive_id = raise_for(conn, symbiot_id, body)
+        # Mirror the missive onto the conversation stream, in the same transaction as the record,
+        # so a line the kernel raised on its own is part of the short-term memory too:
+        # the history of the interaction runs both ways,
+        # and a later reply should see what the machine said unprompted.
+        # It is a machine turn pointing at the missive row where its words live durably.
+        conversation.record_utterance(conn, symbiot_id, "machine", body, missive_id=missive_id)
     push.notify_inbox(pool, symbiot_id)
     return missive_id
