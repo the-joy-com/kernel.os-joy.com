@@ -33,7 +33,7 @@ from core import config
 # but a script hammering the kernel will.
 _LIMITS = {
     "/login": (5, 60),  # caps email bombing; a person needs one or two
-    "/login/verify": (10, 60),  # a 6-digit code in a 10-min TTL stays infeasible
+    "/login/verify": (10, 60),  # an 8-digit code in a 10-min TTL stays infeasible
 }
 _DEFAULT_LIMIT = (120, 60)  # generous headroom for the shell's polling and retries
 

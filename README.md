@@ -92,7 +92,7 @@ The shell reads `/health` from a different origin (`shell.os-joy.com`, or `local
 
 ## Identity
 
-The kernel seeds one human — **the symbiot** — from `SYMBIOT_EMAIL` at startup. The `symbiot` table and the `/login` lookup already hold and match many addresses; today exactly one is seeded, so supporting more is a matter of seeding rather than a schema change. Logging in is a one-time emailed code: `POST /login` with a registered symbiot's address issues a six-digit code and emails it; `POST /login/verify` spends that code for a session token. Two rules make it safe:
+The kernel seeds one human — **the symbiot** — from `SYMBIOT_EMAIL` at startup. The `symbiot` table and the `/login` lookup already hold and match many addresses; today exactly one is seeded, so supporting more is a matter of seeding rather than a schema change. Logging in is a one-time emailed code: `POST /login` with a registered symbiot's address issues an eight-digit code and emails it; `POST /login/verify` spends that code for a session token. Two rules make it safe:
 
 - **No enumeration oracle.** `/login` issues a code *only* on an exact match to a registered address, and its reply is byte-identical whether or not a match happened. An unknown address, a blank one, or a recipient-smuggling value (`a@x, b@y`, `a@x;b@y`, `a@x.evil`, `a+b@x`, an embedded newline) all get the same reply — and no email goes to anyone.
 - **Nothing sensitive at rest.** Codes and session tokens are HMAC'd with `KERNEL_SECRET` before they touch the database, so a leaked table yields no usable code or token. Codes are single-use, short-lived, and only the latest-issued one verifies; sessions are revoked on `/logout`.

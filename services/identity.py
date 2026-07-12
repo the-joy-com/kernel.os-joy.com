@@ -18,7 +18,9 @@ from core import config
 from services.email_client import EmailClient
 
 # Codes are short and human-typed; sessions are long and machine-held.
-_CODE_DIGITS = 6
+# Eight digits, not six: still typeable in one glance,
+# but a hundredfold more space to guess against within the attempt budget and the code's short life.
+_CODE_DIGITS = 8
 
 
 def _hash(value: str) -> str:
@@ -166,9 +168,7 @@ def verify_login_code(conn, address: str, code: str) -> str | None:
         )
         return None
 
-    conn.execute(
-        "UPDATE login_code SET consumed_at = now() WHERE id = %s", (code_id,)
-    )
+    conn.execute("UPDATE login_code SET consumed_at = now() WHERE id = %s", (code_id,))
 
     token = secrets.token_urlsafe(32)
     expires_at = _now() + timedelta(seconds=config.SESSION_TTL_SECONDS)

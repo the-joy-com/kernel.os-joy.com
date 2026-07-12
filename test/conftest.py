@@ -78,12 +78,14 @@ from fastapi.testclient import TestClient
 import pytest
 
 from core import db
+from services import identity
 from services.email_client import FakeEmailClient
 from main import app, get_email_client
 from core.rate_limit import limiter
 
 SYMBIOT_EMAIL = "symbiot@example.com"
-_CODE_RE = re.compile(r"\b(\d{6})\b")
+# Built from identity's own digit count, so the two never drift apart when the code length changes.
+_CODE_RE = re.compile(rf"\b(\d{{{identity._CODE_DIGITS}}})\b")
 
 
 def _assert_test_database(conn) -> None:
@@ -132,11 +134,11 @@ def count_codes() -> int:
 
 
 def extract_code(fake: FakeEmailClient) -> str:
-    """Recover the 6-digit code a real client would have emailed."""
+    """Recover the numeric code a real client would have emailed."""
     assert fake.sent, "expected an email to have been sent"
     body = fake.sent[-1].body
     m = _CODE_RE.search(body)
-    assert m, f"no 6-digit code found in email body: {body!r}"
+    assert m, f"no {identity._CODE_DIGITS}-digit code found in email body: {body!r}"
     return m.group(1)
 
 
