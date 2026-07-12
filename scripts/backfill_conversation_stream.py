@@ -89,14 +89,23 @@ def backfill(conn) -> int:
     so their ids reflect the order the utterances happened —
     the same ordering the reader (conversation.recent) and the compression sweep walk the stream in.
     """
-    rows = conn.execute(_GATHER).fetchall()
-    for symbiot_id, role, text, intake_id, missive_id in rows:
-        conn.execute(
-            "INSERT INTO conversation_item (symbiot_id, role, token_count, intake_id, missive_id) "
-            "VALUES (%s, %s, %s, %s, %s)",
-            (symbiot_id, role, models.count_tokens(text), intake_id, missive_id),
-        )
-    return len(rows)
+    with psycopg.ServerCursor(conn, "backfill_cursor") as cursor:
+        cursor.execute(_GATHER)
+        
+        while True:
+            rows = cursor.fetchmany(1000)
+            if not rows:
+                break
+                
+            for symbiot_id, role, text, intake_id, missive_id in rows:
+                conn.execute(
+                    "INSERT INTO conversation_item (symbiot_id, role, token_count, intake_id, missive_id) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (symbiot_id, role, models.count_tokens(text), intake_id, missive_id),
+                )
+            total_inserted += len(rows)
+            
+    return total_inserted
 
 
 def main() -> None:
