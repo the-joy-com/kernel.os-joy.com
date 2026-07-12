@@ -212,3 +212,37 @@ def test_next_symbiot_to_fold_measures_only_past_the_cutoff(client):
     _with_conn(lambda c: conversation.record_gist(c, SEEDED_SYMBIOT_ID, "folded both", o2))
 
     assert _with_conn(lambda c: conversation.next_symbiot_to_fold(c, 90)) is None  # nothing newer than the cutoff
+
+
+# --- the fold's LLM boundary -------------------------------------------------
+
+
+def test_fold_crosses_the_boundary_as_a_schema_not_free_text(monkeypatch):
+    # The isolation guarantee: the fold hands a mandatory _FoldReply schema to generate_json,
+    # so the summary is the model's only emittable field and nothing else can reach the Gist.
+    # A recursive store — each Gist seeds the next fold — makes this structural, not a prompt plea.
+    seen = {}
+
+    def _fake_generate_json(prompt, schema, *, model=None, context=None):
+        seen["schema"] = schema
+        seen["model"] = model
+        return schema(summary="the merged paragraph")
+
+    monkeypatch.setattr(conversation.llm, "generate_json", _fake_generate_json)
+    # The free-text path is gone: if fold reaches for it, the test fails loudly rather than silently yapping.
+    def _no_free_text(*a, **k):
+        raise AssertionError("fold must not use the free-text generate — meta-commentary could bleed into the Gist")
+    monkeypatch.setattr(conversation.llm, "generate", _no_free_text)
+
+    out = conversation.fold("summary so far", [conversation.Turn(role="symbiot", text="hello")])
+
+    assert out == "the merged paragraph"
+    assert seen["schema"] is conversation._FoldReply
+    assert seen["model"] == conversation.config.CONVERSATION_COMPRESS_MODEL
+
+
+def test_fold_reply_rejects_an_empty_summary():
+    # min_length=1 is the boundary re-check: a fold always has turns to summarise,
+    # so an empty summary is a mis-read the model class refuses rather than filing a blank Gist.
+    with pytest.raises(ValueError):
+        conversation._FoldReply(summary="")

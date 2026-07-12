@@ -13,6 +13,9 @@ It builds a short exchange the way the live path does — a symbiot line and its
   2. folds the oldest turns into the Gist with a deliberately small trigger budget,
      using the live fold model (config.CONVERSATION_COMPRESS_MODEL, the same heavy hitter that composes the replies),
      and prints the Gist it produced — for a human to judge;
+     the fold crosses the model boundary as a validated schema (conversation._FoldReply), not free text,
+     so the summary is the only field the model may emit — this run also checks the live Gist carries no
+     conversational wrapper (a "Here is the summary:" preamble, a ``` fence) that would compound into the anchor;
   3. proves the state-consistency invariant the fold must never break:
      after the fold, the folded turns and the verbatim tail *partition* the stream exactly —
      no turn in both, none in neither, the two buckets meeting at the cutoff with no gap;
@@ -24,7 +27,7 @@ The fold here is orchestrated inline, on this one transaction's connection,
 rather than through worker._compress_one —
 the sweep uses its own pooled connections and would commit outside this transaction,
 where a rolled-back smoke could not see its writes.
-The logic mirrors _compress_one exactly (find the over-trigger symbiot, read the Gist and the oldest turns, fold, append),
+The logic mirrors _compress_one exactly (find the over-trigger symbiot, claim its fold, read the Gist and the oldest turns, fold, append),
 only on the single connection so the whole run rolls back clean.
 
 It is direct-run, not a pytest test, because it needs the live box:
@@ -160,6 +163,7 @@ def main() -> None:
             # --- 2. the fold, live (mirrors worker._compress_one on this one connection) -------
             symbiot_to_fold = conversation.next_symbiot_to_fold(conn, SMALL_BUDGET)
             assert symbiot_to_fold == symbiot_id, "the over-budget tail should have made this symbiot eligible to fold"
+            assert conversation.claim_fold(conn, symbiot_id), "no other worker holds this symbiot's fold, so the claim should succeed"
             gist_row = conversation.current_gist(conn, symbiot_id)
             cutoff = gist_row[1] if gist_row is not None else 0
             to_fold, new_cutoff = conversation.pending_for_fold(conn, symbiot_id, SMALL_BUDGET, cutoff)
@@ -170,6 +174,16 @@ def main() -> None:
             conversation.record_gist(conn, symbiot_id, merged, new_cutoff)
             print(f"  the Gist it produced:\n    {merged!r}")
             assert merged and merged.strip(), "the fold produced an empty Gist"
+            # The isolation guarantee, checked against the live model: the schema boundary (conversation._FoldReply)
+            # gives filler nowhere to land, so the raw Gist starts straight into the summary — no code fence, no
+            # "Here is the summary:" preamble. This matters because each Gist seeds the next fold, so any wrapper
+            # that slipped through would bake into the anchor and compound over time.
+            opener = merged.lstrip().lower()
+            assert not opener.startswith("```"), "the Gist opened with a code fence — meta-text bled into the anchor"
+            assert not opener.startswith(("here is", "here's", "summary:", "sure,", "certainly")), (
+                f"the Gist opened with a conversational preamble — the schema boundary should have prevented it: {merged!r}"
+            )
+            print("  ✓ the Gist is clean prose — no preamble, no fence — so nothing meta compounds into the anchor")
 
             # --- 3. the state-consistency invariant: folded + tail partition the stream --------
             after = conversation.recent(conn, symbiot_id)

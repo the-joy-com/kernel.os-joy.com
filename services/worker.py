@@ -61,34 +61,43 @@ def _compress_one() -> bool:
     Nothing is dropped and nothing goes dark meanwhile:
     those turns stay fully visible in the reader's tail until this commits.
     Each pass finds a symbiot whose tail is over the trigger (next_symbiot_to_fold),
+    claims that symbiot's fold so no other worker runs it at the same time (claim_fold),
     reads its current Gist and the oldest turns to fold out (current_gist, pending_for_fold),
     asks the same heavy model that composes the replies to merge them into one fresh paragraph (conversation.fold),
     and appends the result with the new cutoff (record_gist).
 
-    The eligibility read and the append use separate connections, the way ingestion's do:
-    the fold is a model call, and holding the read's connection across it would pin a pooled slot for no reason.
-    Exactly-once does not depend on holding anything — the cutoff only ever moves forward,
-    so a crash before the append leaves the same turns eligible next pass,
-    and a crash after has already advanced the boundary —
-    so nothing is lost by letting go between the read and the write.
+    The whole fold runs inside one transaction on one connection, under a non-blocking advisory lock claimed up front.
+    That lock is what keeps a multi-worker deployment honest:
+    without it two sweeps could both spot the same over-budget tail, both run the metered fold, and both append a Gist for the one cutoff.
+    With it, the second worker's claim comes back False and it skips the symbiot this pass rather than blocking on the first.
+    Holding the connection across the model call is the cost of a transaction-scoped lock, and a fair one here:
+    only this one symbiot's fold is in flight at a time, so it pins a single pooled slot briefly, never the reply path.
+    Exactly-once no longer leans on timing alone:
+    the lock serialises would-be duplicates, and the single transaction makes the fold atomic —
+    a crash or rollback before the append releases the lock and leaves the same turns eligible next pass,
+    a commit advances the cutoff so they fall outside it, the boundary only ever moving forward.
     """
     budget = conversation.verbatim_budget()
     pool = db.get_pool()
     with pool.connection() as conn:
-        symbiot_id = conversation.next_symbiot_to_fold(conn, budget)
-        if symbiot_id is None:
-            return False
-        gist = conversation.current_gist(conn, symbiot_id)
-        cutoff = gist[1] if gist is not None else 0
-        turns, new_cutoff = conversation.pending_for_fold(conn, symbiot_id, budget, cutoff)
-    # next_symbiot_to_fold already proved the tail is over the trigger, so turns is never empty here
-    # (the two read the same boundary);
-    # the guard keeps a torn race between them from writing a no-op Gist.
-    if not turns:
-        return False
-    merged = conversation.fold(gist[0] if gist is not None else None, turns)
-    with pool.connection() as conn:
-        conversation.record_gist(conn, symbiot_id, merged, new_cutoff)
+        with conn.transaction():
+            symbiot_id = conversation.next_symbiot_to_fold(conn, budget)
+            if symbiot_id is None:
+                return False
+            if not conversation.claim_fold(conn, symbiot_id):
+                # Another worker owns this symbiot's fold; skip it cleanly rather than
+                # block on its model call or race it to a duplicate Gist. It stays eligible for next pass.
+                return False
+            gist = conversation.current_gist(conn, symbiot_id)
+            cutoff = gist[1] if gist is not None else 0
+            turns, new_cutoff = conversation.pending_for_fold(conn, symbiot_id, budget, cutoff)
+            # next_symbiot_to_fold proved the tail is over the trigger, and this reads the same boundary
+            # in the same transaction, so turns is normally non-empty;
+            # the guard is defence against a boundary edge case, leaving nothing written and the lock released on exit.
+            if not turns:
+                return False
+            merged = conversation.fold(gist[0] if gist is not None else None, turns)
+            conversation.record_gist(conn, symbiot_id, merged, new_cutoff)
     return True
 
 

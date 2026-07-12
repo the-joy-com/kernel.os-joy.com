@@ -260,8 +260,8 @@ REPLY_MODEL = os.getenv("REPLY_MODEL", RERANK_MODEL)
 # The headroom the context-budget guard (llm._fit) keeps below a model's optimal window.
 # It covers two slacks at once: tiktoken only approximates qwen's tokeniser, so the count may run a little low,
 # and a generative call spends some of its window on the reply it produces, not just the prompt it reads.
-# A fraction of the optimal, held back from the input budget — 0.1 leaves a tenth of the window as margin.
-CONTEXT_SAFETY_MARGIN = float(os.getenv("CONTEXT_SAFETY_MARGIN", "0.1"))
+# A fraction of the optimal, held back from the input budget — 0.2 leaves a fifth of the window as margin.
+CONTEXT_SAFETY_MARGIN = float(os.getenv("CONTEXT_SAFETY_MARGIN", "0.2"))
 
 # Short-term conversational memory (services/conversation.py, worker.run_compression_sweep):
 # the recent back-and-forth a reply sits inside, held as a gradient — near turns verbatim, far turns folded into one running summary.

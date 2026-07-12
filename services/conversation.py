@@ -48,6 +48,8 @@ then the module's functions in alphabetical order.
 
 from dataclasses import dataclass
 
+from pydantic import BaseModel, Field
+
 from core import config
 from services import llm
 from services import models
@@ -60,6 +62,11 @@ _NO_GIST = "(nothing summarised yet — this conversation is still short)"
 # so the merge prompt reads coherently rather than splicing an empty string where a paragraph goes.
 _NO_PRIOR_GIST = "(no earlier summary yet)"
 _NO_TAIL = "(no earlier turns yet — this is the start of the conversation)"
+
+# The advisory-lock namespace the compression sweep claims a symbiot's fold under (claim_fold).
+# Its own number so the fold lock shares space with nothing else that might take an advisory lock;
+# paired with the symbiot id, it names "this symbiot's fold" and only that. Spells "FOLD" in hex.
+_FOLD_LOCK_NAMESPACE = 0x0F01D
 
 
 @dataclass(frozen=True)
@@ -95,6 +102,30 @@ def _speaker(role: str) -> str:
     return "The human symbiot" if role == "symbiot" else "You"
 
 
+def claim_fold(conn, symbiot_id: int) -> bool:
+    """Take exclusive ownership of this symbiot's fold for the current transaction; True if this caller got it.
+
+    The compression sweep's one lock, and the thing that makes the fold safe when more than one worker runs it.
+    A transaction-scoped advisory lock keyed on the symbiot (namespaced so it collides with nothing else),
+    taken with pg_try_advisory_xact_lock — the *try* form, so a caller that finds the lock already held
+    comes back False at once rather than blocking behind the holder's model call.
+    The sweep folds only when it gets True and skips the symbiot this pass when it gets False,
+    so two workers that spot the same over-budget tail never both run the fold and append a duplicate Gist for the one cutoff.
+
+    Transaction-scoped, not session-scoped, on purpose:
+    the lock releases the instant the transaction ends — commit or rollback, clean exit or crash —
+    so there is no unlock to remember and none left stranded on a connection handed back to the pool.
+    It is the fold *execution* that is claimed, nothing the read path touches:
+    the lock lives in its own advisory namespace, so it never contends with a reply gathering the same stream,
+    which stays completely lock-free.
+    """
+    row = conn.execute(
+        "SELECT pg_try_advisory_xact_lock(%s, %s)",
+        (_FOLD_LOCK_NAMESPACE, symbiot_id),
+    ).fetchone()
+    return row[0]
+
+
 def current_gist(conn, symbiot_id: int) -> tuple[str, int] | None:
     """The symbiot's current Gist as (gist_text, cutoff_item_id), or None if none folded yet.
 
@@ -112,6 +143,21 @@ def current_gist(conn, symbiot_id: int) -> tuple[str, int] | None:
     return (row[0], row[1]) if row else None
 
 
+class _FoldReply(BaseModel):
+    """The fold's answer: the merged summary, and nothing wrapped around it.
+
+    A plain, module-level model — its shape is fixed at a single string, with nothing per-call to fold in.
+    The point of routing the fold through a schema rather than free text is *isolation*:
+    the summary is the only field the model may emit, so a "Here is the updated summary:" preamble
+    or a ``` code fence has no field to land in and cannot reach the Gist that seeds the next fold.
+    Because each fold's output becomes the next fold's input, any such meta-commentary that slipped through
+    would bake into the running anchor permanently and compound over time — so the boundary, not a prompt plea, keeps it out.
+    `min_length=1` is folded into the decoder grammar and re-checked on the way back:
+    a fold always has turns to summarise, so an empty summary is a mis-read, not a valid answer."""
+
+    summary: str = Field(min_length=1)
+
+
 def fold(gist_text: str | None, turns: list[Turn]) -> str:
     """Merge the current Gist and the overflowed turns into one fresh summary paragraph.
 
@@ -122,6 +168,13 @@ def fold(gist_text: str | None, turns: list[Turn]) -> str:
     keeping the concrete facts and dropping the redundancy —
     the Gist is what a later reply reads back through once a turn has aged out of the verbatim tail,
     so its quality is load-bearing and worth the metered call, even though the fold itself is background work no one waits on.
+
+    The merge crosses the LLM boundary as a validated _FoldReply, not free text (llm.generate_json):
+    the summary is the model's only emittable field, so conversational filler — a "Here is the summary:" preamble,
+    a ``` fence — has nowhere to land and cannot reach the store.
+    This matters more here than at most boundaries because the fold is *recursive*:
+    each Gist seeds the next fold's prompt, so meta-text that slipped through once would compound into the anchor forever.
+    The schema makes that structurally impossible rather than trusting a "return only the summary" instruction the model may ignore.
 
     The prior Gist and the transcript are handed as the summarisable context:
     if that input ever overruns the model's window (a large pending band folded in one pass)
@@ -142,11 +195,14 @@ def fold(gist_text: str | None, turns: list[Turn]) -> str:
         f"aged out of the verbatim record. Merge them into one fresh summary of at most about "
         f"{target} tokens: keep every concrete fact, name, date, decision, and open thread; "
         "drop only redundancy and small talk; write it as continuous prose in the past tense, "
-        "not a list. Return only the merged summary, nothing else.\n\n"
+        "not a list. Put the summary in the `summary` field — its prose only, with no preamble, "
+        "heading, or code fence.\n\n"
         f"{context}"
     )
-    merged = llm.generate(prompt, model=config.CONVERSATION_COMPRESS_MODEL, context=context)
-    return models.truncate_tokens(merged, target)
+    reply = llm.generate_json(
+        prompt, _FoldReply, model=config.CONVERSATION_COMPRESS_MODEL, context=context
+    )
+    return models.truncate_tokens(reply.summary, target)
 
 
 def gist_budget() -> int:

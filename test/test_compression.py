@@ -82,6 +82,34 @@ def test_compress_is_idle_when_nothing_has_overflowed(client, monkeypatch):
     assert _gists() == []
 
 
+def test_compress_skips_a_symbiot_whose_fold_another_worker_holds(client, monkeypatch):
+    # The race guard, proven end to end: while one worker holds a symbiot's fold, a second sweep
+    # over the same over-budget tail must claim nothing, fold nothing, and write no duplicate Gist —
+    # then, once the lock is let go, the fold goes through as normal.
+    _small_budget(monkeypatch)
+    calls = []
+    _stub_fold(monkeypatch, calls)
+    intake_id = _intake("m", answer="a")
+    _item("symbiot", 50, intake_id=intake_id)
+    _item("machine", 50, intake_id=intake_id)
+    _item("symbiot", 50, intake_id=_intake("newest"))
+
+    # A stand-in for the other worker: hold this symbiot's fold on its own open transaction,
+    # so the advisory lock is genuinely taken by a different session while the sweep runs.
+    with db.get_pool().connection() as holder:
+        with holder.transaction():
+            assert conversation.claim_fold(holder, SEEDED_SYMBIOT_ID) is True
+
+            assert worker._compress_one() is False  # couldn't claim — skipped this pass
+            assert calls == []                       # the metered fold never ran
+            assert _gists() == []                    # and no Gist was written
+
+    # The holder's transaction has closed, releasing the lock; the fold now goes through.
+    assert worker._compress_one() is True
+    assert len(calls) == 1
+    assert len(_gists()) == 1
+
+
 def test_compress_never_folds_the_same_turn_twice(client, monkeypatch):
     # After a fold, the folded turns fall behind the cutoff,
     # so a second pass has nothing to fold until fresh overflow arrives —
