@@ -156,3 +156,52 @@ The whole prompt is handed to [`llm.generate`](../services/llm.py) with [`config
 ## the memory gradient, in one line
 
 The quick reply is no longer stateless: it carries the conversation as a gradient — **the recent turns verbatim, the older turns summarised, and nothing ever deleted.** Continuity now lives where a conversation actually keeps it — in the thread itself — rather than only in what the next message happens to lexically match in the diary. And "nothing deleted" is the literal truth at every level: the verbatim words stay in `intake` forever, the Gist keeps every fold it ever made, and even a detail blurred by summarisation is still recoverable, because the durable record and the long-term diary both still hold it. The Gist is the glue that keeps the exchange coherent turn to turn; it is never the only place a thing is kept.
+
+## the deep second pass: Tier 2, off the critical path
+
+Everything above is the fast reply — the answer the symbiot waits on, kept lexical and stateless-of-semantics so it is never slow. Tier 2 is the other half of the read path, and it never runs on that waiting path. Once a message's fast reply is settled, a background sweep ([`worker.run_enrichment_sweep`](../services/worker.py)) reaches into the diary again — this time by **meaning** rather than by shared words — and, only when that reach turns up something the fast answer missed, the machine sends an **enriched follow-up**. The fast reply is untouched: this is added beside it, the way short-term memory was added beside long-term, and it answers a third question again — not "what bears on this by relevance?" (the diary) nor "what were we just saying?" (the conversation), but "now that I have had a moment to think harder, is there something worth adding?"
+
+### the deep reach: vector recall, then the ontology walk
+
+The reach lives in [`deep_retrieval.py`](../services/deep_retrieval.py), deliberately apart from the lexical librarian it complements, and runs in two read-only movements.
+
+- **Vector recall** ([`recall_facts`](../services/deep_retrieval.py)) — the message is embedded as a query and the nearest diary facts are pulled by cosine distance through the same HNSW the store built for it, read through the `active_diary_fact_embedding` view so a model swap costs it nothing. A fact surfaces here because it *means* something close to the message, even when it shares not one word — the reach the lexical pass, matching words, structurally cannot make. It is the mirror of the router's [`recall_candidates`](../services/ontology.py) pointed the other way: the router searches ontology vectors to *classify a fact being filed*; this searches diary-fact vectors to *fetch filed facts that bear on a question*.
+- **The ontology walk** ([`expand_by_concept`](../services/deep_retrieval.py)) — the concepts the recalled facts are filed under are read from `diary_fact_ontology`, and the *sibling* facts filed under the same concepts are pulled alongside, most-shared-concepts first. So the reach follows the vocabulary tree the write path grew, not raw distance alone.
+
+Both movements only ever read. The walk never routes the message or mints a type — coining vocabulary from a read pass is the write path's job ([OS-146](../services/ontology.py)), and letting a question grow the diary's tree would corrupt the store slowly. [`deep_search`](../services/deep_retrieval.py) joins the two — recalled facts first, in distance order, then the walked-in siblings — and drops the fact this very message became, so a message never enriches itself. An empty result is the signal to send no enrichment at all.
+
+### the origin reference: three legs, so a late follow-up situates itself
+
+Because the pass lands after the fast reply, and the conversation may have moved on since, the composing call is handed the whole *origin reference* ([`enrichment.origin_reference`](../services/enrichment.py)) — three things: **(a)** the message that prompted the fast answer, **(b)** the fast answer itself, and **(c)** the turns exchanged since, read live from the conversation stream. Leg (b) is load-bearing twice: it is how the gate tells new ground from ground already covered, and — named explicitly in the prompt and forbidden to be repeated — it is what keeps the follow-up from paraphrasing the first answer. Leg (c) lets a delayed follow-up read as caught up rather than arriving out of order. This is the third kind of memory the fast path's opening note set aside: not recall by relevance, not recall by recency, but the anchor a late enrichment carries so it can place itself against everything said since it was set in motion.
+
+### the gate that mostly stays silent
+
+One structured call ([`enrichment.compose`](../services/enrichment.py), on [`config.ENRICH_MODEL`](../core/config.py), the same heavy model that composes the replies) both **gates and composes**: given the persona, the origin reference, and the deep facts, it returns whether to surface at all and, if so, the follow-up's words — a validated [`_EnrichmentReply`](../services/enrichment.py) through [`llm.generate_json`](../services/llm.py), so the decision and the prose come back checked, the same strict-schema-as-grammar the router leans on. When the deep reach found nothing, the call is skipped entirely — no new ground to weigh, so no metered call spent. The bar to surface is high on purpose: the machine already answered, and a second unprompted message must earn its interruption, so **silence is the common outcome** and a suppressed pass simply records itself as considered. A follow-up that clears the bar is delivered as a **missive** ([`missive`](../services/missive.py)) — the kernel reaching out on its own, discovered through the inbox on its own terms — rather than pretending to be an inline reply to a message the conversation has already left behind; it is mirrored onto the conversation stream, so the next turn remembers it too.
+
+### exactly-once, the same way everything else is
+
+A provenance table (`enrichment`, migration 0015) carries one row per message the pass has *considered*, surfaced or not, under a `UNIQUE` link back to the message; the sweep's eligibility ([`enrichment.next_to_enrich`](../services/enrichment.py)) is the mirror of it — an **answered** (there must be an answer *to* enrich, narrower than ingestion's terminal set), authed message with no row yet. A crash mid-pass leaves no row and the message eligible again; a committed pass records its verdict and is never re-run. Because the whole pass reads state before it writes and spends seconds doing so, it carries the same duplicate-work race the compression fold does — two sweeps could both run the deep reach and both deliver a follow-up for the one message — and takes the same cure: a non-blocking transaction-scoped advisory lock in its own namespace ([`enrichment.claim`](../services/enrichment.py)), claimed before the heavy work, so a second worker finds it held and skips. The follow-up and the row that records it commit together, so a message is sent-and-recorded atomically or neither.
+
+```mermaid
+flowchart TD
+    settled["a settled fast answer<br/>(intake, status = answered)"] --> claim
+
+    subgraph sweep["enrichment sweep — worker.run_enrichment_sweep (off the critical path)"]
+        claim["claim<br/>(pg_try_advisory_xact_lock — skip if held)"] --> reach
+        reach["deep_retrieval.deep_search(message)"] --> gate
+    end
+
+    subgraph deep["deep reach — deep_retrieval.py (read-only)"]
+        vec[("vector recall<br/>active_diary_fact_embedding, cosine")]
+        walk[("ontology walk<br/>diary_fact_ontology siblings")]
+    end
+    reach --> vec
+    reach --> walk
+
+    origin["origin reference<br/>(a) message + (b) fast answer + (c) turns since"] --> gate
+    gate["enrichment.compose<br/>gate-and-compose (ENRICH_MODEL)"] -->|"surface = false"| silent(["record considered, send nothing"])
+    gate -->|"surface = true"| send["missive.raise_for + record_utterance"]
+    send --> record["record enrichment (surfaced, missive_id)"]
+    silent --> record
+    send -.->|"a beat later"| inbox["/inbox — the follow-up, on its own terms"]
+```

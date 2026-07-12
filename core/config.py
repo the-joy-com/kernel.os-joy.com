@@ -90,8 +90,7 @@ RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").strip().lower() not
 )
 
 # The intake worker (worker.py): the background loop that answers received messages.
-# On by default; the test suite turns it off so it can't race the suite for received rows
-# while the state machine is driven by hand.
+# On by default; the test suite turns it off so it can't race the suite for received rows while the state machine is driven by hand.
 WORKER_ENABLED = os.getenv("WORKER_ENABLED", "true").strip().lower() not in (
     "0",
     "false",
@@ -320,3 +319,43 @@ INGEST_ENABLED = os.getenv("INGEST_ENABLED", "true").strip().lower() not in ("0"
 # this is only the idle poll, kept short so a just-answered message joins the diary promptly —
 # fresh for the next reply's retrieval — without an idle kernel spinning.
 INGEST_SWEEP_INTERVAL_SECONDS = float(os.getenv("INGEST_SWEEP_INTERVAL_SECONDS", "10"))
+
+# Tier 2 enrichment (services/enrichment.py, services/deep_retrieval.py, worker.run_enrichment_sweep):
+# the deep second pass that follows a settled fast reply —
+# reaching into the diary by meaning (vector recall + the ontology walk out from it),
+# and, only when it adds something the fast answer didn't, sending an enriched follow-up as a missive.
+# Off the critical path, so the fast reply never waits on it.
+# On by default; the test suite turns it off so the live sweep can't race the suite —
+# the enrichment tests drive _enrich_one by hand, the same stance WORKER_ENABLED, INGEST_ENABLED, and COMPRESS_ENABLED take.
+ENRICH_ENABLED = os.getenv("ENRICH_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+# How often the enrichment sweep looks for an answered message to reach deeper on when idle.
+# It drains back-to-back while a backlog remains; this is only the idle poll,
+# kept short so a just-answered message gets its deep pass promptly, while the exchange it follows is still fresh.
+ENRICH_SWEEP_INTERVAL_SECONDS = float(os.getenv("ENRICH_SWEEP_INTERVAL_SECONDS", "10"))
+# The generative model that gates-and-composes the enriched follow-up.
+# The same heavy hitter that composes the replies (REPLY_MODEL), not a cheap local tier:
+# the follow-up interrupts the symbiot unprompted, so it must clear a high bar to be worth sending,
+# and judging "does this genuinely add something I haven't said?" is exactly the fine call a weak model fumbles.
+# It runs off the critical path and only once per message, so the metered call is affordable.
+# Looked up in the model map (services.models) like every generative model, so pointing it at a local name is a one-line change.
+ENRICH_MODEL = os.getenv("ENRICH_MODEL", REPLY_MODEL)
+# The deep reach's vector-recall pass (deep_retrieval.recall_facts): how many nearest diary facts the embedding search hands back.
+# The meaning-based complement to RETRIEVAL_LIMIT's lexical reach; kept modest,
+# since these plus the walked-in siblings are folded into one gate-and-compose prompt,
+# and the point is the few that bear most, not a wide net.
+DEEP_RETRIEVAL_LIMIT = int(os.getenv("DEEP_RETRIEVAL_LIMIT", "10"))
+# How many candidate facts the vector index keeps in play while it searches — the same knob the router's recall sets.
+# The index doesn't compare the query against every fact; it walks a graph,
+# holding a working set of the best matches found so far and widening outward from them.
+# This is the size of that working set.
+# If it were only as big as the number of results we ask for,
+# the search would lock onto its first few hits with no room to look past them for a nearer one it hasn't reached yet —
+# so recall would suffer even on a tiny diary.
+# So it is kept comfortably above DEEP_RETRIEVAL_LIMIT, which is cheap on a store the size of one life's facts.
+# It must never drop below DEEP_RETRIEVAL_LIMIT, or the search couldn't even hold the number of results requested.
+DEEP_RETRIEVAL_EF_SEARCH = int(os.getenv("DEEP_RETRIEVAL_EF_SEARCH", "100"))
+# The ontology walk (deep_retrieval.expand_by_concept):
+# how many sibling facts, sharing the recalled facts' concepts, to pull.
+# Bounds the walk so it broadens the reach along the vocabulary tree
+# without flooding the prompt past the recalled facts it extends.
+DEEP_RETRIEVAL_EXPANSION_LIMIT = int(os.getenv("DEEP_RETRIEVAL_EXPANSION_LIMIT", "10"))

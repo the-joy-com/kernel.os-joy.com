@@ -166,6 +166,23 @@ async def lifespan(app: FastAPI):
         )
         compression_sweep.start()
         worker_threads.append(compression_sweep)
+    # Start the background job that runs the deep second pass — Tier 2 — on answered messages.
+    # The fast reply goes back right away; a beat later this reaches deeper into the diary by meaning
+    # (vector recall plus the ontology walk out from it) and, only when that reach adds something the fast answer didn't,
+    # follows up with an enriched missive — so the symbiot never waits on the deep reach to get their answer,
+    # and only gets interrupted again when it is genuinely worth it.
+    # Its own on/off switch, like the ingestion and compression sweeps and the GC,
+    # because a machine might want the fast replies without the deep follow-ups, or the reverse;
+    # it shares only worker_stop, so the whole process winds down together.
+    if config.ENRICH_ENABLED:
+        enrichment_sweep = threading.Thread(
+            target=worker.run_enrichment_sweep,
+            args=(worker_stop,),
+            name="tier2-enrichment-sweep",
+            daemon=True,
+        )
+        enrichment_sweep.start()
+        worker_threads.append(enrichment_sweep)
     yield
     worker_stop.set()
     for thread in worker_threads:

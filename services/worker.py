@@ -34,8 +34,11 @@ from core import db
 from core import logs
 from core import protocol
 from services import conversation
+from services import deep_retrieval
+from services import enrichment
 from services import execution
 from services import intake
+from services import missive
 from services import ontology
 from services import push
 from services import reply
@@ -98,6 +101,60 @@ def _compress_one() -> bool:
                 return False
             merged = conversation.fold(gist[0] if gist is not None else None, turns)
             conversation.record_gist(conn, symbiot_id, merged, new_cutoff)
+    return True
+
+
+def _enrich_one() -> bool:
+    """Run the deep second pass on one answered message, sending a follow-up if it earns one. True if there was one to run.
+
+    Tier 2's background half, cut from the ingestion sweep's cloth:
+    once a message's fast reply is settled, this reaches deeper into the diary by meaning (deep_retrieval.deep_search) —
+    vector recall plus the ontology walk out from it — and, only when that reach adds something the fast answer didn't,
+    the machine sends an enriched follow-up. All of it off the path the symbiot waited on, so the fast reply carries no cost from it.
+    Each pass finds an answered, authed message with no enrichment yet (next_to_enrich),
+    claims that message's pass so no other worker runs it at the same time (claim),
+    gathers the deep facts and the origin reference the follow-up must situate itself against (deep_search, origin_reference),
+    and gates-and-composes on the heavy model (compose) — which stays silent unless the enrichment is worth the interruption.
+
+    The whole pass runs inside one transaction on one connection, under a non-blocking advisory lock claimed up front —
+    the same shape, and the same reason, as the compression fold:
+    without the lock two sweeps could both run the deep reach and the composing call and both deliver a follow-up for the one message.
+    With it, the second worker's claim comes back False and it skips the message this pass rather than blocking on the first.
+    Holding the connection across the model call is the cost of a transaction-scoped lock, and a fair one here:
+    only this one message's pass is in flight at a time, so it pins a single pooled slot briefly, never the reply path.
+    A follow-up and its provenance row commit together — sent-and-recorded atomically — so a crash before the commit
+    leaves nothing sent and the message still eligible, and a commit records the pass so it is never re-run;
+    exactly-once falls out of the UNIQUE intake_id the same way ingestion's does, the lock only keeping concurrent passes from racing to it.
+    """
+    pool = db.get_pool()
+    missive_id = None
+    with pool.connection() as conn:
+        with conn.transaction():
+            pending = enrichment.next_to_enrich(conn)
+            if pending is None:
+                return False
+            intake_id, symbiot_id, message, answer = pending
+            if not enrichment.claim(conn, intake_id):
+                # Another worker owns this message's pass; skip it cleanly rather than
+                # race it to a duplicate follow-up. It stays eligible for next pass.
+                return False
+            related = deep_retrieval.deep_search(conn, message, exclude_intake_id=intake_id)
+            origin = enrichment.origin_reference(conn, symbiot_id, intake_id, message, answer)
+            surface, follow_up = enrichment.compose(origin, related)
+            if surface:
+                # Raise the missive and mirror it onto the conversation stream in this same transaction,
+                # so the follow-up and the provenance row that records it commit together — sent and recorded atomically.
+                # missive.deliver is deliberately not called: it opens its own transaction and would split the send
+                # from the record, so its two data-access steps are replicated here to land under this pass's one commit.
+                missive_id = missive.raise_for(conn, symbiot_id, follow_up)
+                conversation.record_utterance(
+                    conn, symbiot_id, "machine", follow_up, missive_id=missive_id
+                )
+            enrichment.record(conn, intake_id, symbiot_id, missive_id)
+    # Nudge the symbiot that a missive is waiting — outside the transaction, so a slow push never holds a connection,
+    # and best-effort, because the record already stands: the follow-up surfaces on the next /inbox open regardless.
+    if missive_id is not None:
+        push.notify_inbox(pool, symbiot_id)
     return True
 
 
@@ -270,6 +327,37 @@ def run_compression_sweep(stop: threading.Event) -> None:
         if not worked:
             stop.wait(config.COMPRESS_SWEEP_INTERVAL_SECONDS)
     log.info("compression sweep stopped")
+
+
+def run_enrichment_sweep(stop: threading.Event) -> None:
+    """Run the deep second pass on answered messages until `stop` is set. Started from the kernel's lifespan.
+
+    The fifth background loop beside the worker pool, the reconcile sweep, the ingestion sweep, and the compression sweep,
+    and the whole of Tier 2's non-blocking promise:
+    the fast reply is composed and sent the instant it is ready,
+    and only afterwards, here, does the machine reach deeper into the diary by meaning and — if it finds something worth saying —
+    follow up, so the symbiot never waits on the deep reach's embedding and model calls to get their answer.
+    It drains the way the others do: a pass made means looking again at once, an idle pass waits a beat,
+    so a backlog of just-answered messages is worked through promptly without an idle kernel spinning on the database.
+    One bad pass can't take the loop down —
+    a failed pass is logged and left eligible for the next round, since no enrichment row was committed for it,
+    tried again if it was a transient hiccup off the critical path, or failing harmlessly if it is a poison line.
+    Its own on/off switch (config.ENRICH_ENABLED), like the ingestion and compression sweeps and the GC,
+    because a machine might reasonably want the fast replies without the deep follow-ups, or the reverse;
+    it shares only worker_stop, so the whole process winds down together.
+    """
+    log = logs.get("worker")
+    log.info("enrichment sweep started")
+    while not stop.is_set():
+        try:
+            worked = _enrich_one()
+        except Exception:
+            # Keep the loop alive across a bad pass so one message can't kill it.
+            log.exception("enrichment sweep iteration failed")
+            worked = False
+        if not worked:
+            stop.wait(config.ENRICH_SWEEP_INTERVAL_SECONDS)
+    log.info("enrichment sweep stopped")
 
 
 def run_ingestion_sweep(stop: threading.Event) -> None:
