@@ -38,6 +38,19 @@ log = logs.get("push")
 # A push that hangs mustn't hold anything up; a send past this counts as failed.
 PUSH_TIMEOUT_SECONDS = 6.0
 
+# How long the push service should hold a nudge for a device it can't reach right now.
+# The library's default is 0 — "deliver this instant or discard" — which drops every nudge
+# to a sleeping phone (Android Doze) or a closed laptop, the exact case an out-of-band nudge
+# exists to cover. A day gives the push service room to store-and-forward until the device
+# next wakes; a stale nudge that arrives late is harmless, because it carries no answer text —
+# the shell just wakes and reads whatever /answers or /inbox holds by then.
+PUSH_TTL_SECONDS = 86400
+
+# These nudges are time-sensitive, so they go out at high urgency. On Android this maps to
+# FCM high priority, the one tier allowed to wake a dozing device immediately; the spec
+# default ("normal") is the batchable tier Doze may hold back to a later maintenance window.
+PUSH_URGENCY = "high"
+
 # The internal terminal states, mapped to the shell-facing word the push carries. The
 # words come from protocol.py — the same source /answers reads — so the push and the fetch
 # that follows it can't drift into speaking different vocabularies to the same shell.
@@ -152,6 +165,8 @@ def _send(endpoint: str, p256dh: str, auth: str, payload: dict) -> bool:
             vapid_private_key=signer,
             vapid_claims={"sub": config.VAPID_SUBJECT},
             timeout=PUSH_TIMEOUT_SECONDS,
+            ttl=PUSH_TTL_SECONDS,
+            headers={"Urgency": PUSH_URGENCY},
         )
         return False
     except WebPushException as error:

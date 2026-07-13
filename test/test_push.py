@@ -178,6 +178,24 @@ def test_notify_prunes_a_subscription_the_service_reports_gone(client, monkeypat
     assert link is None  # the link nulled, not the message dropped
 
 
+# --- the send itself ------------------------------------------------------------------
+
+
+def test_send_asks_the_service_to_hold_and_wake_a_closed_device(client, monkeypatch):
+    # The two properties that decide whether a closed-app or dozing device ever sees a nudge:
+    # a non-zero TTL, so the push service stores and forwards it instead of discarding it the
+    # instant the device is unreachable (the library's default of 0 drops it outright); and
+    # high urgency, the one tier Android's Doze wakes for at once rather than batching to a
+    # later window. Every existing test fakes _send whole, so this is the only place these ride.
+    monkeypatch.setattr(config, "VAPID_PRIVATE_KEY", TEST_VAPID_KEY)
+    captured = {}
+    monkeypatch.setattr(push, "webpush", lambda **kwargs: captured.update(kwargs))
+    dead = push._send("https://push.example/live", "p256", "authsecret", {"kind": "reply"})
+    assert dead is False  # a clean send reports nothing to prune
+    assert captured["ttl"] == push.PUSH_TTL_SECONDS > 0  # store-and-forward, not drop-on-miss
+    assert captured["headers"]["Urgency"] == "high"  # punch through Doze
+
+
 # --- subscription identity ------------------------------------------------------------
 
 
