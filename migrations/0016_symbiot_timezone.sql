@@ -1,0 +1,23 @@
+-- The symbiot's local timezone: where its "now" is anchored, so the machine reasons about time
+-- in the human's day, not the server's.
+--
+-- Until now the kernel had no notion of where the symbiot lives in time.
+-- Every clock it read was the server's UTC,
+-- so a reply that mentioned the hour, or a "this evening", spoke in UTC —
+-- wrong by however many hours the symbiot sits from Greenwich,
+-- and plainly so on the phone in the ordinary flow of a day.
+-- The fix is to give the symbiot a timezone of its own and read every human-facing "now" through it.
+--
+-- It is an IANA zone name ('Europe/Paris', 'Asia/Tokyo'), not a fixed offset, on purpose:
+-- an offset can't know about the summer-time shift,
+-- and a name resolves to the right offset for the moment it is read.
+-- The column is filled from a place the symbiot names in plain words (services/zone.py infers the zone from it),
+-- so switching zones is re-naming where you are, not editing a config.
+--
+-- NOT NULL DEFAULT 'UTC' so the perception of time is defined from the first boot,
+-- and for a symbiot that has never set one:
+-- it is exactly the old behaviour (server-clock == UTC) made explicit,
+-- and it is only ever narrowed to a real local zone once the human says where they are —
+-- never left null for a read to trip on.
+ALTER TABLE symbiot
+    ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC';

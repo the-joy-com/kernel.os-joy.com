@@ -117,6 +117,42 @@ def test_compose_marks_the_whole_memory_summarisable_and_never_the_persona_or_me
     assert context in captured["prompt"]
 
 
+def test_compose_states_the_symbiot_local_time_when_the_zone_is_known(monkeypatch):
+    # The fix for the UTC-perception bug: when the worker hands compose the symbiot's local now and zone,
+    # the prompt states that local time so the reply reasons about time in the human's day, not the server's UTC.
+    monkeypatch.setattr(reply.persona, "load", lambda: "VOICE")
+    captured = {}
+    monkeypatch.setattr(
+        reply.llm, "generate",
+        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt, context=context) or "ok",
+    )
+    now_local = datetime(2026, 7, 13, 18, 30, tzinfo=timezone.utc)
+
+    reply.compose("what time is it?", [], _convo(), now_local=now_local, zone_name="Asia/Tokyo")
+
+    prompt = captured["prompt"]
+    # The local date, the hour, and the zone are all stated for the model to reason against.
+    assert "Monday 13 July 2026, 18:30" in prompt
+    assert "Asia/Tokyo" in prompt
+    # The time reference is a sacred one-liner, never folded into the compressible memory block.
+    assert "18:30" not in captured["context"]
+
+
+def test_compose_omits_the_time_line_when_the_zone_is_unknown(monkeypatch):
+    # No zone handed in (an anon stand-in never reaches here, a by-hand call that names no clock):
+    # the prompt asserts no time at all rather than a wrong one — the honest silence over a fabricated hour.
+    monkeypatch.setattr(reply.persona, "load", lambda: "VOICE")
+    captured = {}
+    monkeypatch.setattr(
+        reply.llm, "generate",
+        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt) or "ok",
+    )
+
+    reply.compose("hello", [], _convo())
+
+    assert "local date and time" not in captured["prompt"]
+
+
 def test_compose_over_an_empty_diary_and_no_conversation_still_composes_over_the_honest_empty(monkeypatch):
     # No facts and no conversation yet:
     # the memory block reads its honest empty lines and is still the compressible region (tiny, so the guard never fires) —

@@ -46,6 +46,10 @@ LOGIN_FAILED = "that code didn't work — try again"  # POST /login/verify — w
 LOGIN_SENT = "if that address is registered, a login code is on its way"
 NOT_AUTHED = "not authenticated"  # GET /status — no live session
 
+# Timezone: the symbiot sets its local zone from a place it names (authed only).
+TIMEZONE_SET = "time hack"  # POST /timezone — the place was placed; the IANA zone set rides in data.timezone
+TIMEZONE_UNCLEAR = "say again"  # POST /timezone — the place named no zone we could resolve; nothing stored
+
 # Push: the reply-channel handshake.
 PUSH_KEY = "push key"  # GET /push/key — the public app-server key (null in data when push is off)
 SUBSCRIBED = "subscribed"  # POST /push/subscribe — channel registered; its id in data

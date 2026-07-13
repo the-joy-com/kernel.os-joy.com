@@ -28,6 +28,7 @@ retried a bounded number of times along the way, and never left waiting on an an
 """
 
 import threading
+from datetime import datetime
 
 from core import config
 from core import db
@@ -43,6 +44,7 @@ from services import ontology
 from services import push
 from services import reply
 from services import retrieval
+from services import zone
 
 # How long the loop waits before looking again once it finds nothing to do.
 POLL_INTERVAL_SECONDS = 1.0
@@ -160,27 +162,30 @@ def _enrich_one() -> bool:
 
 def _gather_context(
     pool, message: str, message_id: int, symbiot_id: int | None
-) -> tuple[list[retrieval.Fact], conversation.Conversation]:
-    """Both memories a reply draws on, gathered synchronously before it is composed.
+) -> tuple[list[retrieval.Fact], conversation.Conversation, str]:
+    """Both memories a reply draws on and the symbiot's timezone, gathered synchronously before it is composed.
 
     The long-term diary facts that bear on the message (retrieval.search, recall by relevance),
-    and the short-term conversation the message sits inside (conversation.recent, recall by recency).
-    Runs on the worker's own thread, not in the killable child:
-    both are bounded, indexed reads that carry no hang risk to protect against,
+    the short-term conversation the message sits inside (conversation.recent, recall by recency),
+    and the symbiot's IANA timezone (zone.of), so the reply can reason about time in the human's day, not UTC.
+    All run on the worker's own thread, not in the killable child:
+    they are bounded, indexed reads that carry no hang risk to protect against,
     and doing them here keeps the child — where the deadline bites — to the one call that can run long, the LLM.
-    They share one connection: two reads of the same symbiot's memory, taken together.
-    Only a recognised symbiot's message reaches either memory:
-    an anonymous line is answered without them, so the symbiot's own memory is never read to answer a stranger.
+    They share one connection: reads of the same symbiot's state, taken together.
+    Only a recognised symbiot's message reaches memory:
+    an anonymous line is answered without it, so the symbiot's own memory is never read to answer a stranger,
+    and it never composes a real reply — so the UTC default handed back for it is just a placeholder the stand-in ignores.
     The message being answered is excluded from the conversation tail —
     it was written onto the stream when it arrived,
     so without this it would show up both as the last turn and as the current message the prompt states.
     """
     if symbiot_id is None:
-        return [], conversation.Conversation(gist=None, tail=[])
+        return [], conversation.Conversation(gist=None, tail=[]), zone.DEFAULT_ZONE
     with pool.connection() as conn:
         facts = retrieval.search(conn, message)
         conv = conversation.recent(conn, symbiot_id, exclude_intake_id=message_id)
-    return facts, conv
+        zone_name = zone.of(conn, symbiot_id)
+    return facts, conv, zone_name
 
 
 def _ingest_one() -> bool:
@@ -225,9 +230,13 @@ def _process_one() -> bool:
     message_id, message, symbiot_id = claimed
     # Assemble the answer-time memory here, on the worker's thread, before the killable child runs:
     # the reads are fast and bounded, so only the composing LLM call needs the deadline's protection.
-    facts, conv = _gather_context(pool, message, message_id, symbiot_id)
+    # The symbiot's local "now" is resolved here too, from the zone gathered alongside the memory,
+    # so the reply reasons about time in the human's day rather than the server's UTC —
+    # and it is a concrete instant the child reads, not a clock the child would have to consult mid-compose.
+    facts, conv, zone_name = _gather_context(pool, message, message_id, symbiot_id)
+    now_local = zone.now_for(zone_name)
     result = execution.run_with_deadline(
-        _produce_reply, (message, symbiot_id, facts, conv), config.INTAKE_DEADLINE_SECONDS
+        _produce_reply, (message, symbiot_id, facts, conv, now_local, zone_name), config.INTAKE_DEADLINE_SECONDS
     )
     answered = False
     with pool.connection() as conn:
@@ -258,23 +267,25 @@ def _process_one() -> bool:
     return True
 
 
-def _produce_reply(task: tuple[str, int | None, list[retrieval.Fact], conversation.Conversation]) -> str:
-    """The reply to a message, given the line, who sent it, and the memory gathered for it.
+def _produce_reply(
+    task: tuple[str, int | None, list[retrieval.Fact], conversation.Conversation, datetime, str],
+) -> str:
+    """The reply to a message, given the line, who sent it, the memory gathered for it, and the symbiot's local now.
 
     A recognised symbiot gets a real answer,
-    composed from the persona, the diary facts, and the running conversation (reply.compose) —
-    read off long- and short-term memory rather than a canned line.
+    composed from the persona, the diary facts, the running conversation, and its local time (reply.compose) —
+    read off long- and short-term memory rather than a canned line, and clocked to the human's day, not UTC.
     An anonymous caller gets the stand-in still:
     the memory is the symbiot's, so a stranger is answered without it,
     and told to authenticate rather than handed a conversation that isn't theirs.
-    task is (message, symbiot_id, facts, conversation):
+    task is (message, symbiot_id, facts, conversation, now_local, zone_name):
     it arrives as one tuple because the work runs in a child process (see run_with_deadline), which passes a single arg —
-    facts and conversation are what _gather_context already pulled.
+    facts, conversation, and the local now are what _gather_context and now_for already pulled on the worker thread.
     """
-    message, symbiot_id, facts, conv = task
+    message, symbiot_id, facts, conv, now_local, zone_name = task
     if symbiot_id is None:
         return protocol.STANDIN_ANSWER_ANON
-    return reply.compose(message, facts, conv)
+    return reply.compose(message, facts, conv, now_local=now_local, zone_name=zone_name)
 
 
 def run(stop: threading.Event) -> None:

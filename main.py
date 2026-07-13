@@ -25,12 +25,14 @@ from core import protocol
 from services import ontology_gc
 from services import push
 from services import worker
+from services import zone
 from core.dtos import (
     DeliveredRequest,
     IntakeRequest,
     LoginRequest,
     PushSubscriptionRequest,
     SeenRequest,
+    TimezoneRequest,
     VerifyRequest,
 )
 
@@ -45,8 +47,8 @@ from core.rate_limit import RateLimitMiddleware
 # Bump in lockstep with real changes to what the kernel answers.
 VERSION = "0.0.1"
 
-# Wire the kernel's timestamped log stream before anything logs (db on startup,
-# the routes below). Each call site names its own area via logs.get("<area>").
+# Wire the kernel's timestamped log stream before anything logs (db on startup, the routes below).
+# Each call site names its own area via logs.get("<area>").
 logs.configure()
 
 
@@ -57,18 +59,27 @@ async def lifespan(app: FastAPI):
     # Migrations are idempotent, so this is safe on every boot.
     db.open_pool(config.DATABASE_URL)
     db.migrate_and_seed(db.get_pool(), config.SYMBIOT_EMAIL)
-    # Start the intake workers — the background loop that answers received messages.
-    # A small pool, not one: a single slow or wedged message must not block every message behind it,
-    # so several workers drain the queue in parallel (claim_next is race-safe, so they never grab the same message).
-    # Alongside them, one reconcile sweep settles the rows a worker can't:
-    # it fails a message stuck in 'working' past the ceiling,
-    # re-queues a 'failed' one that still has attempts left,
-    # and parks a spent one in 'abandoned' —
-    # so every message reaches a terminal outcome, retried a bounded number of times along the way.
-    # Threads, not asyncio tasks: the database work is synchronous and would block the event loop the API runs on.
-    # Disabled under test, where the suite drives the state machine by hand.
+    # The kernel's background work runs on daemon threads, not asyncio tasks:
+    # the database work is synchronous and would block the event loop the API runs on.
+    # Every one of them shares a single worker_stop Event — the one signal that winds the whole process down —
+    # and every one is spawned through start_background,
+    # so the thread boilerplate lives in exactly one place and adding a job never re-types it.
     worker_stop = threading.Event()
     worker_threads = []
+
+    def start_background(target, name):
+        thread = threading.Thread(target=target, args=(worker_stop,), name=name, daemon=True)
+        thread.start()
+        worker_threads.append(thread)
+        return thread
+
+    # The intake subsystem: the worker pool that answers messages,
+    # and the reconcile sweep that settles the rows a worker can't —
+    # it fails a message stuck in 'working' past the ceiling,
+    # re-queues a 'failed' one that still has attempts left, and parks a spent one in 'abandoned',
+    # so every message reaches a terminal outcome, retried a bounded number of times along the way.
+    # One subsystem, so one flag (WORKER_ENABLED) gates both, and both wait on orphan recovery first.
+    # Disabled under test, where the suite drives the state machine by hand.
     if config.WORKER_ENABLED:
         # Before any worker of this process starts, reconcile rows the previous one left mid-work.
         # A row still 'working' at boot is an orphan — the worker that held it died with that process —
@@ -93,96 +104,31 @@ async def lifespan(app: FastAPI):
                 push.notify(db.get_pool(), message_id)
             except Exception:
                 log.exception("restart recovery: nudge failed for abandoned message %d", message_id)
+        # A small pool, not one: a single slow or wedged message must not block every message behind it,
+        # so several workers drain the queue in parallel (claim_next is race-safe, so they never grab the same message).
         for n in range(config.WORKER_CONCURRENCY):
-            thread = threading.Thread(
-                target=worker.run,
-                args=(worker_stop,),
-                name=f"intake-worker-{n}",
-                daemon=True,
-            )
-            thread.start()
-            worker_threads.append(thread)
-        # One reconcile sweep beside the pool — not another worker.
-        # On a fixed cadence it fails messages stuck in 'working' past the deadline,
-        # re-queues 'failed' ones that still have attempts, and parks the rest in 'abandoned',
-        # so every row reaches a terminal outcome without a worker waiting between retries.
-        sweep = threading.Thread(
-            target=worker.run_reconcile_sweep,
-            args=(worker_stop,),
-            name="intake-reconcile-sweep",
-            daemon=True,
-        )
-        sweep.start()
-        worker_threads.append(sweep)
-    # The ontology garbage collector —
-    # the offline merge pass that collapses the semantic duplicates lazy minting breeds.
-    # Its own slow cadence (hours), off the read path,
-    # and gated on its own flag rather than WORKER_ENABLED:
-    # the intake workers and the GC are independent background jobs,
-    # and a box could reasonably want one without the other.
-    # The one thing it has in common with the intake workers is worker_stop —
-    # not because they're coupled, but because that Event is how the whole process is told to wind down at once.
-    if config.GC_ENABLED:
-        gc_sweep = threading.Thread(
-            target=ontology_gc.run_sweep,
-            args=(worker_stop,),
-            name="ontology-gc-sweep",
-            daemon=True,
-        )
-        gc_sweep.start()
-        worker_threads.append(gc_sweep)
-    # Start the background job that files the symbiot's messages into the long-term diary.
-    # Answering a message and remembering it are two separate jobs:
-    # the reply goes back right away, and this job writes the message into the diary a moment later,
-    # running on its own thread, in parallel, so it never makes the symbiot wait.
-    # That way the diary the replies draw on keeps filling by itself, instead of only when someone runs a script by hand.
-    # It has its own on/off switch, like the garbage collector,
-    # because a machine might reasonably want the replies without this background filing, or the reverse.
-    # The two are independent; they share only the shutdown signal (worker_stop),
-    # so the whole process can be wound down together.
-    if config.INGEST_ENABLED:
-        ingestion_sweep = threading.Thread(
-            target=worker.run_ingestion_sweep,
-            args=(worker_stop,),
-            name="diary-ingestion-sweep",
-            daemon=True,
-        )
-        ingestion_sweep.start()
-        worker_threads.append(ingestion_sweep)
-    # Start the background job that folds aged-out turns into each symbiot's Gist —
-    # the far end of the short-term memory gradient.
-    # A reply carries the recent turns verbatim;
-    # once they age past that budget this sweep summarises them into the running Gist, off the critical path,
-    # so nothing is lost and the reply never waits on a fold.
-    # Its own on/off switch, like the ingestion sweep and the GC,
-    # because a machine might want the verbatim tail without the folding, or the reverse;
-    # it shares only worker_stop, so the whole process winds down together.
-    if config.COMPRESS_ENABLED:
-        compression_sweep = threading.Thread(
-            target=worker.run_compression_sweep,
-            args=(worker_stop,),
-            name="conversation-compression-sweep",
-            daemon=True,
-        )
-        compression_sweep.start()
-        worker_threads.append(compression_sweep)
-    # Start the background job that runs the deep second pass — Tier 2 — on answered messages.
-    # The fast reply goes back right away; a beat later this reaches deeper into the diary by meaning
-    # (vector recall plus the ontology walk out from it) and, only when that reach adds something the fast answer didn't,
-    # follows up with an enriched missive — so the symbiot never waits on the deep reach to get their answer,
-    # and only gets interrupted again when it is genuinely worth it.
-    # Its own on/off switch, like the ingestion and compression sweeps and the GC,
-    # because a machine might want the fast replies without the deep follow-ups, or the reverse;
-    # it shares only worker_stop, so the whole process winds down together.
-    if config.ENRICH_ENABLED:
-        enrichment_sweep = threading.Thread(
-            target=worker.run_enrichment_sweep,
-            args=(worker_stop,),
-            name="tier2-enrichment-sweep",
-            daemon=True,
-        )
-        enrichment_sweep.start()
-        worker_threads.append(enrichment_sweep)
+            start_background(worker.run, f"intake-worker-{n}")
+        # One reconcile sweep beside the pool — not another worker — on a fixed cadence.
+        start_background(worker.run_reconcile_sweep, "intake-reconcile-sweep")
+
+    # The independent background sweeps — each a single daemon loop on its own slow cadence, off the read path,
+    # and each gated on its own flag rather than WORKER_ENABLED:
+    # these are separate jobs, not one subsystem,
+    # and a box could reasonably want any of them without the others (or the intake workers without any of them).
+    # To add one: give it a flag and a run_* loop, then add a line to this table — nothing else in lifespan changes.
+    #   conversation compression — folds aged-out verbatim turns into each symbiot's running Gist, off the critical path.
+    #   diary ingestion          — files each answered message into the long-term diary, a beat after the reply goes back.
+    #   ontology GC              — the offline merge pass that collapses the semantic duplicates lazy minting breeds.
+    #   Tier 2 enrichment        — reaches deeper into the diary by meaning, following up only when it adds something new.
+    sweeps = [
+        (config.COMPRESS_ENABLED, worker.run_compression_sweep, "conversation-compression-sweep"),
+        (config.INGEST_ENABLED, worker.run_ingestion_sweep, "diary-ingestion-sweep"),
+        (config.GC_ENABLED, ontology_gc.run_sweep, "ontology-gc-sweep"),
+        (config.ENRICH_ENABLED, worker.run_enrichment_sweep, "tier2-enrichment-sweep"),
+    ]
+    for enabled, target, name in sweeps:
+        if enabled:
+            start_background(target, name)
     yield
     worker_stop.set()
     for thread in worker_threads:
@@ -206,8 +152,8 @@ ALLOWED_ORIGINS = [
     "https://shell.os-joy.com",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    # `vite preview` (the built-shell server) — the service worker, and so the
-    # offline outbox, only exist in a real build, so they can only be tested there.
+    # `vite preview` (the built-shell server) —
+    # the service worker, and so the offline outbox, only exist in a real build, so they can only be tested there.
     "http://localhost:4173",
     "http://127.0.0.1:4173",
 ]
@@ -254,9 +200,8 @@ def bearer_token(authorization: str | None = Header(default=None)) -> str | None
 
 # --- routes ---------------------------------------------------------------
 
-# Every `msg` a route returns is a token from protocol.py — the one catalog of what the
-# kernel says to the shell — so the wire's vocabulary lives in one place, not scattered
-# one literal per handler.
+# Every `msg` a route returns is a token from protocol.py — the one catalog of what the kernel says to the shell —
+# so the wire's vocabulary lives in one place, not scattered one literal per handler.
 
 
 @app.get("/")
@@ -332,14 +277,13 @@ def health() -> dict:
 def inbox(conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)) -> dict:
     """A symbiot's unseen inbound messages — the ones it couldn't have discovered on its own.
 
-    The shell learns of an answer to its *own* line from the id it kept at intake, and asks
-    /answers about it. But a message the kernel raises unprompted — a nudge, a line relayed
-    from the World — was never sent from here, so there's no id to have kept; this is where
-    the shell discovers those. Identity-gated on purpose: these messages are addressed to a
-    symbiot, so a caller with no live session is owed nothing and gets an empty list rather
-    than an error (nothing here is an oracle about who's registered or what's waiting).
-    Each message carries its id and body; the shell shows it, then POSTs the ids to
-    /inbox/seen so it isn't offered again.
+    The shell learns of an answer to its *own* line from the id it kept at intake, and asks /answers about it.
+    But a message the kernel raises unprompted — a nudge, a line relayed from the World — was never sent from here,
+    so there's no id to have kept; this is where the shell discovers those.
+    Identity-gated on purpose: these messages are addressed to a symbiot,
+    so a caller with no live session is owed nothing and gets an empty list rather than an error
+    (nothing here is an oracle about who's registered or what's waiting).
+    Each message carries its id and body; the shell shows it, then POSTs the ids to /inbox/seen so it isn't offered again.
     """
     symbiot_id = identity.authenticated_symbiot_id(conn, token)
     messages = (
@@ -376,7 +320,8 @@ def intake(
     # FastAPI validates the body against the DTO;
     # we persist it as one 'received' row *before* answering, so "roger" now means
     # *The Joy has it, durably* — not "saw it and dropped it", as it did before.
-    # The write commits in lockstep with this response (db.get_conn commits the request's transaction on success),
+    # The write commits in lockstep with this response
+    # (db.get_conn commits the request's transaction on success),
     # so the acknowledgement can never outrun the durable record behind it.
     # One row per request, never the lines within: a reconnect arrives as one batch
     # (the outbox joins its queued lines with newlines),
@@ -385,7 +330,8 @@ def intake(
     # telling a live tail whether one POST carried one line or a whole drained queue.
     # Read who sent it from the session, now, while the request is in hand:
     # a live session names the symbiot, its absence is an anonymous line — both welcome, the input layer never gates on auth.
-    # We stamp that on the row so the worker can answer by it later; the shell can't assert identity, only the token proves it.
+    # We stamp that on the row so the worker can answer by it later;
+    # the shell can't assert identity, only the token proves it.
     symbiot_id = identity.authenticated_symbiot_id(conn, token)
     message_id = record_message(conn, body.line, body.reply_channel_id, symbiot_id)
     # Mirror a recognised symbiot's line onto the conversation stream,
@@ -450,9 +396,8 @@ def push_subscribe(
     # the token the shell then threads through /intake so the kernel knows which channel to nudge when that message settles.
     # Ungated, like /intake: the right to be reachable is never fenced behind identity,
     # and a push address is nothing an attacker gains by planting.
-    # A session, when one is present, ties the channel to that symbiot so the kernel can also
-    # reach them for a missive (a message it raises on its own); without one it stays anonymous
-    # and still serves per-message reply nudges.
+    # A session, when one is present, ties the channel to that symbiot so the kernel can also reach them for a missive (a message it raises on its own);
+    # without one it stays anonymous and still serves per-message reply nudges.
     symbiot_id = identity.authenticated_symbiot_id(conn, token)
     channel_id = push.save_subscription(
         conn, body.endpoint, body.keys.p256dh, body.keys.auth, symbiot_id
@@ -466,3 +411,31 @@ def status(
 ) -> dict:
     st = identity.session_status(conn, token)
     return envelope(protocol.AUTHED if st["authed"] else protocol.NOT_AUTHED, st)
+
+
+@app.post("/timezone")
+def timezone(
+    body: TimezoneRequest,
+    conn=Depends(db.get_conn),
+    token: str | None = Depends(bearer_token),
+) -> dict:
+    """Set the symbiot's local timezone from a place it names — authed only.
+
+    Unlike /intake, this *is* gated on a live session, and deliberately:
+    the timezone belongs to a particular symbiot's perception of time,
+    so there is no anonymous version of it to offer,
+    and the shell never advertises the command to a visitor.
+    A caller with no live session is turned away with NOT_AUTHED,
+    rather than silently writing to a symbiot it can't name —
+    the same shape /status uses to say "there is no one here to act for".
+    The place is read into an IANA zone and stored (services/zone.py);
+    a place we can't resolve stores nothing and comes back TIMEZONE_UNCLEAR,
+    so the shell can ask the human to name it more plainly.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    resolved = zone.set_for(conn, symbiot_id, body.location)
+    if resolved is None:
+        return envelope(protocol.TIMEZONE_UNCLEAR, {"location": body.location})
+    return envelope(protocol.TIMEZONE_SET, {"timezone": resolved})

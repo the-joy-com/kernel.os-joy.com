@@ -95,6 +95,19 @@ class SeenRequest(BaseModel):
     ids: list[int] = Field(max_length=1000)
 
 
+class TimezoneRequest(BaseModel):
+    """A place the symbiot names, on its way to becoming the symbiot's stored local timezone.
+
+    Free text on purpose — a city, a country, a casual "just landed in NYC" —
+    because the kernel infers the IANA zone from it (services/zone.py),
+    rather than asking the human to type an identifier.
+    Never empty, and capped so a stray paste can't ship an unbounded body;
+    the shell trims before sending.
+    """
+
+    location: str = Field(min_length=1, max_length=200)
+
+
 class VerifyRequest(BaseModel):
     """A one-time code being spent for a session, and the address it was issued to.
 
