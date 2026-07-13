@@ -1,7 +1,8 @@
 """By-hand smoke test: the symbiot's timezone — inference, storage, and the reply's local-time perception, against live models.
 
-The pytest suite (test/test_zone.py, test/test_reply.py) proves the store round trip, the validation that
-only a real IANA name is kept, and that the reply prompt states the local time — all with the model faked.
+The pytest suite (test/test_zone.py, test/test_reply.py) proves the store round trip,
+the validation that only a real IANA name is kept,
+and that the reply prompt states the local time — all with the model faked.
 It never proves the two things only a live run can:
 that the real generative model turns a place named in plain words into the right IANA zone,
 and that a live reply, handed that zone's "now", actually answers about time in the human's day rather than UTC.
@@ -15,8 +16,9 @@ It runs three movements, all on one rolled-back transaction:
   2. the store round trip — a smoke symbiot's zone is set from "Tokyo" (zone.set_for) and read back (zone.of),
      proving the inferred name persists and reads as the symbiot's own;
   3. the payoff — a live reply is composed to "what time is it for me right now?",
-     handed the local now for the zone just set, so a correct answer can only come from the local-time line
-     the prompt now carries; the reply is printed for a human to judge it speaks Tokyo time, not UTC.
+     handed the local now for the zone just set,
+     so a correct answer can only come from the local-time line the prompt now carries;
+     the reply is printed for a human to judge it speaks Tokyo time, not UTC.
 
 It is direct-run, not a pytest test, because it needs the live box:
 
@@ -43,9 +45,9 @@ import psycopg
 
 from core import config
 from core import db
-from services import conversation
-from services import reply
-from services import zone
+from services.memory import conversation
+from services.loop import reply
+from services.loop import zone
 
 # Places named the way a human would, casually, plus one that names no place at all.
 # The placeable ones must each resolve to a real IANA zone; the last must come back None.

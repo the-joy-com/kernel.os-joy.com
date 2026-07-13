@@ -27,10 +27,10 @@ the honest answer when there is nothing on record and nothing yet said to lean o
 from datetime import datetime
 
 from core import config
-from services import conversation
-from services import llm
-from services import persona
-from services import retrieval
+from services.memory import conversation
+from services.adapters import llm
+from services.loop import persona
+from services.memory import retrieval
 
 # What the diary block reads when the librarian found nothing —
 # so the prompt always has a coherent line where the memories go, never a blank the model must puzzle over.

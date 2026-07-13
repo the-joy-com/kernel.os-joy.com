@@ -28,23 +28,26 @@ retried a bounded number of times along the way, and never left waiting on an an
 """
 
 import threading
+import traceback
 from datetime import datetime
 
 from core import config
 from core import db
 from core import logs
 from core import protocol
-from services import conversation
-from services import deep_retrieval
-from services import enrichment
-from services import execution
-from services import intake
-from services import missive
-from services import ontology
-from services import push
-from services import reply
-from services import retrieval
-from services import zone
+from services.memory import conversation
+from services.memory import deep_retrieval
+from services.memory import enrichment
+from services.loop import execution
+from services.memory import intake
+from services.loop import missive
+from services.memory import ontology
+from services.adapters import push
+from services.tools import reminder
+from services.loop import reply
+from services.memory import retrieval
+from services.tools import tools
+from services.loop import zone
 
 # How long the loop waits before looking again once it finds nothing to do.
 POLL_INTERVAL_SECONDS = 1.0
@@ -54,6 +57,82 @@ POLL_INTERVAL_SECONDS = 1.0
 # to the ceiling, so an overdue message is ruled failed, and a failed one retried or
 # abandoned, promptly rather than lingering most of a sweep interval.
 SWEEP_INTERVAL_SECONDS = 5.0
+
+
+def _answer(
+    pool,
+    message_id: int,
+    message: str,
+    symbiot_id: int | None,
+    facts: list[retrieval.Fact],
+    conv: conversation.Conversation,
+    now_local: datetime,
+    zone_name: str,
+    shortlist: list[tools.ToolCandidate],
+) -> execution.Result:
+    """Produce a message's answer, forking into the tool seam only when the gate surfaced a candidate.
+
+    This is the read path's one additive fork —
+    invisible to the overwhelming majority of messages, which ask for nothing to be done.
+    With no tool candidate (the gate closed), or an anonymous caller (no symbiot to act for),
+    the answer is the ordinary reply — one composing call in the killable child, exactly as before.
+    When a candidate surfaced, the flow is decide, act, speak:
+    a decision call names a tool and extracts its arguments, or answers "none";
+    a "none" falls back to the ordinary reply, which has the full memory to answer well;
+    a named tool's executor runs on this thread, and a second call composes the confirmation.
+    Each composing call is its own killable child under the deadline;
+    the executor runs here, on the worker's own thread, never in a child that could be severed mid-effect.
+    Returns the execution.Result the caller records — completed with the answer, or failed to be retried.
+    """
+    if symbiot_id is None or not shortlist:
+        return execution.run_with_deadline(
+            _produce_reply,
+            (message, symbiot_id, facts, conv, now_local, zone_name),
+            config.INTAKE_DEADLINE_SECONDS,
+        )
+    # A candidate surfaced — decide, in the child, on the shortlist and the recent tail (not the full diary).
+    decided = execution.run_with_deadline(
+        _decide_tool,
+        (message, shortlist, conv.tail, now_local, zone_name),
+        config.INTAKE_DEADLINE_SECONDS,
+    )
+    if decided.status != execution.COMPLETED:
+        # A timeout or a crash deciding fails the message, to be retried like any other — nothing was done yet.
+        return decided
+    decision = decided.value
+    if decision.tool == tools.NO_TOOL:
+        # Coarse recall surfaced a candidate, but nothing truly fit — hand off to the ordinary reply.
+        return execution.run_with_deadline(
+            _produce_reply,
+            (message, symbiot_id, facts, conv, now_local, zone_name),
+            config.INTAKE_DEADLINE_SECONDS,
+        )
+    # A tool was named — run its executor on this thread, never the killable child, exactly-once.
+    try:
+        result = _execute_tool(pool, decision, symbiot_id, message_id, now_local, zone_name)
+    except Exception:
+        # A failed effect fails the message; the retry re-runs,
+        # and the executor's exactly-once guard (the reminder's ON CONFLICT) makes that second run harmless,
+        # so nothing is ever done twice.
+        return execution.Result(execution.CRASHED, traceback.format_exc())
+    # Speak — compose the confirmation, or the clarifying question, in the child, in the persona's voice.
+    return execution.run_with_deadline(
+        _compose_confirmation,
+        (message, result, now_local, zone_name),
+        config.INTAKE_DEADLINE_SECONDS,
+    )
+
+
+def _compose_confirmation(task: tuple[str, tools.ToolResult, datetime, str]) -> str:
+    """Compose the confirmation the human sees after a tool ran — the speak step, in the killable child.
+
+    Pure model work, like the ordinary reply, so it runs in the child under the deadline (see _answer).
+    task is (message, result, now_local, zone_name), one tuple because the child takes a single arg;
+    it speaks the tool's own result in the persona's voice (tools.compose_confirmation) —
+    confirming when the tool acted, asking for what was missing when it could not.
+    """
+    message, result, now_local, zone_name = task
+    return tools.compose_confirmation(message, result, now_local, zone_name)
 
 
 def _compress_one() -> bool:
@@ -104,6 +183,20 @@ def _compress_one() -> bool:
             merged = conversation.fold(gist[0] if gist is not None else None, turns)
             conversation.record_gist(conn, symbiot_id, merged, new_cutoff)
     return True
+
+
+def _decide_tool(
+    task: tuple[str, list[tools.ToolCandidate], list[conversation.Turn], datetime, str],
+) -> tools.Decision:
+    """Decide which tool a message is asking for, and extract its arguments — the decide step, in the child.
+
+    Pure model work under the deadline, like the ordinary reply (see _answer).
+    task is (message, shortlist, tail, now_local, zone_name), one tuple because the child takes a single arg;
+    it builds the flat decision schema from the shortlist and calls the model (tools.decide),
+    returning a Decision — a named tool with its arguments, or "none".
+    """
+    message, shortlist, tail, now_local, zone_name = task
+    return tools.decide(message, shortlist, tail, now_local, zone_name)
 
 
 def _enrich_one() -> bool:
@@ -160,32 +253,85 @@ def _enrich_one() -> bool:
     return True
 
 
+def _execute_tool(
+    pool, decision: tools.Decision, symbiot_id: int, message_id: int, now_local: datetime, zone_name: str
+) -> tools.ToolResult:
+    """Run the named tool's executor on the worker's own thread, in its own transaction — the act step.
+
+    Never in the killable child:
+    the child can be severed at the deadline mid-run,
+    and a half-done side effect is exactly what the rest of the kernel is careful never to leave behind,
+    so the effect runs here, where nothing kills it.
+    One transaction, so the effect and its exactly-once guard commit together (tools.execute → the executor);
+    the message id is that guard's key, so a retried message re-runs this harmlessly.
+    """
+    with pool.connection() as conn:
+        with conn.transaction():
+            return tools.execute(conn, decision, symbiot_id, message_id, now_local, zone_name)
+
+
+def _fire_one() -> bool:
+    """Fire one due reminder as a missive, exactly once. True if there was one to fire.
+
+    The reminder tool's due side, cut from the enrichment sweep's cloth.
+    It claims the oldest unfired reminder whose moment has come
+    (reminder.claim_due, under FOR UPDATE SKIP LOCKED so two sweeps never fire the same one),
+    raises the stored line as a missive, mirrors it onto the conversation stream, and stamps the reminder fired —
+    all in one transaction, so the send and the record commit together.
+    A crash before the commit leaves the reminder unfired and simply due again;
+    a commit sends it and stamps it, so it is never delivered twice —
+    exactly-once on the firing side, pinned in the database the way the rest of the kernel pins it,
+    not by the sweep being careful.
+    The nudge is best-effort and outside the transaction,
+    since the missive already stands to be read on the next inbox open regardless.
+    """
+    pool = db.get_pool()
+    symbiot_id = None
+    with pool.connection() as conn:
+        with conn.transaction():
+            due = reminder.claim_due(conn)
+            if due is None:
+                return False
+            reminder_id, symbiot_id, body = due
+            # Raise the missive and mirror it onto the stream in this same transaction, then stamp the reminder,
+            # so the line the kernel says on its own is remembered and the reminder is recorded delivered —
+            # sent and recorded atomically, the same shape the enrichment follow-up commits under.
+            missive_id = missive.raise_for(conn, symbiot_id, body)
+            conversation.record_utterance(conn, symbiot_id, "machine", body, missive_id=missive_id)
+            reminder.mark_fired(conn, reminder_id)
+    push.notify_inbox(pool, symbiot_id)
+    return True
+
+
 def _gather_context(
     pool, message: str, message_id: int, symbiot_id: int | None
-) -> tuple[list[retrieval.Fact], conversation.Conversation, str]:
-    """Both memories a reply draws on and the symbiot's timezone, gathered synchronously before it is composed.
+) -> tuple[list[retrieval.Fact], conversation.Conversation, str, list[tools.ToolCandidate]]:
+    """The memories, the timezone, and the tool shortlist a reply draws on, gathered before it is composed.
 
     The long-term diary facts that bear on the message (retrieval.search, recall by relevance),
     the short-term conversation the message sits inside (conversation.recent, recall by recency),
-    and the symbiot's IANA timezone (zone.of), so the reply can reason about time in the human's day, not UTC.
+    the symbiot's IANA timezone (zone.of), so the reply reasons about time in the human's day, not UTC,
+    and the tools the message might be reaching for (tools.search_catalog, the gate before the tool seam).
     All run on the worker's own thread, not in the killable child:
     they are bounded, indexed reads that carry no hang risk to protect against,
-    and doing them here keeps the child — where the deadline bites — to the one call that can run long, the LLM.
+    and doing them here keeps the child — where the deadline bites — to the calls that can run long, the LLM's.
     They share one connection: reads of the same symbiot's state, taken together.
-    Only a recognised symbiot's message reaches memory:
-    an anonymous line is answered without it, so the symbiot's own memory is never read to answer a stranger,
-    and it never composes a real reply — so the UTC default handed back for it is just a placeholder the stand-in ignores.
+    Only a recognised symbiot's message reaches any of this:
+    an anonymous line is answered without it, so the symbiot's memory is never read to answer a stranger,
+    it never composes a real reply — so the UTC default handed back for it is a placeholder the stand-in ignores —
+    and no tool is offered it, because a tool acts on the symbiot's behalf and there is no symbiot here to act for.
     The message being answered is excluded from the conversation tail —
     it was written onto the stream when it arrived,
     so without this it would show up both as the last turn and as the current message the prompt states.
     """
     if symbiot_id is None:
-        return [], conversation.Conversation(gist=None, tail=[]), zone.DEFAULT_ZONE
+        return [], conversation.Conversation(gist=None, tail=[]), zone.DEFAULT_ZONE, []
     with pool.connection() as conn:
         facts = retrieval.search(conn, message)
         conv = conversation.recent(conn, symbiot_id, exclude_intake_id=message_id)
         zone_name = zone.of(conn, symbiot_id)
-    return facts, conv, zone_name
+        shortlist = tools.search_catalog(conn, message)
+    return facts, conv, zone_name, shortlist
 
 
 def _ingest_one() -> bool:
@@ -228,16 +374,15 @@ def _process_one() -> bool:
     if claimed is None:
         return False
     message_id, message, symbiot_id = claimed
-    # Assemble the answer-time memory here, on the worker's thread, before the killable child runs:
-    # the reads are fast and bounded, so only the composing LLM call needs the deadline's protection.
+    # Assemble the answer-time memory here, on the worker's thread, before any killable child runs:
+    # the reads are fast and bounded, so only the composing LLM calls need the deadline's protection.
     # The symbiot's local "now" is resolved here too, from the zone gathered alongside the memory,
     # so the reply reasons about time in the human's day rather than the server's UTC —
     # and it is a concrete instant the child reads, not a clock the child would have to consult mid-compose.
-    facts, conv, zone_name = _gather_context(pool, message, message_id, symbiot_id)
+    # The tool shortlist is gathered here too — the gate before the tool seam _answer may fork into.
+    facts, conv, zone_name, shortlist = _gather_context(pool, message, message_id, symbiot_id)
     now_local = zone.now_for(zone_name)
-    result = execution.run_with_deadline(
-        _produce_reply, (message, symbiot_id, facts, conv, now_local, zone_name), config.INTAKE_DEADLINE_SECONDS
-    )
+    result = _answer(pool, message_id, message, symbiot_id, facts, conv, now_local, zone_name, shortlist)
     answered = False
     with pool.connection() as conn:
         if result.status == execution.COMPLETED:
@@ -435,3 +580,32 @@ def run_reconcile_sweep(stop: threading.Event) -> None:
             log.exception("reconcile sweep iteration failed")
         stop.wait(SWEEP_INTERVAL_SECONDS)
     log.info("reconcile sweep stopped")
+
+
+def run_reminder_sweep(stop: threading.Event) -> None:
+    """Deliver due reminders as missives until `stop` is set. Started from the kernel's lifespan.
+
+    The sixth background loop beside the worker pool and the other sweeps,
+    and the firing half of the reminder tool:
+    the tool schedules a reminder on the reply path,
+    and here, off it, the kernel reaches back out at the appointed moment and says the stored line.
+    It drains the way the others do: a reminder fired means looking again at once, an idle pass waits a beat,
+    so a batch of reminders that came due together is delivered promptly without an idle kernel spinning.
+    One bad firing can't take the loop down —
+    a failed pass is logged and left for the next round, since the reminder stays unfired until its send commits,
+    tried again if it was a transient hiccup off the critical path.
+    Its own on/off switch (config.REMINDER_ENABLED), like the other sweeps,
+    so a box can want the reply path without the firing loop, or the reverse; it shares only worker_stop.
+    """
+    log = logs.get("worker")
+    log.info("reminder sweep started")
+    while not stop.is_set():
+        try:
+            worked = _fire_one()
+        except Exception:
+            # Keep the loop alive across a bad firing so one reminder can't kill it.
+            log.exception("reminder sweep iteration failed")
+            worked = False
+        if not worked:
+            stop.wait(config.REMINDER_SWEEP_INTERVAL_SECONDS)
+    log.info("reminder sweep stopped")

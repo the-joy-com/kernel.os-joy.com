@@ -40,6 +40,12 @@ os.environ["COMPRESS_ENABLED"] = "0"
 # The Tier 2 enrichment sweep stays off under test too — its tests drive _enrich_one by hand,
 # and a live sweep would race them for the intake and enrichment tables.
 os.environ["ENRICH_ENABLED"] = "0"
+# The tool-catalog reconcile stays off at test startup so it never reaches Ollama to embed a descriptor —
+# the tool tests seed the catalog by hand (or reconcile with the embedding faked).
+os.environ["TOOLS_ENABLED"] = "0"
+# The reminder firing sweep stays off under test too — its tests drive _fire_one by hand,
+# and a live sweep would race them for the reminder table.
+os.environ["REMINDER_ENABLED"] = "0"
 # Web push stays off unless a test opts in (by monkeypatching config), so no test can reach a real push service —
 # even though a dev .env might carry a VAPID key, this pins it empty
 # (load_dotenv won't override an env var already set, blank or not).
@@ -85,7 +91,7 @@ import pytest
 
 from core import db
 from services import identity
-from services.email_client import FakeEmailClient
+from services.adapters.email_client import FakeEmailClient
 from main import app, get_email_client
 from core.rate_limit import limiter
 
@@ -120,7 +126,8 @@ def clean_db(client):
         # embedding_model is left alone — it holds the active-model seed the migration wrote, not test data.
         conn.execute(
             "TRUNCATE symbiot, login_code, session, intake, missive, reply_channel, "
-            "schema_ontology, diary_facts, conversation_item, conversation_gist, enrichment "
+            "schema_ontology, diary_facts, conversation_item, conversation_gist, enrichment, "
+            "tool_catalog, reminder "
             "RESTART IDENTITY CASCADE"
         )
         conn.execute("INSERT INTO symbiot (email) VALUES (%s)", (SYMBIOT_EMAIL,))

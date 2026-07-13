@@ -37,10 +37,10 @@ import psycopg
 
 from core import config
 from core import db
-from services import conversation
-from services import models
-from services import reply
-from services import retrieval
+from services.memory import conversation
+from services.adapters import models
+from services.loop import reply
+from services.memory import retrieval
 
 # A small diary with a shape worth reading back:
 # two facts share words with the boxing/gym question below (so the reach ranks across both),

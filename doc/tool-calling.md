@@ -77,3 +77,9 @@ A message can be re-run: if the deadline bites or the process crashes, the recon
 ## the first tool
 
 The registry's first and only inhabitant is a one-shot reminder: `schedule_reminder(message, when)`. It is the cleanest possible first action — it needs no external driver and no third-party credential, only a durable row in our own store and the reply path already built, so what is under test is the machinery of acting rather than the plumbing of an integration. Its executor resolves the time to a concrete moment in the symbiot's timezone and persists it; a due-check later fires the stored message back over the reply path, itself exactly-once per due moment. The catalog of one exercises the retrieval and the registry trivially, but the contract holds from the first tool, so the second is a new entry and a new row, not a rewrite.
+
+## the tools The Joy has
+
+Each tool in the registry is documented one file per tool under [`doc/tool-calling/`](tool-calling/). This section is the index: adding a tool adds a row here and a page there, so the set of things The Joy can actually *do* is legible in one place.
+
+- **[`schedule_reminder`](tool-calling/reminders.md)** — a one-shot reminder. Hear "remind me of X at Y" in the ordinary flow of conversation, resolve the time in the symbiot's own timezone, and at that moment say the stored line back as a missive. One message, one future time, one fire; recurrence and other future actions are the general scheduler's remit, not this tool's.

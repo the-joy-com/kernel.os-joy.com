@@ -8,8 +8,8 @@ The verbatim budget is monkeypatched small so the arithmetic that decides "overf
 """
 
 from core import db
-from services import conversation
-from services import worker
+from services.memory import conversation
+from services.loop import worker
 
 SEEDED_SYMBIOT_ID = 1  # conftest re-seeds exactly one symbiot with RESTART IDENTITY, so it's always id 1
 

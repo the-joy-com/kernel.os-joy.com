@@ -7,7 +7,7 @@ and walk is exercised by stubbing recall to a fixed list and letting the real wa
 """
 
 from core import db
-from services import deep_retrieval
+from services.memory import deep_retrieval
 
 
 def _concept(type_name, definition="a kind of thing") -> int:

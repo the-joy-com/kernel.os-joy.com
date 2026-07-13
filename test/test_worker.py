@@ -8,11 +8,11 @@ _process_one directly.
 from datetime import datetime, timezone
 
 from core import db
-from services import conversation
-from services import execution
-from services import intake
+from services.memory import conversation
+from services.loop import execution
+from services.memory import intake
 from core import protocol
-from services import worker
+from services.loop import worker
 
 SEEDED_SYMBIOT_ID = 1  # conftest re-seeds exactly one symbiot with RESTART IDENTITY, so it's always id 1
 _EMPTY_CONVO = conversation.Conversation(gist=None, tail=[])
@@ -118,6 +118,53 @@ def test_worker_records_crash_traceback(client, monkeypatch):
     assert status == "failed"
     assert answer is None
     assert failed_reason == trace
+
+
+def test_answer_forks_to_the_tool_when_a_candidate_surfaces(client, monkeypatch):
+    # The tool seam: a surfaced candidate takes the decide → act → speak path, ending in the confirmation.
+    # Every model step is faked and run in-process (run_with_deadline runs fn(arg)),
+    # so the fork is exercised without a child spawn or a live model —
+    # the real thing is proven end to end in the by-hand smoke.
+    from services.tools import tools
+
+    monkeypatch.setattr(
+        worker.execution, "run_with_deadline",
+        lambda fn, arg, deadline: execution.Result(execution.COMPLETED, fn(arg)),
+    )
+    monkeypatch.setattr(
+        worker.tools, "decide",
+        lambda *a: tools.Decision("schedule_reminder", {"reminder_message": "x", "fire_at": None}),
+    )
+    monkeypatch.setattr(worker, "_execute_tool", lambda *a: tools.ToolResult(True, "did it"))
+    monkeypatch.setattr(worker.tools, "compose_confirmation", lambda *a: "confirmed")
+    shortlist = [tools.ToolCandidate("schedule_reminder", "…", 0.1)]
+
+    result = worker._answer(
+        db.get_pool(), 1, "remind me", SEEDED_SYMBIOT_ID, [], _EMPTY_CONVO, _NOW, _ZONE, shortlist
+    )
+    assert result.status == execution.COMPLETED
+    assert result.value == "confirmed"
+
+
+def test_answer_falls_back_to_the_reply_when_the_decision_is_none(client, monkeypatch):
+    # A candidate surfaced by coarse recall but the decision found nothing fit → the ordinary reply, full memory.
+    from services.tools import tools
+
+    monkeypatch.setattr(
+        worker.execution, "run_with_deadline",
+        lambda fn, arg, deadline: execution.Result(execution.COMPLETED, fn(arg)),
+    )
+    monkeypatch.setattr(worker.tools, "decide", lambda *a: tools.Decision(tools.NO_TOOL, {}))
+    monkeypatch.setattr(
+        worker.reply, "compose",
+        lambda message, facts, conv, *, now_local=None, zone_name=None: "ordinary reply",
+    )
+    shortlist = [tools.ToolCandidate("schedule_reminder", "…", 0.1)]
+
+    result = worker._answer(
+        db.get_pool(), 1, "how are you?", SEEDED_SYMBIOT_ID, [], _EMPTY_CONVO, _NOW, _ZONE, shortlist
+    )
+    assert result.value == "ordinary reply"
 
 
 def test_worker_records_timeout_reason(client, monkeypatch):

@@ -788,6 +788,7 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "pywebpush" },
     { name = "tiktoken" },
+    { name = "tzdata" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -810,6 +811,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "pywebpush", specifier = ">=2.3.0" },
     { name = "tiktoken", specifier = ">=0.8.0" },
+    { name = "tzdata", specifier = ">=2026.2" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.49.0" },
 ]
 

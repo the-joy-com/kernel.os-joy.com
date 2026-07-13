@@ -17,8 +17,8 @@ complete act of the kernel reaching out — record the missive, then nudge — a
 producer (or a QA session) calls to send one.
 """
 
-from services import conversation
-from services import push
+from services.memory import conversation
+from services.adapters import push
 
 
 # The functions below are ordered by layer, not alphabetically:

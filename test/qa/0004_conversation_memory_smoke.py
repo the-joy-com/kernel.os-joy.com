@@ -55,7 +55,7 @@ import psycopg
 
 from core import config
 from core import db
-from services import conversation
+from services.memory import conversation
 
 # The deliberately small fold trigger: with the real turns below counting well over this, the tail is
 # "over budget" and the fold fires, folding its oldest turns until the remaining tail is back within it.
@@ -204,7 +204,7 @@ def main() -> None:
             # --- 4. the payoff: a live reply that must reach back into the memory --------------
             # No diary facts here (this smoke isolates the conversation), so continuity can only come from the
             # short-term memory just assembled — the Gist and the tail. Read the reply to judge whether it did.
-            from services import reply
+            from services.loop import reply
 
             answer = reply.compose(FOLLOW_UP, [], after)
             print(f"\n=== the composed reply (live {config.REPLY_MODEL}) ===")

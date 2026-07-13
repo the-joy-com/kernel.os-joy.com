@@ -15,7 +15,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from core import config
-from services.email_client import EmailClient
+from services.adapters.email_client import EmailClient
 
 # Codes are short and human-typed; sessions are long and machine-held.
 # Eight digits, not six: still typeable in one glance,

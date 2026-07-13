@@ -12,8 +12,8 @@ import psycopg
 import pytest
 
 from core import db
-from services import conversation
-from services import models
+from services.memory import conversation
+from services.adapters import models
 
 SEEDED_SYMBIOT_ID = 1  # conftest re-seeds exactly one symbiot with RESTART IDENTITY, so it's always id 1
 

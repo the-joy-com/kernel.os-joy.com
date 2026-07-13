@@ -1,10 +1,11 @@
 """The symbiot's timezone: inferring it from a place, storing it, reading it back, and the authed route.
 
 The inference is the one part that reaches the model, so its LLM boundary is faked here;
-what the tests pin is the guarantee around it — that only a name the system's timezone database actually
-carries is ever returned or stored, so a null answer or an invented-but-well-formed name both come back as
-the honest "say again". The store reads and the /timezone route (authed only) are exercised end
-to end against the test database, with the inference faked so no test makes a network call.
+what the tests pin is the guarantee around it —
+that only a name the system's timezone database actually carries is ever returned or stored,
+so a null answer or an invented-but-well-formed name both come back as the honest "say again".
+The store reads and the /timezone route (authed only) are exercised end to end against the test database,
+with the inference faked so no test makes a network call.
 """
 
 from datetime import datetime, timezone as dt_timezone
@@ -12,7 +13,7 @@ from datetime import datetime, timezone as dt_timezone
 from core import db
 from core import protocol
 from services import identity
-from services import zone
+from services.loop import zone
 
 
 def _symbiot_id() -> int:

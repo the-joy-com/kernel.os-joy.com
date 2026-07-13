@@ -38,7 +38,7 @@ from pydantic import BaseModel, create_model
 from core import config
 from core import db
 from core import logs
-from services import llm
+from services.adapters import llm
 
 
 @dataclass(frozen=True)

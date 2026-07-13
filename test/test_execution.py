@@ -8,7 +8,7 @@ module-level so the spawned process can import them by name.
 
 import time
 
-from services import execution
+from services.loop import execution
 
 
 def _ok(message):

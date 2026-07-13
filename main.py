@@ -18,14 +18,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core import config
 from core import db
-from services import conversation
+from services.memory import conversation
 from services import identity
 from core import logs
 from core import protocol
-from services import ontology_gc
-from services import push
-from services import worker
-from services import zone
+from services.memory import ontology_gc
+from services.adapters import push
+from services.tools import tools
+from services.loop import worker
+from services.loop import zone
 from core.dtos import (
     DeliveredRequest,
     IntakeRequest,
@@ -38,9 +39,9 @@ from core.dtos import (
 
 # The /intake handler is named intake(),
 # so the module is reached by its function rather than imported as `intake` (which the handler would shadow).
-from services.intake import mark_delivered, read_outcome, record_message, recover_orphaned
-from services.missive import mark_seen, unseen_for_symbiot
-from services.email_client import EmailClient, GmailEmailClient
+from services.memory.intake import mark_delivered, read_outcome, record_message, recover_orphaned
+from services.loop.missive import mark_seen, unseen_for_symbiot
+from services.adapters.email_client import EmailClient, GmailEmailClient
 from core.rate_limit import RateLimitMiddleware
 
 # The single source the envelope reports.
@@ -59,6 +60,13 @@ async def lifespan(app: FastAPI):
     # Migrations are idempotent, so this is safe on every boot.
     db.open_pool(config.DATABASE_URL)
     db.migrate_and_seed(db.get_pool(), config.SYMBIOT_EMAIL)
+    # Bring the tool catalog in line with the code registry now the schema is in place:
+    # the code registry is the source of truth for which tools exist,
+    # and this reconcile embeds a new or changed descriptor so recall can match a message against it.
+    # Gated so a test startup never reaches Ollama to embed; idempotent, so a hot reload re-runs it harmlessly.
+    if config.TOOLS_ENABLED:
+        with db.get_pool().connection() as conn:
+            tools.reconcile_catalog(conn)
     # The kernel's background work runs on daemon threads, not asyncio tasks:
     # the database work is synchronous and would block the event loop the API runs on.
     # Every one of them shares a single worker_stop Event — the one signal that winds the whole process down —
@@ -120,11 +128,13 @@ async def lifespan(app: FastAPI):
     #   diary ingestion          — files each answered message into the long-term diary, a beat after the reply goes back.
     #   ontology GC              — the offline merge pass that collapses the semantic duplicates lazy minting breeds.
     #   Tier 2 enrichment        — reaches deeper into the diary by meaning, following up only when it adds something new.
+    #   reminder firing          — delivers a scheduled reminder as a missive at its appointed moment (the tool's due side).
     sweeps = [
         (config.COMPRESS_ENABLED, worker.run_compression_sweep, "conversation-compression-sweep"),
         (config.INGEST_ENABLED, worker.run_ingestion_sweep, "diary-ingestion-sweep"),
         (config.GC_ENABLED, ontology_gc.run_sweep, "ontology-gc-sweep"),
         (config.ENRICH_ENABLED, worker.run_enrichment_sweep, "tier2-enrichment-sweep"),
+        (config.REMINDER_ENABLED, worker.run_reminder_sweep, "reminder-firing-sweep"),
     ]
     for enabled, target, name in sweeps:
         if enabled:

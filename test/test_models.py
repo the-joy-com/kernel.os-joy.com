@@ -5,7 +5,7 @@ both count and truncate on the same measure, so the assertions are about the cou
 (positive, monotonic, and a truncation that actually caps), not about an exact token number.
 """
 
-from services import models
+from services.adapters import models
 
 
 def test_the_map_carries_provider_and_optimal_context():

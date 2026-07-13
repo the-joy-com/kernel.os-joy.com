@@ -13,9 +13,9 @@ and that the summarisable region is exactly the remembered block — never the p
 from datetime import datetime, timezone
 
 from core import config
-from services import conversation
-from services import reply
-from services import retrieval
+from services.memory import conversation
+from services.loop import reply
+from services.memory import retrieval
 
 
 def _fact(id: int, raw_text: str, effective_at: datetime, rank: float = 0.5) -> retrieval.Fact:

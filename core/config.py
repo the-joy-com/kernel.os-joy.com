@@ -359,3 +359,42 @@ DEEP_RETRIEVAL_EF_SEARCH = int(os.getenv("DEEP_RETRIEVAL_EF_SEARCH", "100"))
 # Bounds the walk so it broadens the reach along the vocabulary tree
 # without flooding the prompt past the recalled facts it extends.
 DEEP_RETRIEVAL_EXPANSION_LIMIT = int(os.getenv("DEEP_RETRIEVAL_EXPANSION_LIMIT", "10"))
+
+# Tool calling (services/tools.py, services/reminder.py): the seam where the loop acts rather than only speaks.
+# The catalog reconcile that syncs the store's tool descriptors to the code registry, run once at startup.
+# On by default; the test suite turns it off so startup never reaches Ollama to embed a descriptor —
+# the tool tests seed the catalog by hand (or reconcile with the embedding faked),
+# the same stance WORKER_ENABLED and the sweeps take for their own background work.
+TOOLS_ENABLED = os.getenv("TOOLS_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+# The generative model behind the decision call — which tool a message is asking for, and its arguments.
+# A routing-and-extraction judgment, the same kind of call the ontology router makes,
+# so it defaults to the router's model (RERANK_MODEL) rather than the reply's;
+# reached with thinking off and output held to the flat decision schema (llm.generate_json).
+# Looked up in the model map like every generative model.
+TOOL_DECISION_MODEL = os.getenv("TOOL_DECISION_MODEL", RERANK_MODEL)
+# The generative model that composes the confirmation the human sees —
+# prose in the symbiot's voice, speaking the tool's result, so it defaults to the reply's model (REPLY_MODEL).
+# Reached free-text (llm.generate).
+TOOL_CONFIRM_MODEL = os.getenv("TOOL_CONFIRM_MODEL", REPLY_MODEL)
+# The catalog recall's gate (tools.search_catalog):
+# the cosine distance under which a tool's descriptor is near enough to a message to be a candidate.
+# Coarse recall — set generously so a real ask is never missed, since the decision call is the precision that follows;
+# the lexical match catches an obvious phrasing regardless of distance,
+# so this is the meaning-based half of the two-signal gate.
+TOOL_RECALL_MAX_DISTANCE = float(os.getenv("TOOL_RECALL_MAX_DISTANCE", "0.6"))
+# How many candidate tools the gate hands the decision at most — the shortlist size.
+# Small: the catalog is tiny, and the decision reads every candidate's description in one call.
+TOOL_RECALL_LIMIT = int(os.getenv("TOOL_RECALL_LIMIT", "5"))
+# The HNSW working-set width for the catalog search, set per query, comfortably above the shortlist —
+# the same knob and the same reason as the other recalls (RECALL_EF_SEARCH, DEEP_RETRIEVAL_EF_SEARCH).
+TOOL_RECALL_EF_SEARCH = int(os.getenv("TOOL_RECALL_EF_SEARCH", "100"))
+
+# The reminder firing sweep (worker.run_reminder_sweep): the loop that delivers due reminders as missives.
+# On by default; the test suite turns it off so the live sweep can't race the suite for the reminder table —
+# the reminder tests drive _fire_one by hand, the same stance the other sweeps take.
+REMINDER_ENABLED = os.getenv("REMINDER_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+# How often the firing sweep looks for a due reminder when idle.
+# It drains back-to-back while reminders are due; this is only the idle poll —
+# a reminder fires within about this long of its moment,
+# which is close enough for a one-shot nudge and cheap on the partial due index.
+REMINDER_SWEEP_INTERVAL_SECONDS = float(os.getenv("REMINDER_SWEEP_INTERVAL_SECONDS", "10"))

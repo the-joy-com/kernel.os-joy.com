@@ -13,18 +13,13 @@ The kernel's Python lives in two packages, and the division between them is the 
 - [`logs.py`](../core/logs.py) — one timestamped logging stream the whole `kernel.*` tree hangs under.
 - [`rate_limit.py`](../core/rate_limit.py) — the soft in-memory edge limiter that sheds gross volume before a request reaches a route.
 
-**`services/`** holds the actual work — each module a feature or a domain capability, built *on top of* core:
+**`services/`** holds the actual work — each module a feature or a domain capability, built *on top of* core. It grew past the point where a flat folder of two dozen modules stayed legible, so the work is now grouped into subpackages by the role a module plays: a module's folder tells you what kind of thing it is.
 
-- [`identity.py`](../services/identity.py) — the login/session state machine.
-- [`intake.py`](../services/intake.py) — the intake table's data layer and its state machine.
-- [`worker.py`](../services/worker.py) — the background pool that drains the intake queue, plus the deadline sweep.
-- [`execution.py`](../services/execution.py) — running a message's work under a hard deadline.
-- [`ontology.py`](../services/ontology.py), [`embedding.py`](../services/embedding.py), [`llm.py`](../services/llm.py) — the ontology router: recall, the embedding calls it recalls with, and the generative client it re-ranks and decides through.
-- [`ontology_gc.py`](../services/ontology_gc.py) — the offline duplicate garbage collector: the background sweep that finds the semantic-duplicate types lazy minting breeds, confirms them with the model, and collapses each set into one survivor.
-- [`email_client.py`](../services/email_client.py) — the `EmailClient` interface and its Gmail-API implementation (with a fake for tests).
-- [`push.py`](../services/push.py) — the Web Push reply channel.
-- [`missive.py`](../services/missive.py) — the outbound message shaping.
-- [`persona.py`](../services/persona.py) — the machine symbiot's persona, spliced from its public and private halves.
+- **[`adapters/`](../services/adapters)** — the kernel's edge, where our own vocabulary stops and a foreign system begins: [`llm.py`](../services/adapters/llm.py) and [`embedding.py`](../services/adapters/embedding.py) (the generative and embedding provider calls), [`models.py`](../services/adapters/models.py) (the map of which models exist and the budgets they read well), [`email_client.py`](../services/adapters/email_client.py) (the `EmailClient` interface and its Gmail-API implementation, with a fake for tests), and [`push.py`](../services/adapters/push.py) (the Web Push reply channel). Gathering the churn-prone edge in one place is the same instinct as keeping the kernel's internals provider-independent — the border is the one place a provider's specifics are allowed to live, so when an API shifts the blast radius is a single folder.
+- **[`memory/`](../services/memory)** — the durable store and the reaches into it: [`intake.py`](../services/memory/intake.py) (the intake table's data layer and its state machine), [`conversation.py`](../services/memory/conversation.py), [`enrichment.py`](../services/memory/enrichment.py), the ontology router in [`ontology.py`](../services/memory/ontology.py) with its offline duplicate collector [`ontology_gc.py`](../services/memory/ontology_gc.py), and the two diary reaches [`retrieval.py`](../services/memory/retrieval.py) (fast and lexical, on the critical path) and [`deep_retrieval.py`](../services/memory/deep_retrieval.py) (slow and semantic, off it).
+- **[`loop/`](../services/loop)** — deciding and speaking: [`worker.py`](../services/loop/worker.py) (the background pool that drains the intake queue, plus the deadline sweep), [`reply.py`](../services/loop/reply.py), [`persona.py`](../services/loop/persona.py) (the machine symbiot's voice, spliced from its public and private halves), [`zone.py`](../services/loop/zone.py) (its local timezone), [`missive.py`](../services/loop/missive.py) (lines the kernel raises for a symbiot unprompted), and [`execution.py`](../services/loop/execution.py) (running a message's work under a hard deadline, in a process we can actually kill).
+- **[`tools/`](../services/tools)** — the seam where the loop stops talking and acts: [`tools.py`](../services/tools/tools.py) (the tool-calling machinery — the catalog, the decision, the execution) and [`reminder.py`](../services/tools/reminder.py) (its first inhabitant). The design lives in [`doc/tool-calling.md`](tool-calling.md).
+- [`identity.py`](../services/identity.py) — the login/session state machine, left at the top level on purpose: it governs the *human's* sessions and one-time codes, orthogonal to the read path rather than a step along it.
 
 ## the rule: one-way imports
 
@@ -35,7 +30,7 @@ The line between the two isn't just where a file sits — it's a real boundary t
 
 That is the whole rationale, and it earns its keep. Because the arrow only points up, `core/` stays self-contained and cheap to reason about: you can import `core.db` or `core.dtos` without dragging in Ollama, the Gmail libraries, or the worker loop. It keeps the foundation testable in isolation and stops the kernel's primitives from quietly growing a dependency on the features that are supposed to depend on *them*. It's the same instinct as a kernel-versus-userland or infrastructure-versus-domain split, scaled down to one repo.
 
-The rule is enforced by convention rather than by tooling today — but it is a convention the code has never once broken, and a new module earns its folder by answering one question: does anything above it depend on this, or does it depend on the work above it? A primitive with no knowledge of any feature belongs in `core/`; a feature belongs in `services/`.
+The rule is enforced by convention rather than by tooling today — but it is a convention the code has never once broken, and a new module earns its folder by answering one question: does anything above it depend on this, or does it depend on the work above it? A primitive with no knowledge of any feature belongs in `core/`; a feature belongs in `services/`, and within `services/` its subpackage follows the role it plays — the edge that reaches off the box, the store, the loop that speaks, or the seam where it acts.
 
 ## what sits above both
 

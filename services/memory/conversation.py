@@ -51,8 +51,8 @@ from dataclasses import dataclass
 from pydantic import BaseModel, Field
 
 from core import config
-from services import llm
-from services import models
+from services.adapters import llm
+from services.adapters import models
 
 # What the two short-term blocks read when there is nothing yet —
 # a fresh symbiot, an empty store —

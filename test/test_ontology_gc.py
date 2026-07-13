@@ -15,8 +15,8 @@ from pydantic import ValidationError
 
 from core import config
 from core import db
-from services import llm
-from services import ontology_gc
+from services.adapters import llm
+from services.memory import ontology_gc
 
 # The active model's output width; every hand-built vector must match it or the ::vector cast rejects it.
 _DIM = 768

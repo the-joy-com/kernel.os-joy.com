@@ -64,7 +64,7 @@ from openai import OpenAI
 from pydantic import BaseModel
 
 from core import config
-from services import models
+from services.adapters import models
 
 M = TypeVar("M", bound=BaseModel)
 

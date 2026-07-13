@@ -9,7 +9,7 @@ import psycopg
 import pytest
 
 from core import db
-from services import intake
+from services.memory import intake
 
 
 def _rows():

@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from services import llm
+from services.adapters import llm
 
 
 class _FakeChat:

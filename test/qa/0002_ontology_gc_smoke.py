@@ -41,8 +41,8 @@ import psycopg
 
 from core import config
 from core import db
-from services import embedding
-from services import ontology_gc
+from services.adapters import embedding
+from services.memory import ontology_gc
 
 # Two genuinely synonymous types the pass should merge, plus one unrelated type it must leave alone.
 # Definitions are what actually get embedded and what the re-ranker reads, so they carry the meaning.

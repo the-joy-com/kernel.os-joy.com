@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import psycopg
 
 from core import config
-from services import models
+from services.adapters import models
 
 # The three sources, unioned in the order the live path writes them,
 # with the sort key that reconstructs true chronology across all of them:

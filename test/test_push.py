@@ -10,8 +10,8 @@ signing and sending a real push needs a real browser, proven by hand.
 
 from core import config
 from core import db
-from services import intake
-from services import push
+from services.memory import intake
+from services.adapters import push
 from conftest import SYMBIOT_EMAIL, extract_code
 
 # A valid base64url 32-octet private scalar — a throwaway VAPID key for the tests that

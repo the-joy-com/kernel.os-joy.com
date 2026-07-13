@@ -9,7 +9,7 @@ depends on what's actually on the box.
 """
 
 from core import config
-from services import persona
+from services.loop import persona
 
 
 def _point_at(monkeypatch, public_body, private_body, tmp_path):

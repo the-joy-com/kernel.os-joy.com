@@ -31,10 +31,10 @@ from dataclasses import dataclass
 from pydantic import BaseModel
 
 from core import config
-from services import conversation
-from services import deep_retrieval
-from services import llm
-from services import persona
+from services.memory import conversation
+from services.memory import deep_retrieval
+from services.adapters import llm
+from services.loop import persona
 
 # The advisory-lock namespace the enrichment sweep claims a message's pass under (claim).
 # Its own number, distinct from the fold's (conversation._FOLD_LOCK_NAMESPACE), so the two never share a lock;

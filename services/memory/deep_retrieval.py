@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from core import config
-from services import embedding
+from services.adapters import embedding
 
 
 @dataclass(frozen=True)

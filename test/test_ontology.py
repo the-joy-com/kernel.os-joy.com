@@ -17,9 +17,9 @@ from pydantic import BaseModel, ValidationError
 
 from core import config
 from core import db
-from services import embedding
-from services import llm
-from services import ontology
+from services.adapters import embedding
+from services.adapters import llm
+from services.memory import ontology
 
 # The active model's output width; every hand-built vector must match it or the ::vector cast rejects it.
 _DIM = 768

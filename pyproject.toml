@@ -15,6 +15,12 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "pywebpush>=2.3.0",
     "tiktoken>=0.8.0",
+    # Ship our own IANA timezone database rather than trusting the OS to carry one.
+    # zoneinfo falls back to /usr/share/zoneinfo, which a lean server image may not have —
+    # and when it is missing, ZoneInfo(zone) raises and services.zone.now_for silently returns UTC,
+    # so the symbiot's clock reads correct-looking but wrong. Carrying tzdata in the venv makes the
+    # local "now" independent of the OS image, on the box and on every developer's machine alike.
+    "tzdata>=2026.2",
     "uvicorn[standard]>=0.49.0",
 ]
 

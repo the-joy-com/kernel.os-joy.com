@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from core import config
 from core import db
-from services import retrieval
+from services.memory import retrieval
 
 
 def _add_fact(conn, raw_text: str, *, happened_at=None, payload=None) -> int:

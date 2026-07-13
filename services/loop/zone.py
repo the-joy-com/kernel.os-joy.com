@@ -30,7 +30,7 @@ from zoneinfo import available_timezones, ZoneInfo
 
 from pydantic import BaseModel
 
-from services import llm
+from services.adapters import llm
 
 # The fallback zone for a symbiot that has never named a place,
 # and for a stored name that somehow no longer resolves (a tzdata that dropped a zone between reads).

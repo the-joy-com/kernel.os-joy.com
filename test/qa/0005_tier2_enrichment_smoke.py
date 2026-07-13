@@ -52,12 +52,12 @@ import psycopg
 
 from core import config
 from core import db
-from services import conversation
-from services import deep_retrieval
-from services import enrichment
-from services import missive
-from services import ontology
-from services import retrieval
+from services.memory import conversation
+from services.memory import deep_retrieval
+from services.memory import enrichment
+from services.loop import missive
+from services.memory import ontology
+from services.memory import retrieval
 
 # The themed diary: every entry circles being depleted / running on empty, but none uses the message's words —
 # so the lexical reach, seeing no shared term, should mostly miss them, and only the meaning-based reach should surface them.

@@ -10,10 +10,10 @@ that a suppressed pass records itself too so it is never reconsidered, and that 
 from datetime import datetime, timezone
 
 from core import db
-from services import conversation
-from services import deep_retrieval
-from services import enrichment
-from services import worker
+from services.memory import conversation
+from services.memory import deep_retrieval
+from services.memory import enrichment
+from services.loop import worker
 
 SEEDED_SYMBIOT_ID = 1  # conftest re-seeds exactly one symbiot with RESTART IDENTITY, so it's always id 1
 

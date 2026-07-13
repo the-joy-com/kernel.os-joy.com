@@ -10,8 +10,8 @@ intake — it has no question and no walk to an answer — so the worker never s
 """
 
 from core import db
-from services import intake
-from services import missive
+from services.memory import intake
+from services.loop import missive
 from conftest import SYMBIOT_EMAIL, extract_code
 
 

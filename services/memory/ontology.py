@@ -30,8 +30,8 @@ from typing import Literal
 from pydantic import BaseModel, Field, create_model
 
 from core import config
-from services import embedding
-from services import llm
+from services.adapters import embedding
+from services.adapters import llm
 
 # The three bands the top re-rank score falls into, deciding what happens to the concept.
 REUSE = "reuse"  # a clear enough fit: link the fact to that existing type

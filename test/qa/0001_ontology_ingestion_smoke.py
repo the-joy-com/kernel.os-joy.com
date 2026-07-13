@@ -37,7 +37,7 @@ import psycopg
 
 from core import config
 from core import db
-from services import ontology
+from services.memory import ontology
 
 # The acceptance-criteria example, and a second fact that deliberately shares one concept (boxing)
 # with the first while adding two it has never seen (a friend, a heat wave) — so the run exercises

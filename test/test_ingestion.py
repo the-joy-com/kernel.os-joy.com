@@ -9,7 +9,7 @@ uniqueness — the real exactly-once guarantee — is exercised rather than mock
 import json
 
 from core import db
-from services import worker
+from services.loop import worker
 
 SEEDED_SYMBIOT_ID = 1  # conftest re-seeds exactly one symbiot with RESTART IDENTITY, so it's always id 1
 
