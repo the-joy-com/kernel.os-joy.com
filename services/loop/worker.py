@@ -257,11 +257,17 @@ def _enrich_one() -> bool:
     # Nudge the symbiot that a missive is waiting — outside the transaction, so a slow push never holds a connection,
     # and best-effort, because the record already stands: the follow-up surfaces on the next /inbox open regardless.
     if missive_id is not None:
-        # A follow-up the kernel raised on its own — no tool, no request behind it — so it fans out to every
-        # channel there is (the dispatcher then drops any the symbiot has globally disabled). Titled as the
-        # symbiot's own reaching-out, not by the internal pass that produced it.
+        # A follow-up the kernel raised on its own — no tool, no request behind it —
+        # so it fans out to every channel there is
+        # (the dispatcher then drops any the symbiot has globally disabled).
+        # Titled as the symbiot's own reaching-out,
+        # not by the internal pass that produced it.
+        # suppress_when_present, like every unprompted missive:
+        # if the symbiot is watching the shell,
+        # the live /inbox poll already surfaces this record,
+        # so the out-of-app nudge is held rather than doubling up.
         notification = notify.Notification(title="The Joy", body=follow_up, pointer="/inbox")
-        notify.dispatch(pool, symbiot_id, notification, list(notify.ALL_CHANNELS))
+        notify.dispatch(pool, symbiot_id, notification, list(notify.ALL_CHANNELS), suppress_when_present=True)
     return True
 
 

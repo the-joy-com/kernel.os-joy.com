@@ -1,0 +1,24 @@
+-- Presence: when the symbiot was last seen actively watching the shell.
+--
+-- The kernel is stateless request-and-reply — no live connection, no session presence —
+-- so until now "is the symbiot in the shell right now" was a question it could not answer at all.
+-- A missive it raised fanned out to every channel there is,
+-- blind to the case where the symbiot is sitting in the terminal watching the tab,
+-- about to read the record the moment the next inbox poll lands it in front of them.
+-- In that case the out-of-app nudge (an email in a mailbox, a push on a device) is not a second safety net;
+-- it is a redundant ping for something already on screen.
+--
+-- This column is the one piece needed to know better: a timestamp the shell's inbox poll refreshes.
+-- That poll fires every ten seconds,
+-- and only while the tab is visible (a backgrounded tab goes quiet),
+-- so a recent last_seen_at is a near-perfect heartbeat for "someone is looking".
+-- presence.is_active reads it against a tolerant window (config.PRESENCE_ACTIVE_WINDOW_SECONDS),
+-- and notify.dispatch uses that to hold a courtesy fan-out's out-of-app channels back while the symbiot is present.
+--
+-- Nullable, no default: a symbiot who has never polled has genuinely never been seen,
+-- and null reads as "not present" without a sentinel instant pretending otherwise.
+-- It only ever moves forward, stamped now() on each inbox poll — never cleared,
+-- since "last seen" is a high-water mark,
+-- and the window does the deciding about whether that mark is recent enough to still mean present.
+ALTER TABLE symbiot
+    ADD COLUMN last_seen_at TIMESTAMPTZ;

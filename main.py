@@ -26,6 +26,7 @@ from services.adapters import models
 from services.memory import model_config
 from services.memory import notification_prefs
 from services.memory import ontology_gc
+from services.memory import presence
 from services.adapters import push
 from services.loop import notify
 from services.tools import tools
@@ -318,11 +319,17 @@ def inbox(conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)) 
     Each message carries its id and body; the shell shows it, then POSTs the ids to /inbox/seen so it isn't offered again.
     """
     symbiot_id = identity.authenticated_symbiot_id(conn, token)
-    messages = (
-        [{"id": mid, "body": body} for mid, body in unseen_for_symbiot(conn, symbiot_id)]
-        if symbiot_id is not None
-        else []
-    )
+    if symbiot_id is None:
+        return envelope(protocol.TRAFFIC_WAITING, {"messages": []})
+    # This poll is the shell's presence heartbeat:
+    # it fires every ten seconds, and only while the tab is visible,
+    # so stamping it here is the kernel's one honest read on "the symbiot is watching right now".
+    # The dispatcher uses that to hold a missive's out-of-app nudge back while they're present (notify.dispatch),
+    # since this very poll is already surfacing the record in front of them.
+    # Stamped in the request's own transaction (db.get_conn commits on success),
+    # so the heartbeat lands in lockstep with the read it rode in on.
+    presence.mark_seen(conn, symbiot_id)
+    messages = [{"id": mid, "body": body} for mid, body in unseen_for_symbiot(conn, symbiot_id)]
     return envelope(protocol.TRAFFIC_WAITING, {"messages": messages})
 
 

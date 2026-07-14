@@ -13,6 +13,7 @@ from services.adapters import email_client
 from services.adapters import push
 from services.loop import notify
 from services.memory import notification_prefs
+from services.memory import presence
 
 SEEDED_SYMBIOT_ID = 1  # conftest re-seeds exactly one symbiot with RESTART IDENTITY, so it's always id 1
 
@@ -141,3 +142,76 @@ def test_dispatch_is_a_noop_when_the_set_is_empty(client, monkeypatch):
     _enable_web_push(monkeypatch, pushes)
     notify.dispatch(db.get_pool(), SEEDED_SYMBIOT_ID, _N, [])
     assert pushes == []
+
+
+def _mark_present():
+    # Stamp the seeded symbiot seen now, so presence.is_active reads them as watching the shell.
+    with db.get_pool().connection() as conn:
+        presence.mark_seen(conn, SEEDED_SYMBIOT_ID)
+
+
+def _mark_seen_ago(seconds: float):
+    # Stamp last_seen_at a fixed span in the past, to sit either side of the presence window.
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE symbiot SET last_seen_at = now() - make_interval(secs => %s) WHERE id = %s",
+            (seconds, SEEDED_SYMBIOT_ID),
+        )
+
+
+def test_dispatch_holds_out_of_app_channels_when_present_and_courtesy(client, monkeypatch):
+    pushes, emails = [], []
+    _enable_web_push(monkeypatch, pushes)
+    _enable_email(monkeypatch, emails)
+    _mark_present()
+    # A courtesy fan-out (suppress_when_present) to a symbiot who's watching the shell: both out-of-app channels
+    # are held, because the live /inbox poll is already surfacing the record in front of them. The nudge collapses
+    # to the durable record alone — exactly what a missive raised while the symbiot is present should do.
+    notify.dispatch(db.get_pool(), SEEDED_SYMBIOT_ID, _N, list(notify.ALL_CHANNELS), suppress_when_present=True)
+    assert pushes == [] and emails == []
+
+
+def test_dispatch_ignores_presence_without_the_courtesy_switch(client, monkeypatch):
+    pushes, emails = [], []
+    _enable_web_push(monkeypatch, pushes)
+    _enable_email(monkeypatch, emails)
+    _mark_present()
+    # The reminder path: an explicit request, so suppress_when_present is off (the default). Presence is never
+    # even read, and both named channels fire though the symbiot is right here — an intent is not a courtesy.
+    notify.dispatch(db.get_pool(), SEEDED_SYMBIOT_ID, _N, list(notify.ALL_CHANNELS))
+    assert len(pushes) == 1 and len(emails) == 1
+
+
+def test_dispatch_fires_when_absent_even_with_courtesy_on(client, monkeypatch):
+    pushes, emails = [], []
+    _enable_web_push(monkeypatch, pushes)
+    _enable_email(monkeypatch, emails)
+    # No stamp at all — a freshly seeded symbiot has never polled (last_seen_at null), so they read as absent
+    # and the courtesy fan-out reaches out over every channel, exactly as it must when no one is watching.
+    notify.dispatch(db.get_pool(), SEEDED_SYMBIOT_ID, _N, list(notify.ALL_CHANNELS), suppress_when_present=True)
+    assert len(pushes) == 1 and len(emails) == 1
+
+
+def test_dispatch_fires_when_presence_is_stale(client, monkeypatch):
+    pushes, emails = [], []
+    _enable_web_push(monkeypatch, pushes)
+    _enable_email(monkeypatch, emails)
+    _mark_seen_ago(config.PRESENCE_ACTIVE_WINDOW_SECONDS + 5)
+    # Seen, but longer ago than the window — the tab has gone quiet (backgrounded, closed, or asleep). The
+    # symbiot is owed the nudge again, so the courtesy fan-out fires over every channel despite the old stamp.
+    notify.dispatch(db.get_pool(), SEEDED_SYMBIOT_ID, _N, list(notify.ALL_CHANNELS), suppress_when_present=True)
+    assert len(pushes) == 1 and len(emails) == 1
+
+
+def test_dispatch_present_still_honors_globally_disabled(client, monkeypatch):
+    pushes, emails = [], []
+    _enable_web_push(monkeypatch, pushes)
+    _enable_email(monkeypatch, emails)
+    _mark_present()
+    with db.get_pool().connection() as conn:
+        notification_prefs.set_channel(conn, SEEDED_SYMBIOT_ID, "web_push", False)
+    # Presence and the global switch are independent filters that stack: web push is disabled outright, email is
+    # held only because they're present. Both land on nothing here — proof the courtesy hold doesn't override or
+    # replace the standing preference, it sits beside it.
+    notify.dispatch(db.get_pool(), SEEDED_SYMBIOT_ID, _N, list(notify.ALL_CHANNELS), suppress_when_present=True)
+    assert pushes == [] and emails == []

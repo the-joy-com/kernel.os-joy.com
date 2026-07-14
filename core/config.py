@@ -156,6 +156,19 @@ VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "").strip()
 # this is that base, defaulting to the production shell and overridable for a dev box.
 SHELL_URL = os.getenv("SHELL_URL", "https://shell.os-joy.com").strip().rstrip("/")
 
+# How recently the shell must have been seen for the symbiot to count as "present" —
+# actively watching the terminal right now, not merely logged in.
+# The signal is the shell's inbox poll (see the /inbox route and presence.py):
+# it fires every ten seconds, but only while the tab is visible,
+# so a fresh last_seen_at means someone is looking at the screen.
+# This window is that cadence plus slack for a missed beat or a slow request,
+# so a single dropped poll doesn't flip a watching symbiot to absent.
+# It gates only a courtesy: when present, a missive's out-of-app nudge is held
+# because the live poll is already surfacing the record in front of them (notify.dispatch).
+# Err toward the shorter side — a too-long window suppresses a nudge someone actually needed;
+# a too-short one merely sends a redundant one to a screen they were looking at.
+PRESENCE_ACTIVE_WINDOW_SECONDS = float(os.getenv("PRESENCE_ACTIVE_WINDOW_SECONDS", "30"))
+
 # Ollama on the box (embedding.py, and the generative ladder's last-resort tier in llm.py).
 # The embedding model runs locally — no external inference API for it —
 # so these point at the host's Ollama, not a remote service.

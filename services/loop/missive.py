@@ -109,6 +109,9 @@ def deliver(pool, symbiot_id: int, body: str) -> int:
     # A missive the kernel raised on its own has no tool and no request behind it,
     # so it fans out to every channel there is;
     # the dispatcher drops any the symbiot has globally disabled.
+    # suppress_when_present because this is a pure courtesy nudge:
+    # if the symbiot is watching the shell, the live /inbox poll already surfaces this record in front of them,
+    # so the out-of-app channels are held rather than doubling up on something on the screen.
     notification = notify.Notification(title="The Joy", body=body, pointer="/inbox")
-    notify.dispatch(pool, symbiot_id, notification, list(notify.ALL_CHANNELS))
+    notify.dispatch(pool, symbiot_id, notification, list(notify.ALL_CHANNELS), suppress_when_present=True)
     return missive_id

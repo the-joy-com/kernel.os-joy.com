@@ -50,6 +50,7 @@ from core import protocol
 from services.adapters import email_client
 from services.adapters import push
 from services.memory import notification_prefs
+from services.memory import presence
 
 log = logs.get("notify")
 
@@ -63,6 +64,16 @@ log = logs.get("notify")
 # Sorted, so the set reads the same wherever it is spelled out.
 Channel = Literal["email", "web_push"]
 ALL_CHANNELS: tuple[Channel, ...] = ("email", "web_push")
+
+# The channels that reach the symbiot somewhere other than the shell they may be looking at —
+# an email in a mailbox, a push on a device surface.
+# Both current channels are out-of-app; there is no in-app channel here,
+# because the in-app reach isn't a push at all — it's the shell's own /inbox poll pulling the record.
+# This is the set a courtesy fan-out holds back when the symbiot is present (see dispatch):
+# a nudge somewhere else is pure redundancy for a record already surfacing on the screen they're watching.
+# Kept as its own name rather than reusing ALL_CHANNELS,
+# so that adding a genuine in-app channel later narrows this set without touching the fan-out.
+OUT_OF_APP_CHANNELS: frozenset[Channel] = frozenset({"email", "web_push"})
 
 
 @dataclass(frozen=True)
@@ -84,18 +95,38 @@ class Notification:
     pointer: str
 
 
-def dispatch(pool, symbiot_id: int, notification: Notification, channels: list[Channel]) -> None:
+def dispatch(
+    pool,
+    symbiot_id: int,
+    notification: Notification,
+    channels: list[Channel],
+    *,
+    suppress_when_present: bool = False,
+) -> None:
     """Fan a notification to a symbiot across the given channels — the one entry point every caller uses.
 
     The caller decides the channels:
     the reminder passes what the symbiot asked for
     (or its whole supported set when they asked for nothing);
     a missive raised on its own passes ALL_CHANNELS.
-    Whatever comes in, two silent filters narrow it before anything is sent —
+    Whatever comes in, three silent filters narrow it before anything is sent —
     a channel that isn't real is dropped,
-    and one the symbiot has globally disabled is skipped —
+    one the symbiot has globally disabled is skipped,
+    and — only when the caller opts in with suppress_when_present —
+    the out-of-app channels are held while the symbiot is actively watching the shell —
     so "email only" against a disabled email reaches no one rather than erroring,
     and an unknown slug can never reach a sender.
+    suppress_when_present is the courtesy switch,
+    and it belongs only to an unrequested fan-out:
+    a missive the kernel raised on its own passes it,
+    because when the symbiot is present,
+    the live /inbox poll is already surfacing the record in front of them,
+    so an email or a push is a redundant ping for something on the screen.
+    An explicit request — a reminder the symbiot set to email them at nine — passes it off (the default),
+    because that channel is an intent, not a courtesy,
+    and "you happened to be here" is no reason to eat it.
+    Presence is only read when the switch is on,
+    so the reminder path pays nothing for a signal it doesn't use.
     Each channel send is best-effort and isolated:
     a channel that fails (or has nothing to reach) is logged and stepped over,
     never raised into the sweep or worker that called this,
@@ -108,9 +139,16 @@ def dispatch(pool, symbiot_id: int, notification: Notification, channels: list[C
         return
     with pool.connection() as conn:
         disabled = notification_prefs.disabled_channels(conn, symbiot_id)
+        # Read presence only for a fan-out that opted into the courtesy;
+        # the reminder path skips the query entirely.
+        present = suppress_when_present and presence.is_active(conn, symbiot_id)
     for channel in requested:
         if channel in disabled:
             continue  # globally turned off by the symbiot — never fired, silently
+        if present and channel in OUT_OF_APP_CHANNELS:
+            # The symbiot is watching the shell; the live inbox poll is the delivery,
+            # so this out-of-app nudge is held rather than doubling up on a record already on screen.
+            continue
         try:
             _SENDERS[channel](pool, symbiot_id, notification)
         except Exception:
@@ -130,7 +168,7 @@ def _send_web_push(pool, symbiot_id: int, notification: Notification) -> None:
     all the web-push detail the dispatcher stays clear of.
     kind keeps the shell's routing vocabulary
     (protocol.TRAFFIC_WAITING, the inbox-traffic family),
-    now with the real title and body riding under it
+    now with the real title and body riding under it,
     and the pointer as the url to open.
     """
     payload = {
@@ -151,12 +189,12 @@ def _send_email(pool, symbiot_id: int, notification: Notification) -> None:
     and sends the title as the subject
     and the body followed by a link to open The Joy —
     since an email has nowhere to poll back to,
-    the mail is the delivery, and the link is how the symbiot crosses from it to the shell to act.
+    the mail is the delivery,
+    and the link is how the symbiot crosses from it to the shell to act.
     The client is built per send from config,
     the same stance push takes with its signer:
     notifications are infrequent,
-    so a fresh, stateless client is cheaper to reason about
-    than one held across the process.
+    so a fresh, stateless client is cheaper to reason about than one held across the process.
     """
     if not config.GMAIL_CREDENTIALS_FILE or not config.GMAIL_SENDER:
         return

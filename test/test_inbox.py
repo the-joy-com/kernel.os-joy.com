@@ -9,8 +9,11 @@ intake — it has no question and no walk to an answer — so the worker never s
 /answers can't reach one. Everything runs against the test database.
 """
 
+from core import config
 from core import db
+from services.adapters import email_client
 from services.memory import intake
+from services.memory import presence
 from services.loop import missive
 from conftest import SYMBIOT_EMAIL, extract_code
 
@@ -80,6 +83,35 @@ def test_deliver_records_the_missive_so_inbox_surfaces_it(client, fake_email):
     assert _row(missive_id)[1] == "reaching out"  # body persisted
     messages = client.get("/inbox", headers=_auth(token)).json()["data"]["messages"]
     assert messages == [{"id": missive_id, "body": "reaching out"}]
+
+
+def test_deliver_holds_the_email_nudge_when_the_symbiot_is_present(client, fake_email, monkeypatch):
+    # deliver fans a missive out as a courtesy (suppress_when_present=True). With the symbiot actively watching
+    # the shell, the out-of-app nudge is held — the live /inbox poll is already the delivery — so no email is
+    # sent, yet the durable record stands and /inbox surfaces it. The guarantee is untouched; only the redundant
+    # ping is spared.
+    monkeypatch.setattr(config, "GMAIL_CREDENTIALS_FILE", "/dev/null")
+    monkeypatch.setattr(config, "GMAIL_SENDER", "joy@example.com")
+    emails = []
+
+    class _Recorder:
+        def __init__(self, *args):
+            pass
+
+        def send(self, to, subject, body):
+            emails.append((to, subject, body))
+
+    monkeypatch.setattr(email_client, "GmailEmailClient", _Recorder)
+    token = _token(client, fake_email)
+    sid = _symbiot_id()
+    with db.get_pool().connection() as conn:
+        presence.mark_seen(conn, sid)  # the symbiot is watching the shell right now
+
+    missive_id = missive.deliver(db.get_pool(), sid, "reaching out")
+
+    assert emails == []  # held — a nudge for a record already on their screen
+    messages = client.get("/inbox", headers=_auth(token)).json()["data"]["messages"]
+    assert messages == [{"id": missive_id, "body": "reaching out"}]  # the record still stands
 
 
 # --- /inbox: discovery ----------------------------------------------------------------
