@@ -239,11 +239,36 @@ def test_fold_crosses_the_boundary_as_a_schema_not_free_text(monkeypatch):
     out = conversation.fold(
         "summary so far",
         [conversation.Turn(role="symbiot", text="hello", created_at=datetime(2026, 7, 1, tzinfo=timezone.utc))],
+        "UTC",
     )
 
     assert out == "the merged paragraph"
     assert seen["schema"] is conversation._FoldReply
     assert seen["model"] == conversation.config.CONVERSATION_COMPRESS_MODEL
+
+
+def test_fold_stamps_each_turn_with_its_local_date_and_time(monkeypatch):
+    # The core of the temporal-integrity fix: the fold used to strip the timestamp and hand a bare
+    # speaker: text, so distinct-time statements melted into one timeless paragraph. Now each turn
+    # reaches the model prefixed with its local date and time, read in the symbiot's zone, and the
+    # prompt asks the model to hold that order — so ordering can survive the compression.
+    seen = {}
+
+    def _capture(prompt, schema, *, model=None, context=None):
+        seen["prompt"] = prompt
+        return schema(summary="merged")
+
+    monkeypatch.setattr(conversation.llm, "generate_json", _capture)
+
+    # 20:30 UTC on a Tuesday is 22:30 the same day in Paris — the stamp must read the human's clock,
+    # not the server's, and carry the full date so a turn cannot land in the wrong week.
+    conversation.fold(
+        None,
+        [conversation.Turn(role="symbiot", text="hello", created_at=datetime(2026, 7, 14, 20, 30, tzinfo=timezone.utc))],
+        "Europe/Paris",
+    )
+
+    assert "[Tue 14 Jul 2026, 22:30] The human symbiot: hello" in seen["prompt"]
 
 
 def test_fold_reply_rejects_an_empty_summary():

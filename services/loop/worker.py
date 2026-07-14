@@ -181,7 +181,11 @@ def _compress_one() -> bool:
             # the guard is defence against a boundary edge case, leaving nothing written and the lock released on exit.
             if not turns:
                 return False
-            merged = conversation.fold(gist[0] if gist is not None else None, turns)
+            # The fold stamps each turn with its local time,
+            # so it reads the symbiot's zone the same way the reply path does —
+            # the clock is what lets temporal ordering survive the compression.
+            zone_name = zone.of(conn, symbiot_id)
+            merged = conversation.fold(gist[0] if gist is not None else None, turns, zone_name)
             conversation.record_gist(conn, symbiot_id, merged, new_cutoff)
     return True
 

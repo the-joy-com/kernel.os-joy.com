@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field, create_model
 from core import config
 from services.adapters import embedding
 from services.adapters import llm
+from services.adapters import models
 
 # The three bands the top re-rank score falls into, deciding what happens to the concept.
 REUSE = "reuse"  # a clear enough fit: link the fact to that existing type
@@ -335,7 +336,12 @@ def mint(conn, fact_text: str, ranked: list[Ranked]) -> int:
         so the database, not our timing, lets exactly one win and the loser reuses the winner's row.
     """
     context = ranked[:MINT_CONTEXT]
-    reply = llm.generate_json(_mint_prompt(fact_text, context), _mint_reply_model(context))
+    # Minting is the router's one generative call,
+    # so it runs on its own MID-tier role rather than the SMALL-tier default the classification calls take —
+    # the definition it coins is permanent vocabulary.
+    reply = llm.generate_json(
+        _mint_prompt(fact_text, context), _mint_reply_model(context), model=models.role_name("mint")
+    )
 
     # The model named a type that already exists: reuse it rather than mint a twin,
     # and return before embedding — the vector we would compute is for a row we will never write.

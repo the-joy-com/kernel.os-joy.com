@@ -450,7 +450,7 @@ def test_generate_json_sends_the_fixed_flags_and_validates(monkeypatch):
     out = llm.generate_json("some prompt", _Scored)
 
     assert isinstance(out, _Scored) and out.score == 0.5
-    assert fake.captured["json"]["reasoning_effort"] == "none"  # thinking off
+    assert fake.captured["json"]["reasoning_effort"] == llm._reasoning_effort(llm.models.role_name("rerank"))  # thinking off, the per-model value
     assert _schema(fake) == _Scored.model_json_schema()  # the caller's model bound the decoder
     assert fake.captured["json"]["temperature"] == 0  # deterministic for a scored judgment
     assert fake.captured["base_url"] == llm.config.SCALEWAY_API_BASE_URL

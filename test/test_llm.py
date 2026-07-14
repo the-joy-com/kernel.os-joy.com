@@ -138,7 +138,7 @@ def test_generate_returns_free_text_with_no_schema_grammar(monkeypatch):
 
     assert out == "here is a warm reply"
     assert "response_format" not in fake.captured["json"]  # free prose, unconstrained by a schema
-    assert fake.captured["json"]["reasoning_effort"] == "none"  # thinking off, Scaleway's documented way
+    assert fake.captured["json"]["reasoning_effort"] == llm._reasoning_effort(llm.models.role_name("rerank"))  # thinking off, the per-model value for whichever model the default resolves to
     assert fake.captured["json"]["stream"] is False
     assert fake.captured["json"]["temperature"] == 0  # sampling pinned, not left to the provider's default
     assert fake.captured["json"]["max_tokens"] == llm.models.BUILTIN_MODELS["glm-5.2"].max_output_tokens  # the reply's runaway guard
@@ -152,6 +152,16 @@ def test_generate_raises_on_empty_response(monkeypatch):
 
     with pytest.raises(RuntimeError):
         llm.generate("say something")
+
+
+def test_reasoning_effort_is_per_model_and_thinking_off():
+    # Thinking is off on every Scaleway call, but the value differs by model:
+    # glm-5.2 accepts "none" and emits no trace,
+    # while gpt-oss rejects "none" with a 400 (its floor is "low") and still emits no trace at "low",
+    # so the value sent is always one the model accepts and a 400 on the effort field is impossible.
+    assert llm._reasoning_effort("glm-5.2") == "none"
+    assert llm._reasoning_effort("gpt-oss-120b") == "low"
+    assert llm._reasoning_effort("gpt-oss-20b") == "low"
 
 
 # --- the context-budget guard (_fit) -------------------------------------------------------

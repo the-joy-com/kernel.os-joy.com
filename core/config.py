@@ -1,6 +1,7 @@
 """Configuration: every environment-sourced value the kernel reads, in one place.
 
-`.env` is loaded once here so the rest of the code reads plain module-level constants and never touches `os.environ` directly.
+`.env` is loaded once here so the rest of the code reads plain module-level constants
+and never touches `os.environ` directly.
 The same `.env` file is read identically on a dev box and on the server —
 only the values differ (see .env.example for the local-vs-server database URL, in particular).
 """
@@ -76,7 +77,8 @@ OTP_FILE = os.getenv("OTP_FILE", os.path.join(_REPO_ROOT, "OTP.txt"))
 
 # Lifetimes for the two short-lived secrets.
 # Codes are deliberately brief;
-# a session lasts a day — long enough that the shell needn't re-ask for a login on every reload,
+# a session lasts a day —
+# long enough that the shell needn't re-ask for a login on every reload,
 # short enough that a forgotten open tab doesn't stay authed indefinitely.
 LOGIN_CODE_TTL_SECONDS = 10 * 60
 SESSION_TTL_SECONDS = 24 * 60 * 60
@@ -101,7 +103,8 @@ RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").strip().lower() not
 )
 
 # The intake worker (worker.py): the background loop that answers received messages.
-# On by default; the test suite turns it off so it can't race the suite for received rows while the state machine is driven by hand.
+# On by default;
+# the test suite turns it off so it can't race the suite for received rows while the state machine is driven by hand.
 WORKER_ENABLED = os.getenv("WORKER_ENABLED", "true").strip().lower() not in (
     "0",
     "false",
@@ -142,7 +145,8 @@ MAX_INTAKE_ATTEMPTS = int(os.getenv("MAX_INTAKE_ATTEMPTS", "3"))
 # The private key is the raw 32-octet scalar in base64url;
 # the public application server key the browser subscribes with is derived from it at runtime (push.py),
 # so only the private half is configured here.
-# Unset means push is simply off: answers still store and /answers still serves them,
+# Unset means push is simply off:
+# answers still store and /answers still serves them,
 # only the out-of-band nudge is skipped —
 # so a missing key degrades the reply channel to poll-on-open rather than breaking anything.
 VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
@@ -163,7 +167,8 @@ SHELL_URL = os.getenv("SHELL_URL", "https://shell.os-joy.com").strip().rstrip("/
 # so a fresh last_seen_at means someone is looking at the screen.
 # This window is that cadence plus slack for a missed beat or a slow request,
 # so a single dropped poll doesn't flip a watching symbiot to absent.
-# It gates only a courtesy: when present, a missive's out-of-app nudge is held
+# It gates only a courtesy:
+# when present, a missive's out-of-app nudge is held,
 # because the live poll is already surfacing the record in front of them (notify.dispatch).
 # Err toward the shorter side — a too-long window suppresses a nudge someone actually needed;
 # a too-short one merely sends a redundant one to a screen they were looking at.
@@ -225,12 +230,54 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
 GENERATIVE_FALLBACK_MODEL = os.getenv("GENERATIVE_FALLBACK_MODEL", "mistral-large-latest")
 GENERATIVE_LOCAL_FALLBACK_MODEL = os.getenv("GENERATIVE_LOCAL_FALLBACK_MODEL", "qwen3.5:4b")
 
-# The generative model behind the router's judgments — re-ranking the recalled candidates,
-# and breaking the tie in the grey zone when their top score is ambiguous.
+# The three intelligence tiers behind the generative roles, each a model in the catalog (services.models).
+# A generative call is not one kind of work:
+# composing a reply the symbiot reads,
+# or folding the running conversation Gist every later reply leans on,
+# is prose held to a high bar;
+# pulling one structured decision out of a message is competent extraction;
+# and scoring recalled candidates or breaking a grey-zone tie
+# is a bounded, schema-shaped classification the write path fires several of per message.
+# So the roles map onto three tiers rather than one model, and the right model plays each:
+#   FLAGSHIP — the voice and the load-bearing memory (reply, enrich, conversation_compress);
+#   MID      — competent language and structured extraction (tool_confirm, tool_decision, mint);
+#   SMALL    — the high-volume bounded classifications (rerank and the ontology router's sub-judgments).
+# Each is a catalog name its provider answers to, looked up in the model map at call time,
+# so a provider, window, and output ceiling ride along,
+# and an operator's /models reassignment wins over these defaults.
+# The default flagship is glm-5.2 on Scaleway —
+# the capable model kept for the reply and the load-bearing memory,
+# where the quality of the words the symbiot reads matters most.
+# The two cheaper rungs both default to gpt-oss-120b on Scaleway,
+# an order of magnitude cheaper per token,
+# at near-o4-mini parity with the strict instruction-following the schema-shaped calls turn on;
+# they are named apart though they resolve to one model today,
+# so the small rung can later drop to a cheaper model
+# without dragging the middle (and mint in particular) down with it.
+FLAGSHIP_MODEL = os.getenv("FLAGSHIP_MODEL", "glm-5.2")
+MID_MODEL = os.getenv("MID_MODEL", "gpt-oss-120b")
+SMALL_MODEL = os.getenv("SMALL_MODEL", "gpt-oss-120b")
+
+# The SMALL tier's model, behind the router's judgments — re-ranking the recalled candidates,
+# breaking the grey-zone tie, and the rest of the write path's bounded classifications, which default to it.
+# It is the highest-volume, cheapest-per-call generative work, so it takes the cheap model.
 # Its provider (Scaleway, Mistral, or local Ollama) is looked up from the model map (services.models),
 # so pointing this at a local model name is the one-line rollback to on-box generation.
 # Reached with thinking off and output constrained to the caller's JSON schema (llm.py).
-RERANK_MODEL = os.getenv("RERANK_MODEL", "glm-5.2")
+RERANK_MODEL = os.getenv("RERANK_MODEL", SMALL_MODEL)
+# The MID tier's model behind minting —
+# coining a new ontology type's name and definition when nothing existing fits.
+# Alone among the router's calls it is generative, not classification:
+# it writes a definition that becomes permanent vocabulary everything downstream routes against,
+# and a bad one is wrong forever.
+# So it sits a rung above its SMALL-tier siblings (RERANK_MODEL),
+# even though the two resolve to one model today —
+# keeping mint named apart means the small rung can move to a cheaper model later
+# without dragging minting's definitions down with it.
+# It fires only when nothing fits,
+# so its volume is low and thins as the vocabulary fills.
+# Looked up in the model map like every generative model.
+MINT_MODEL = os.getenv("MINT_MODEL", MID_MODEL)
 # How long to wait on a single generative attempt, applied per tier of the fallback ladder.
 # Longer than an embedding — generation is token by token,
 # and the first call after a cold load pays the load once.
@@ -246,7 +293,8 @@ REUSE_THRESHOLD = float(os.getenv("REUSE_THRESHOLD", "0.7"))
 MINT_THRESHOLD = float(os.getenv("MINT_THRESHOLD", "0.3"))
 # The bands only make sense with the mint floor strictly below the reuse floor and both inside 0.0–1.0;
 # cross them and the grey zone vanishes and decide() tests MINT before REUSE,
-# so a fact that clearly fits an existing type gets read as a mint and a needless duplicate is coined — silently, forever.
+# so a fact that clearly fits an existing type gets read as a mint
+# and a needless duplicate is coined — silently, forever.
 # Caught at import (before the pool opens or a worker starts),
 # so a fat-fingered .env refuses to boot rather than quietly mis-filing every fact that follows.
 if not 0.0 <= MINT_THRESHOLD < REUSE_THRESHOLD <= 1.0:
@@ -255,7 +303,8 @@ if not 0.0 <= MINT_THRESHOLD < REUSE_THRESHOLD <= 1.0:
         f"got MINT_THRESHOLD={MINT_THRESHOLD}, REUSE_THRESHOLD={REUSE_THRESHOLD}"
     )
 
-# The offline duplicate garbage-collection pass (services/ontology_gc.py) that merges the semantic duplicates forward-only minting breeds —
+# The offline duplicate garbage-collection pass (services/ontology_gc.py)
+# that merges the semantic duplicates forward-only minting breeds —
 # workout_action coined Tuesday, training_session Friday.
 # GC_DISTANCE is the cosine-distance pre-filter:
 # only type pairs nearer than this are even offered to the model as possible twins.
@@ -279,33 +328,45 @@ GC_ENABLED = os.getenv("GC_ENABLED", "true").strip().lower() not in ("0", "false
 # so the point is the few that bear most on the question, not a wide net —
 # the wide, meaning-based reach is the deep second pass, not this one.
 RETRIEVAL_LIMIT = int(os.getenv("RETRIEVAL_LIMIT", "10"))
-# The generative model that composes the reply.
-# Defaults to the router's model (the primary cloud model),
-# but named apart because composing prose is a different job from the router's classification calls,
-# and it may want a different model without a code change.
-# Reached through the same fallback ladder as the router (llm.generate), thinking off;
-# the reply keeps the model's own default warmth rather than the router's temperature 0.
-REPLY_MODEL = os.getenv("REPLY_MODEL", RERANK_MODEL)
+# The generative model that composes the reply — the FLAGSHIP tier.
+# Composing prose the symbiot reads is the highest-bar generative work,
+# so it takes the flagship model,
+# named apart from the router's cheaper classification model so the two move independently.
+# Reached through the fallback ladder (llm.generate),
+# thinking off, temperature pinned to 0 like every call through that boundary,
+# so the same diary tends to reproduce the same reply.
+REPLY_MODEL = os.getenv("REPLY_MODEL", FLAGSHIP_MODEL)
 # The headroom the context-budget guard (llm._fit) keeps below a model's optimal window.
-# It covers two slacks at once: tiktoken only approximates qwen's tokeniser, so the count may run a little low,
+# It covers two slacks at once:
+# tiktoken only approximates qwen's tokeniser, so the count may run a little low,
 # and a generative call spends some of its window on the reply it produces, not just the prompt it reads.
 # A fraction of the optimal, held back from the input budget — 0.2 leaves a fifth of the window as margin.
 CONTEXT_SAFETY_MARGIN = float(os.getenv("CONTEXT_SAFETY_MARGIN", "0.2"))
 
 # Short-term conversational memory (services/conversation.py, worker.run_compression_sweep):
-# the recent back-and-forth a reply sits inside, held as a gradient — near turns verbatim, far turns folded into one running summary.
+# the recent back-and-forth a reply sits inside,
+# held as a gradient — near turns verbatim, far turns folded into one running summary.
 # Two budgets size its share of the reply model's optimal window,
-# each a fraction rather than an absolute so it "travels with" the model the way the rest of the prompt's budget does (llm._fit):
-# if a provider drops and the fallback ladder switches models, the reserved share is recomputed against whichever model answers.
+# each a fraction rather than an absolute so it "travels with" the model
+# the way the rest of the prompt's budget does (llm._fit):
+# if a provider drops and the fallback ladder switches models,
+# the reserved share is recomputed against whichever model answers.
 # In practice all three generative tiers share one optimal window (131072),
 # so the figures are stable across a fallback.
-# Neither budget caps a read — the reader carries the whole verbatim tail back to the Gist's cutoff, uncapped, so the two buckets never gap.
-# The verbatim fraction (Bucket 1) is the *trigger* the background fold fires at, and the size it trims the tail back to:
+# Neither budget caps a read —
+# the reader carries the whole verbatim tail back to the Gist's cutoff, uncapped,
+# so the two buckets never gap.
+# The verbatim fraction (Bucket 1) is the *trigger* the background fold fires at,
+# and the size it trims the tail back to:
 # it carries whole turns, word-for-word, so it is the larger.
-# The gist fraction (Bucket 2) is the *cap* on the single summary paragraph, re-compressed to this size every fold so it cannot creep upward;
-# smaller than the verbatim slice, but not tiny — it must hold the concrete facts and open threads of an ever-longer history.
-# The two, plus the persona, the diary facts, the current message, the instruction, and the output headroom, all sum to well under the window.
-# On the rare overrun, the post-hoc backstop (llm._fit) condenses the whole remembered block (diary + conversation), never the persona, the instructions, or the live message.
+# The gist fraction (Bucket 2) is the *cap* on the single summary paragraph,
+# re-compressed to this size every fold so it cannot creep upward;
+# smaller than the verbatim slice, but not tiny —
+# it must hold the concrete facts and open threads of an ever-longer history.
+# The two, plus the persona, the diary facts, the current message, the instruction, and the output headroom,
+# all sum to well under the window.
+# On the rare overrun, the post-hoc backstop (llm._fit) condenses the whole remembered block (diary + conversation),
+# never the persona, the instructions, or the live message.
 CONVERSATION_VERBATIM_BUDGET_FRACTION = float(
     os.getenv("CONVERSATION_VERBATIM_BUDGET_FRACTION", "0.25")
 )
@@ -319,13 +380,16 @@ CONVERSATION_GIST_BUDGET_FRACTION = float(
 # so a weak fold that bloats the summary or garbles a fact quietly degrades every reply that leans on it.
 # The local tier proved exactly that unreliable in practice (see the by-hand fold smoke),
 # and the symbiot lives inside the result, so quality wins over saving the metered call —
-# the fold is still background work no one waits on, and it fires only when a tail overflows, so it is far from every turn.
+# the fold is still background work no one waits on,
+# and it fires only when a tail overflows,
+# so it is far from every turn.
 # It is looked up in the model map (services.models) the same way every generative model is,
 # so pointing it back at the local name is a one-line change if the cost ever outweighs the quality.
 CONVERSATION_COMPRESS_MODEL = os.getenv("CONVERSATION_COMPRESS_MODEL", REPLY_MODEL)
-# On by default; the test suite turns it off so the live sweep can't race the suite —
-# the compression tests drive _compress_one by hand, the same stance WORKER_ENABLED,
-# GC_ENABLED, and INGEST_ENABLED take for their own background loops.
+# On by default;
+# the test suite turns it off so the live sweep can't race the suite —
+# the compression tests drive _compress_one by hand,
+# the same stance WORKER_ENABLED, GC_ENABLED, and INGEST_ENABLED take for their own background loops.
 COMPRESS_ENABLED = os.getenv("COMPRESS_ENABLED", "true").strip().lower() not in (
     "0",
     "false",
@@ -341,8 +405,10 @@ COMPRESS_SWEEP_INTERVAL_SECONDS = float(os.getenv("COMPRESS_SWEEP_INTERVAL_SECON
 # Live diary ingestion (worker.run_ingestion_sweep):
 # the background sweep that files each settled message into the diary through the write path,
 # so the store the read path leans on fills itself as messages arrive.
-# On by default; the test suite turns it off so the live sweep can't race the suite —
-# the ingestion tests drive _ingest_one by hand, the same stance WORKER_ENABLED and GC_ENABLED take.
+# On by default;
+# the test suite turns it off so the live sweep can't race the suite —
+# the ingestion tests drive _ingest_one by hand,
+# the same stance WORKER_ENABLED and GC_ENABLED take.
 INGEST_ENABLED = os.getenv("INGEST_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 # How often the ingestion sweep looks for a message to file when idle.
 # It drains back-to-back while a backlog remains;
@@ -355,21 +421,27 @@ INGEST_SWEEP_INTERVAL_SECONDS = float(os.getenv("INGEST_SWEEP_INTERVAL_SECONDS",
 # reaching into the diary by meaning (vector recall + the ontology walk out from it),
 # and, only when it adds something the fast answer didn't, sending an enriched follow-up as a missive.
 # Off the critical path, so the fast reply never waits on it.
-# On by default; the test suite turns it off so the live sweep can't race the suite —
-# the enrichment tests drive _enrich_one by hand, the same stance WORKER_ENABLED, INGEST_ENABLED, and COMPRESS_ENABLED take.
+# On by default;
+# the test suite turns it off so the live sweep can't race the suite —
+# the enrichment tests drive _enrich_one by hand,
+# the same stance WORKER_ENABLED, INGEST_ENABLED, and COMPRESS_ENABLED take.
 ENRICH_ENABLED = os.getenv("ENRICH_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 # How often the enrichment sweep looks for an answered message to reach deeper on when idle.
-# It drains back-to-back while a backlog remains; this is only the idle poll,
-# kept short so a just-answered message gets its deep pass promptly, while the exchange it follows is still fresh.
+# It drains back-to-back while a backlog remains;
+# this is only the idle poll,
+# kept short so a just-answered message gets its deep pass promptly,
+# while the exchange it follows is still fresh.
 ENRICH_SWEEP_INTERVAL_SECONDS = float(os.getenv("ENRICH_SWEEP_INTERVAL_SECONDS", "10"))
 # The generative model that gates-and-composes the enriched follow-up.
 # The same heavy hitter that composes the replies (REPLY_MODEL), not a cheap local tier:
 # the follow-up interrupts the symbiot unprompted, so it must clear a high bar to be worth sending,
 # and judging "does this genuinely add something I haven't said?" is exactly the fine call a weak model fumbles.
 # It runs off the critical path and only once per message, so the metered call is affordable.
-# Looked up in the model map (services.models) like every generative model, so pointing it at a local name is a one-line change.
+# Looked up in the model map (services.models) like every generative model,
+# so pointing it at a local name is a one-line change.
 ENRICH_MODEL = os.getenv("ENRICH_MODEL", REPLY_MODEL)
-# The deep reach's vector-recall pass (deep_retrieval.recall_facts): how many nearest diary facts the embedding search hands back.
+# The deep reach's vector-recall pass (deep_retrieval.recall_facts):
+# how many nearest diary facts the embedding search hands back.
 # The meaning-based complement to RETRIEVAL_LIMIT's lexical reach; kept modest,
 # since these plus the walked-in siblings are folded into one gate-and-compose prompt,
 # and the point is the few that bear most, not a wide net.
@@ -392,23 +464,28 @@ DEEP_RETRIEVAL_EXPANSION_LIMIT = int(os.getenv("DEEP_RETRIEVAL_EXPANSION_LIMIT",
 
 # Tool calling (services/tools.py, services/reminder.py): the seam where the loop acts rather than only speaks.
 # The catalog reconcile that syncs the store's tool descriptors to the code registry, run once at startup.
-# On by default; the test suite turns it off so startup never reaches Ollama to embed a descriptor —
+# On by default;
+# the test suite turns it off so startup never reaches Ollama to embed a descriptor —
 # the tool tests seed the catalog by hand (or reconcile with the embedding faked),
 # the same stance WORKER_ENABLED and the sweeps take for their own background work.
 TOOLS_ENABLED = os.getenv("TOOLS_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 # The generative model behind the decision call — which tool a message is asking for, and its arguments.
-# A routing-and-extraction judgment, the same kind of call the ontology router makes,
-# so it defaults to the router's model (RERANK_MODEL) rather than the reply's;
+# A routing-and-extraction judgment:
+# more than the router's bounded classifications, less than composing prose,
+# so it is the MID tier,
 # reached with thinking off and output held to the flat decision schema (llm.generate_json).
 # Looked up in the model map like every generative model.
-TOOL_DECISION_MODEL = os.getenv("TOOL_DECISION_MODEL", RERANK_MODEL)
+TOOL_DECISION_MODEL = os.getenv("TOOL_DECISION_MODEL", MID_MODEL)
 # The generative model that composes the confirmation the human sees —
-# prose in the symbiot's voice, speaking the tool's result, so it defaults to the reply's model (REPLY_MODEL).
-# Reached free-text (llm.generate).
-TOOL_CONFIRM_MODEL = os.getenv("TOOL_CONFIRM_MODEL", REPLY_MODEL)
+# prose in the symbiot's voice, speaking the tool's result.
+# It is the MID tier: real language, but a bounded factual read-back of a known result
+# rather than the open composition the reply is,
+# so it sits a rung below the flagship. Reached free-text (llm.generate).
+TOOL_CONFIRM_MODEL = os.getenv("TOOL_CONFIRM_MODEL", MID_MODEL)
 # The catalog recall's gate (tools.search_catalog):
 # the cosine distance under which a tool's descriptor is near enough to a message to be a candidate.
-# Coarse recall — set generously so a real ask is never missed, since the decision call is the precision that follows;
+# Coarse recall — set generously so a real ask is never missed,
+# since the decision call is the precision that follows;
 # the lexical match catches an obvious phrasing regardless of distance,
 # so this is the meaning-based half of the two-signal gate.
 TOOL_RECALL_MAX_DISTANCE = float(os.getenv("TOOL_RECALL_MAX_DISTANCE", "0.6"))
@@ -420,7 +497,8 @@ TOOL_RECALL_LIMIT = int(os.getenv("TOOL_RECALL_LIMIT", "5"))
 TOOL_RECALL_EF_SEARCH = int(os.getenv("TOOL_RECALL_EF_SEARCH", "100"))
 
 # The reminder firing sweep (worker.run_reminder_sweep): the loop that delivers due reminders as missives.
-# On by default; the test suite turns it off so the live sweep can't race the suite for the reminder table —
+# On by default;
+# the test suite turns it off so the live sweep can't race the suite for the reminder table —
 # the reminder tests drive _fire_one by hand, the same stance the other sweeps take.
 REMINDER_ENABLED = os.getenv("REMINDER_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 # How often the firing sweep looks for a due reminder when idle.

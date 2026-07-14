@@ -164,7 +164,7 @@ def test_confirm_same_kind_reads_both_definitions(monkeypatch):
     prompt = _prompt(fake)
     assert "workout_action" in prompt and "physical training" in prompt
     assert "training_session" in prompt and "a training bout" in prompt
-    assert fake.captured["json"]["reasoning_effort"] == "none"  # thinking off
+    assert fake.captured["json"]["reasoning_effort"] == llm._reasoning_effort(llm.models.role_name("rerank"))  # thinking off, the per-model value
     assert _schema(fake) == ontology_gc._SameKindReply.model_json_schema()
 
 
@@ -188,7 +188,7 @@ def test_pick_survivor_offers_the_cluster_names_and_returns_the_id(monkeypatch):
     assert ontology_gc.pick_survivor(types) == 7
     prompt = _prompt(fake)
     assert "workout_action" in prompt and "training_session" in prompt
-    assert fake.captured["json"]["reasoning_effort"] == "none"  # thinking off
+    assert fake.captured["json"]["reasoning_effort"] == llm._reasoning_effort(llm.models.role_name("rerank"))  # thinking off, the per-model value
 
 
 def test_pick_survivor_rejects_a_name_outside_the_cluster(monkeypatch):

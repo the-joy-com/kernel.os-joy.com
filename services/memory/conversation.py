@@ -102,6 +102,14 @@ class Conversation:
     tail: list[Turn]
 
 
+def _dated_stamp(created_at: datetime, zone_name: str) -> str:
+    # The fold's stamp: local weekday, full date, and clock (e.g. "Mon 14 Jul 2026, 21:10"), read in the symbiot's zone.
+    # Where the verbatim tail's _stamp drops the date on purpose — it is recent, and the prompt's "now" supplies month and year —
+    # the Gist spans arbitrary stretches, with turns days or weeks apart folded in one pass,
+    # so a bare weekday there is ambiguous and the date has to ride on every line to pin each turn to the right week.
+    return zone.local(created_at, zone_name).strftime("%a %d %b %Y, %H:%M")
+
+
 def _speaker(role: str) -> str:
     # The tag each turn wears in the prompt, so the exchange reads top-to-bottom as it happened.
     # The machine reads these as a transcript of itself and the human it lives with.
@@ -171,7 +179,7 @@ class _FoldReply(BaseModel):
     summary: str = Field(min_length=1)
 
 
-def fold(gist_text: str | None, turns: list[Turn]) -> str:
+def fold(gist_text: str | None, turns: list[Turn], zone_name: str) -> str:
     """Merge the current Gist and the overflowed turns into one fresh summary paragraph.
 
     The fold *re-compresses* rather than accumulates:
@@ -181,6 +189,13 @@ def fold(gist_text: str | None, turns: list[Turn]) -> str:
     keeping the concrete facts and dropping the redundancy —
     the Gist is what a later reply reads back through once a turn has aged out of the verbatim tail,
     so its quality is load-bearing and worth the metered call, even though the fold itself is background work no one waits on.
+
+    Each turn is handed to the model stamped with the local date and time it was said (_dated_stamp, in zone_name),
+    the same clock every other render of these turns already wears — where the fold alone used to strip it
+    and hand a bare speaker: text, which is why distinct-time statements melted into one timeless paragraph.
+    The prompt asks the model to hold the order those stamps give and to keep the time-anchor on any fact whose time matters,
+    so temporal ordering survives the compression and still reads as a sequence when this Gist seeds the next fold
+    rather than eroding a little further every pass.
 
     The merge crosses the LLM boundary as a validated _FoldReply, not free text (llm.generate_json):
     the summary is the model's only emittable field, so conversational filler — a "Here is the summary:" preamble,
@@ -197,19 +212,27 @@ def fold(gist_text: str | None, turns: list[Turn]) -> str:
     the cap is a guarantee, the same way llm._summarise already makes it for the diary facts.
     """
     target = gist_budget()
-    transcript = "\n".join(f"{_speaker(t.role)}: {t.text}" for t in turns)
+    transcript = "\n".join(
+        f"[{_dated_stamp(t.created_at, zone_name)}] {_speaker(t.role)}: {t.text}" for t in turns
+    )
     context = (
         f"Summary so far:\n{gist_text or _NO_PRIOR_GIST}\n\n"
         f"Newer turns to fold in:\n{transcript}"
     )
     prompt = (
-        "You keep a running summary of a conversation between you and the human symbiot you "
-        "live in symbiosis with. Below is the summary so far, then the newer turns that have "
-        f"aged out of the verbatim record. Merge them into one fresh summary of at most about "
-        f"{target} tokens: keep every concrete fact, name, date, decision, and open thread; "
-        "drop only redundancy and small talk; write it as continuous prose in the past tense, "
-        "not a list. Put the summary in the `summary` field — its prose only, with no preamble, "
-        "heading, or code fence.\n\n"
+        "You keep a running summary of a conversation between you and the human symbiot "
+        "you live in symbiosis with. Below is the summary so far, "
+        "then the newer turns that have aged out of the verbatim record — "
+        "each prefixed in brackets with the human's local date and time it was said. "
+        f"Merge them into one fresh summary of at most about {target} tokens: "
+        "keep every concrete fact, name, date, decision, and open thread; "
+        "hold events in the order they happened "
+        "and keep the time (day, or day and hour) on any fact whose timing matters, "
+        "so a later reader can still tell what came before what and what has since changed; "
+        "drop only redundancy and small talk; "
+        "write it as continuous prose in the past tense, not a list. "
+        "Put the summary in the `summary` field — "
+        "its prose only, with no preamble, heading, or code fence.\n\n"
         f"{context}"
     )
     reply = llm.generate_json(

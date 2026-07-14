@@ -120,11 +120,23 @@ class Model:
 # and the fallback the resolver falls back to when the store carries no row for a name —
 # so a spawned child that hasn't loaded the store,
 # or a boot before the seed runs, still resolves a builtin rather than nothing.
-# The generative windows are each the model's *optimal*,
-# deliberately below the advertised maximum:
-# glm-5.2 and mistral-large-latest both advertise ~256K but recall frays past roughly half that,
-# so 131072 (128K) is held for each —
-# the same figure qwen3.5:4b (advertised ~262K) carries.
+#
+# The generative roles map onto three tiers (see the tier constants in core/config.py),
+# and the models here are what those tiers default to:
+#   flagship — glm-5.2 on Scaleway, the capable model kept for the reply and the load-bearing memory;
+#   the two cheaper rungs — gpt-oss-120b on Scaleway, an order of magnitude cheaper per token;
+#   and each rung's cross-cloud fallback on Mistral — mistral-large-latest, mistral-small-latest, ministral-8b-latest —
+#   with qwen3.5:4b the single local floor beneath them all, the rollback target reached when both clouds are down.
+#
+# The context windows are each the model's *optimal*,
+# deliberately below the advertised maximum,
+# because a model reads well across only about half the window it will accept —
+# NVIDIA's RULER and its successors find recall frays past that, with no error to show for it.
+# The models advertising ~256K — glm-5.2, mistral-large-latest, mistral-small-latest — are held at 131072 (128K);
+# gpt-oss-120b and ministral-8b-latest, whose native window *is* 128K, are held at half again — 65536 —
+# past which a 128K model's own recall frays.
+# Each Mistral fallback sits at or above the window of the Scaleway primary it catches,
+# so a prompt fitted for the primary can never overflow the model that inherits it when the ladder falls.
 # The output ceiling works the opposite way to the window:
 # it isn't an optimal below a degradation point
 # (a reply doesn't get worse because we let it run longer),
@@ -138,27 +150,27 @@ class Model:
 #     but Scaleway hard-caps max_completion_tokens at 16384 for it
 #     (its 5-minute-response rule),
 #     and a request over that is a 400 we would never fall through —
-#     so 16384 is the true ceiling;
-#   mistral-large-latest enforces no request-time output cap at all
-#     (it accepts an absurd max_tokens and just stops when done),
+#     so 16384 is the true ceiling, and the other Scaleway generative models are held to the same verified cap;
+#   the Mistral models enforce no request-time output cap at all
+#     (they accept an absurd max_tokens and just stop when done),
 #     so the guard there is entirely ours to set;
 #   qwen3.5:4b caps output only through Ollama's num_predict, unbounded by default.
-# 16384 is Scaleway's verified maximum,
-# and the same figure is held for the other two
+# 16384 is held across the whole generative catalog,
 # so a fallback never truncates a reply shorter than the primary would have given —
-# one ceiling across all three, at the highest the most-constrained tier allows,
-# the way the shared window lets a prompt fitted for one tier fit them all.
+# one ceiling at the highest the most-constrained tier allows.
 # The keys are the exact ids each provider answers to:
-# "glm-5.2" is Scaleway's Generative APIs id
-# (not the "zai-org/GLM-5.2" the model card uses),
-# and "mistral-large-latest" is Mistral's own web-API id.
+# "glm-5.2" is Scaleway's Generative APIs id (not the "zai-org/GLM-5.2" the model card uses),
+# and the Mistral names are Mistral's own web-API ids.
 # nomic-embed-text is the embedder, not a generative model —
 # it caps its own input via num_ctx (embedding.py) and never generates a reply,
 # so its windows are listed for the catalog's completeness (0 output — never consulted)
 # but are not the budget guard's concern.
 BUILTIN_MODELS = {
     "glm-5.2": Model("scaleway", "glm-5.2", 131072, 16384),
+    "gpt-oss-120b": Model("scaleway", "gpt-oss-120b", 65536, 16384),
+    "ministral-8b-latest": Model("mistral", "ministral-8b-latest", 65536, 16384),
     "mistral-large-latest": Model("mistral", "mistral-large-latest", 131072, 16384),
+    "mistral-small-latest": Model("mistral", "mistral-small-latest", 131072, 16384),
     "nomic-embed-text": Model("ollama", "nomic-embed-text", 8192, 0),
     "qwen3.5:4b": Model("ollama", "qwen3.5:4b", 131072, 16384),
 }
@@ -177,6 +189,7 @@ BUILTIN_MODELS = {
 BUILTIN_ROLES = {
     "reply": config.REPLY_MODEL,
     "rerank": config.RERANK_MODEL,
+    "mint": config.MINT_MODEL,
     "enrich": config.ENRICH_MODEL,
     "tool_decision": config.TOOL_DECISION_MODEL,
     "tool_confirm": config.TOOL_CONFIRM_MODEL,

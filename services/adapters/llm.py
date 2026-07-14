@@ -25,8 +25,8 @@ so it surfaces at once rather than falling through to a provider that would fail
 Four call settings are fixed here so no caller has to remember them:
 thinking is off —
 every call is a fast judgment or a reply the symbiot is waiting on, not a problem that wants a visible reasoning trace —
-so GLM's reasoning is disabled with Scaleway's documented `reasoning_effort="none"`,
-Mistral Large has no trace to suppress, and the Ollama tier keeps `think=False`;
+so on Scaleway reasoning is turned down per model (GLM and Qwen accept `reasoning_effort="none"`, gpt-oss its floor `"low"`, which still returns no trace for these bounded calls; see _reasoning_effort),
+the Mistral tier has no trace to suppress, and the Ollama tier keeps `think=False`;
 the output is held to the shape the caller demands —
 `generate_json` hands its Pydantic model through each SDK's structured-output `parse` helper,
 which binds the decoder to that model's schema, and validates the reply back through the same model,
@@ -81,14 +81,29 @@ class _Outage(Exception):
     and is left to propagate so it surfaces rather than being masked by a fall-through."""
 
 
+def _reasoning_effort(model_name: str) -> str:
+    """The reasoning_effort to send Scaleway for this model — always a value its schema accepts.
+
+    Scaleway's Generative APIs take one of 'none' | 'low' | 'medium' | 'high',
+    and every call here wants thinking off:
+    a fast judgment, or a reply the symbiot is waiting on, not a visible reasoning trace.
+    Most models accept 'none' and emit no trace;
+    gpt-oss is the exception — it rejects 'none' with a 400 (its reasoning floor is 'low'),
+    but at 'low' it still returns no reasoning trace for the bounded calls made here,
+    so 'low' is its effective thinking-off.
+    Keyed by name, so the value is always one the model accepts and a 400 on the effort field is impossible.
+    """
+    return "low" if model_name.startswith("gpt-oss") else "none"
+
+
 def _scaleway(model_name: str, prompt: str, schema: type[BaseModel] | None, temperature: float | None, max_output_tokens: int | None) -> str:
     """One generative call to Scaleway through the OpenAI-compatible client Scaleway advertises.
 
     The client is built fresh per call (fork-safety for the reply's killable child) with retries off,
     so an outage fails fast to the next tier rather than the SDK burning its own retry budget first.
-    Reasoning is disabled with `reasoning_effort="none"` —
-    Scaleway's documented control for it,
-    in place of the z.ai `chat_template_kwargs`/`thinking` fields their Generative APIs explicitly do not support.
+    Reasoning is turned down through Scaleway's `reasoning_effort` (see _reasoning_effort),
+    the control their Generative APIs expose,
+    in place of the z.ai `chat_template_kwargs`/`thinking` fields those APIs explicitly do not support.
     A schema, when given, goes through the SDK's `parse` helper:
     it hands the Pydantic model over as a strict structured-output request
     (the schema carrying `additionalProperties: false` and all-required,
@@ -106,7 +121,7 @@ def _scaleway(model_name: str, prompt: str, schema: type[BaseModel] | None, temp
     request = {
         "messages": [{"role": "user", "content": prompt}],
         "model": model_name,
-        "reasoning_effort": "none",
+        "reasoning_effort": _reasoning_effort(model_name),
     }
     if temperature is not None:
         request["temperature"] = temperature

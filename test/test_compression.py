@@ -43,7 +43,7 @@ def _gists():
 def _stub_fold(monkeypatch, calls):
     # Stand in for the model call: record the prior Gist and the turns handed in,
     # and return a deterministic merged paragraph, so the sweep's boundary logic is exercised, not the LLM.
-    def fake(gist_text, turns):
+    def fake(gist_text, turns, zone_name):
         calls.append((gist_text, [(t.role, t.text) for t in turns]))
         return "FOLDED SUMMARY"
 

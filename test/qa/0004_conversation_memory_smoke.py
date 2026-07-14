@@ -55,6 +55,7 @@ import psycopg
 
 from core import config
 from core import db
+from services.loop import zone
 from services.memory import conversation
 
 # The deliberately small fold trigger: with the real turns below counting well over this, the tail is
@@ -170,7 +171,7 @@ def main() -> None:
             print(f"\n=== the fold (live {config.CONVERSATION_COMPRESS_MODEL}) ===")
             print(f"  folding {len(to_fold)} of {len(items)} turns (the oldest, past the budget); "
                   f"new cutoff → item {new_cutoff}")
-            merged = conversation.fold(gist_row[0] if gist_row is not None else None, to_fold)
+            merged = conversation.fold(gist_row[0] if gist_row is not None else None, to_fold, zone.of(conn, symbiot_id))
             conversation.record_gist(conn, symbiot_id, merged, new_cutoff)
             print(f"  the Gist it produced:\n    {merged!r}")
             assert merged and merged.strip(), "the fold produced an empty Gist"
