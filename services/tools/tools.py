@@ -377,9 +377,12 @@ def _decide_prompt(
     return (
         "You decide whether the human symbiot's message is asking you to use one of your tools, and if so, "
         "which one and with what arguments.\n\n"
-        f"For reference, the symbiot's local date and time right now is {now_local.isoformat()} ({zone_name}). "
+        f"For reference, the human symbiot's local date and time right now is "
+        f"{now_local.strftime('%Y-%m-%d %H:%M')} ({zone_name}). "
         "Resolve any time in the message against this — a relative one (\"in 20 minutes\", \"tomorrow at 9\") "
-        "and an absolute one (\"on the 14th at noon\") both become a concrete instant.\n\n"
+        "and an absolute one (\"on the 14th at noon\") both become a concrete local date and time. "
+        "Give it as the human's own wall-clock reading (for example 2026-07-14 20:05); "
+        "do not convert it to UTC, and do not attach a timezone offset.\n\n"
         f"Your tools (name — what it does):\n{tools_block}\n\n"
         f"The recent conversation, so an argument that refers back resolves:\n{tail_block}\n\n"
         f'The human symbiot just said:\n"{message}"\n\n'

@@ -18,7 +18,7 @@ When the time can't be read, it stores nothing
 and returns a result that asks the human for it,
 rather than guessing (the reactive-ambiguity law).
 Time resolution is the symbiot's, not the server's:
-a fire_at with no zone is read as the symbiot's local wall clock,
+a fire_at is read as the symbiot's local wall clock — the clock face the decision named, in their zone —
 and stored as the absolute instant that names.
 The due side is the *fire*:
 claim_due finds the oldest unfired reminder whose moment has come,
@@ -140,10 +140,20 @@ def _execute(conn, symbiot_id: int, intake_id: int, args: ReminderArgs, now_loca
     When either is missing the executor stores nothing and returns an un-effected result,
     so the confirmation asks the human instead of pretending a reminder was set
     (the reactive-ambiguity law — ask rather than guess).
-    A fire_at with no timezone is read as the symbiot's local wall clock
-    (the decision resolved it in their zone),
-    and stored as the absolute instant that names,
+    The fire_at is read as the symbiot's local wall clock —
+    the clock face the decision named, stamped with their zone —
+    whatever offset the decision may have attached to it:
+    the zone is ground truth and a model's offset is only a guess,
+    so taking the wall-clock reading and stamping the zone is right
+    whether the decision left it bare or labelled it (even mislabelled),
+    and it is stored as the absolute instant that names,
     so the due check later compares two absolute instants.
+    A resolved instant that lands at or before now is refused the same way:
+    a reminder is for the future, so a non-future time means it was read wrong —
+    the classic failure is a fire_at the decision handed back as a bare UTC reading,
+    which the local-wall-clock rule above then mis-stamps hours early —
+    and firing it the moment it is written would say the reminder back at once, uselessly,
+    so the executor asks for the time again rather than storing an instant already past.
     The write is exactly-once against the triggering message:
     ON CONFLICT (intake_id) DO NOTHING,
     so a retried message re-runs this harmlessly —
@@ -158,9 +168,15 @@ def _execute(conn, symbiot_id: int, intake_id: int, args: ReminderArgs, now_loca
                 "ask them when they want it, and what it should say if that is missing too"
             ),
         )
-    fire_at = args.fire_at
-    if fire_at.tzinfo is None:
-        fire_at = fire_at.replace(tzinfo=ZoneInfo(zone_name))
+    fire_at = args.fire_at.replace(tzinfo=ZoneInfo(zone_name))
+    if fire_at <= now_local:
+        return tools.ToolResult(
+            effected=False,
+            summary=(
+                "the human asked to be reminded, but the time came out in the past, "
+                "so it couldn't have been read right; ask them when they want it"
+            ),
+        )
     conn.execute(
         "INSERT INTO reminder (intake_id, symbiot_id, body, fire_at, channels) VALUES (%s, %s, %s, %s, %s) "
         "ON CONFLICT (intake_id) DO NOTHING",
