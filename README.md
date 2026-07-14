@@ -4,7 +4,9 @@
 
 The kernel — the privileged core behind `kernel.os-joy.com`. The server-side counterpart to the [shell](../shell.os-joy.com): where the shell is the thin user-facing input layer, the kernel does the real work — intake/release, the buffer, identity, the Dead Man's Switch — mediating World ↔ symbiot.
 
-It exposes a small HTTP surface: a health probe the shell's connectivity dot reads, a name on the door at `/`, a line-intake endpoint, the identity routes (`/login`, `/login/verify`, `/status`, `/logout`), and auto-generated API docs — see [Routes](#routes) below. Every response wears the same [envelope](#api-response-envelope). State lives in **Postgres**, reached over [psycopg](https://www.psycopg.org/) with **no ORM** — see [Database & migrations](#database--migrations).
+It exposes a small HTTP surface: a health probe the shell's connectivity dot reads, a name on the door at `/`, a line-intake endpoint, the identity routes (`/login`, `/login/verify`, `/status`, `/logout`), the model-configuration routes (`/models`), and auto-generated API docs — see [Routes](#routes) below. Every response wears the same [envelope](#api-response-envelope). State lives in **Postgres**, reached over [psycopg](https://www.psycopg.org/) with **no ORM** — see [Database & migrations](#database--migrations).
+
+> **Running it on a home box with no cloud API and no Gmail?** The kernel can run fully local — generation on your own [Ollama](https://ollama.com), login codes to a file instead of email. Jump to [Running fully local](#running-fully-local-no-cloud-api-no-gmail).
 
 ## Install & run (local)
 
@@ -80,10 +82,12 @@ So `GET /health` answers:
 | `GET /` | A name on the door — `{ "msg": "the ghost in the shell", "data": { "version": "0.0.1" } }` — so the bare host is legible instead of a 404. |
 | `GET /health` | The probe the shell's connectivity dot reads — `{ "msg": "loud and clear", "data": { "version": "0.0.1" } }`. |
 | `POST /intake` | Takes one line off the shell's prompt — body `{ "line": "<text>" }` — and acknowledges it with `{ "msg": "roger", "data": null }`. `"roger"` means *received*, not *stored*: the line is dropped (holding it in the buffer is a separate concern that layers on top of this round trip). The `line` is required, non-empty, and capped at 4096 chars; anything else is a `422`. The request shape is validated by the `IntakeRequest` DTO in [`dtos.py`](./core/dtos.py). |
-| `POST /login` | Body `{ "address": "<email>" }`. Issues a one-time code **only** on an exact match to a registered symbiot, emailing it to them; otherwise does nothing. The reply is **identical either way** — `{ "msg": "if that address is registered, a login code is on its way", "data": null }` — so it's no oracle for who's registered (an unknown address, a blank one, and a recipient-smuggling string all get the same answer, and never an email). |
+| `POST /login` | Body `{ "address": "<email>" }`. Issues a one-time code **only** on an exact match to a registered symbiot, delivering it to them — emailed when Gmail is configured, or written to `OTP.txt` on a mailboxless box (see [Running fully local](#running-fully-local-no-cloud-api-no-gmail)); otherwise does nothing. The reply is **identical either way** — `{ "msg": "if that address is registered, a login code is on its way", "data": null }` — so it's no oracle for who's registered (an unknown address, a blank one, and a recipient-smuggling string all get the same answer, and no code goes anywhere). |
 | `POST /login/verify` | Body `{ "address": "<email>", "code": "<code>" }`. Spends a valid (unconsumed, unexpired, latest-issued) code for that address's session: `{ "msg": "logged in", "data": { "token": "…", "email": "…" } }`. A wrong code answers `{ "msg": "that code didn't work — try again", "data": null }` and leaves the caller unauthed, free to retry. The address names whose code the guess is charged against: after `MAX_VERIFY_ATTEMPTS` wrong tries the database burns that code (see [Rate limiting & abuse](#rate-limiting--abuse)). |
 | `GET /status` | Reads `Authorization: Bearer <token>`. Reports `{ "data": { "authed": true, "email": "…" } }` for a live session, else `{ "data": { "authed": false, "email": null } }`. |
 | `POST /logout` | Reads `Authorization: Bearer <token>` and revokes that session. Idempotent — no token, or an already-revoked one, is a clean no-op: `{ "msg": "out", "data": { "authed": false } }`. |
+| `GET /models` | Authed (`Authorization: Bearer <token>`). Reports the model configuration — the catalog, the current role assignments, and the assignable roles — in `data`, so the shell's `/models` command opens on the current state. Box-level config, but still session-gated: only the logged-in operator sees or shapes it. Unauthed → `{ "msg": "not authenticated", "data": { "authed": false } }`. |
+| `POST /models` | Authed. One change to the model configuration — body `{ "action": "register"\|"delete"\|"assign", … }` (see the `ModelConfigRequest` DTO in [`dtos.py`](./core/dtos.py)): register/edit an operator model, delete one, or point a role at a catalog model. A successful change returns the full fresh state (`{ "msg": "models", … }`); a refused one (editing a builtin, deleting a model in use, an unknown role) returns `{ "msg": "that model change didn't take", "data": { …, "reason": "…" } }` with the state unchanged. See [Running fully local](#running-fully-local-no-cloud-api-no-gmail). |
 | `GET /docs` | Interactive API docs (Swagger UI), generated for free by FastAPI from the route signatures. `GET /redoc` and the raw `GET /openapi.json` come along with it. |
 
 ## CORS
@@ -97,7 +101,12 @@ The kernel seeds one human — **the symbiot** — from `SYMBIOT_EMAIL` at start
 - **No enumeration oracle.** `/login` issues a code *only* on an exact match to a registered address, and its reply is byte-identical whether or not a match happened. An unknown address, a blank one, or a recipient-smuggling value (`a@x, b@y`, `a@x;b@y`, `a@x.evil`, `a+b@x`, an embedded newline) all get the same reply — and no email goes to anyone.
 - **Nothing sensitive at rest.** Codes and session tokens are HMAC'd with `KERNEL_SECRET` before they touch the database, so a leaked table yields no usable code or token. Codes are single-use, short-lived, and only the latest-issued one verifies; sessions are revoked on `/logout`.
 
-Email goes out through an `EmailClient` interface ([`email_client.py`](./services/email_client.py)) — the real one sends via the **Gmail API** (see [Email (Gmail API)](#email-gmail-api)); the test suite injects a fake that records messages instead of sending, so the whole flow is exercised without credentials.
+The code reaches the human through a small `EmailClient` interface ([`email_client.py`](./services/adapters/email_client.py)), and which implementation a box uses is chosen at startup by config:
+
+- **Gmail wired** (`GMAIL_CREDENTIALS_FILE` *and* `GMAIL_SENDER` both set) → the code is emailed via the **Gmail API** (see [Email (Gmail API)](#email-gmail-api)).
+- **Neither set** → the code is written to a local file, **`OTP.txt`** at the repo root (`OTP_FILE`), and a console line signposts that a code was written and where (never the code itself). This is the mailboxless path for a fully-local box — the operator, who controls the box, reads the code straight off disk. See [Running fully local](#running-fully-local-no-cloud-api-no-gmail).
+
+Either way the `/login` reply is the same and reveals nothing; the test suite injects a fake that records messages instead, so the whole flow is exercised without credentials or a file on disk. The enumeration-safety above holds identically for both — a local file has no external observer at all.
 
 Address **format** is never validated by the kernel — only matched. A malformed address takes the same no-match path as any unknown one (no code, no email, the one canonical reply), because a `422` on "that's not a valid email" would itself be an enumeration oracle. Catching typos is the shell's job, done locally before the request is sent — a kindness that costs the kernel no safety to omit.
 
@@ -168,15 +177,94 @@ Ollama serves on `http://127.0.0.1:11434` by default, native on both local and s
 
 > **Heads-up on `nomic-embed-text`:** Ollama clips this model's context to 2048 tokens by default (its native window is 8192) and truncates *silently*, so long text must be embedded with `num_ctx: 8192` set — otherwise its tail vanishes from the vector with no error. The model also expects `search_document:` / `search_query:` task prefixes for its distances to mean anything. Both live in how the pipeline calls Ollama ([`services/embedding.py`](./services/embedding.py)), not in the schema.
 
-**Generation runs in the cloud**, on a bigger, faster model than the box can serve. Every generative call — the router's judgments (re-rank, the grey-zone gate, the GC same-kind and survivor calls, concept and time extraction) *and* the composed reply — goes through a **fallback ladder**, tried per request ([`services/llm.py`](./services/llm.py)):
+**Generation is configurable at runtime**, and can run entirely on the box or lean on the cloud — your choice, changed with a command, never a code edit. Two things drive it, and it's worth keeping them apart (they map to two database tables, migration `0019`):
 
-1. **Scaleway — `glm-5.2`** (primary), reached through the OpenAI-compatible client Scaleway advertises.
+- **The catalog** — the set of models the kernel knows how to talk to, each with the characteristics it must be driven by: its **provider** (`scaleway`, `mistral`, or `ollama`), the context **window it reads well**, and its **output ceiling**. Four ship built-in — `glm-5.2` (Scaleway), `mistral-large-latest` (Mistral), `qwen3.5:4b` (local Ollama), and `nomic-embed-text` (the embedder). You can register your own on top of these.
+- **The role assignments** — which model, out of that catalog, does each generative job: `reply` (the composed answer), `rerank` (the router's judgments), `enrich` (the follow-up gate), `tool_decision`, `tool_confirm`, and `conversation_compress`. Each role points at one catalog model.
+
+Both are **operator-editable, box-level state** (not per-symbiot — a model is a property of the machine), reached through the authed **`/models` command in the shell** (see [Running fully local](#running-fully-local-no-cloud-api-no-gmail) for the walkthrough). Both are seeded from code at boot: the built-in models are reconciled from [`services/adapters/models.py`](./services/adapters/models.py), and each role is seeded from its config default (`REPLY_MODEL`, `RERANK_MODEL`, …) *only if you haven't set it* — so a fresh box behaves exactly as before these tables existed, and your own assignments are never overwritten by a later boot.
+
+When a role points at a **cloud** model (a `scaleway` provider), the call goes through a **fallback ladder**, tried per request ([`services/llm.py`](./services/llm.py)):
+
+1. **Scaleway** (primary), reached through the OpenAI-compatible client Scaleway advertises.
 2. **Mistral — `mistral-large-latest`** (fallback), reached at Mistral's *own* web API through the official `mistralai` client — deliberately not Scaleway's Mistral, since the point is surviving Scaleway being down.
-3. **Local Ollama — `qwen3.5:4b`** (last resort), the old on-box engine, kept wired so a double cloud outage still gets an answer.
+3. **Local Ollama — `qwen3.5:4b`** (last resort), the on-box engine, kept wired so a double cloud outage still gets an answer.
 
-A call tries the primary and falls to the next tier only on an *outage-class* failure (transport error, timeout, 5xx, 429); a 4xx (a bad request, a bad key) surfaces at once rather than being masked. This crosses the kernel's former strictly-local stance on purpose: generation sends the symbiot's own diary content to an external provider, a deliberate trade for capability and speed. Pointing `RERANK_MODEL`/`REPLY_MODEL` at a local model name (via `.env`) is the one-line rollback to on-box generation.
+A cloud call tries the primary and falls to the next tier only on an *outage-class* failure (transport error, timeout, 5xx, 429); a 4xx (a bad request, a bad key) surfaces at once rather than being masked. When a role points at an **Ollama** model, there is no ladder at all — the call goes straight to your local Ollama and never touches the cloud. So **pointing every role at an Ollama model, via `/models`, is what makes generation fully local** (see below). The two fallback tiers themselves are named by `GENERATIVE_FALLBACK_MODEL` and `GENERATIVE_LOCAL_FALLBACK_MODEL`.
 
-> **Heads-up on the generative calls:** thinking is off on every one — on Scaleway with `reasoning_effort="none"` (Scaleway's documented control; the z.ai `chat_template_kwargs`/`thinking` fields their Generative APIs do *not* support), and on the Ollama fallback with `think: false`. Structured output (the router's typed JSON) goes through each SDK's official `parse` structured-output helper, which binds the decoder to the caller's Pydantic schema; temperature is 0 for the router's scored judgments and the model's own default warmth for the spoken reply. These live in how [`services/llm.py`](./services/llm.py) calls each provider, not in the schema.
+> **Heads-up on the generative calls:** thinking is off on every one — on Scaleway with `reasoning_effort="none"` (Scaleway's documented control; the z.ai `chat_template_kwargs`/`thinking` fields their Generative APIs do *not* support), and on the Ollama tier with `think: false`. Structured output (the router's typed JSON) goes through each SDK's official `parse` structured-output helper, which binds the decoder to the caller's Pydantic schema; temperature is 0 for the router's scored judgments and the model's own default warmth for the spoken reply. These live in how [`services/llm.py`](./services/llm.py) calls each provider, not in the schema.
+
+## Running fully local (no cloud API, no Gmail)
+
+The kernel can run with **no paid API and no Google Workspace** — everything on a box with an [Ollama](https://ollama.com) serving a couple of models. This is the setup for a home server that can't (or won't) reach Scaleway/Mistral for generation or Gmail for login. Embedding was always local; the two things that used to assume the cloud — **login delivery** and **generation** — are each independently switchable, and neither is a single "mode" flag. Here's the whole picture.
+
+### What actually toggles "local"
+
+There is no master switch. Local-ness is the sum of two independent config decisions (plus one thing that's always local):
+
+| Concern | What decides it | Local when… |
+| --- | --- | --- |
+| **Login code delivery** | Whether the two Gmail vars are set (`main.py` picks the client at startup) | `GMAIL_CREDENTIALS_FILE` **and** `GMAIL_SENDER` are both blank → the code is written to a file instead of emailed |
+| **Generation** | The **provider of the model each role points at** (set via `/models`) | every role points at a model whose provider is `ollama` → calls go straight to your Ollama, the cloud is never touched |
+| **Embedding** | Always local — `nomic-embed-text` on Ollama, not a toggle | always |
+
+> **Important — blanking the cloud API keys is *not* enough by itself.** The roles still *default* to `glm-5.2`, a Scaleway model, and a Scaleway call with no key returns a `401` — a `4xx`, which does **not** fall through the ladder to Ollama; it raises. To go local you must **reassign the roles to a local model** with `/models`. Blanking the keys is optional tidiness; reassigning the roles is the actual switch for generation.
+
+### Step by step
+
+1. **Install Ollama and pull the models** ([official install](https://ollama.com/download)). You always need the embedder; for generation, pull a capable local chat model (any Ollama model works — `qwen3.5:4b` ships as a built-in in the catalog, but you can register your own):
+
+   ```bash
+   ollama pull nomic-embed-text     # the embedder — required on every box
+   ollama pull qwen3.5:4b           # a local generative model (or your own choice)
+   ```
+
+2. **Start Postgres and create `.env`**, leaving the cloud and Gmail vars blank:
+
+   ```bash
+   docker compose up -d
+   cp .env.example .env
+   ```
+
+   In `.env`, set `SYMBIOT_EMAIL` (your login handle — see the note below), `KERNEL_SECRET`, and **leave these blank**:
+
+   ```bash
+   GMAIL_CREDENTIALS_FILE=          # blank → login code goes to a file, not email
+   GMAIL_SENDER=                    # blank → same
+   SCALEWAY_API_KEY=                # blank → no Scaleway (but you must still reassign roles, below)
+   MISTRAL_API_KEY=                 # blank → no Mistral
+   ```
+
+   > `SYMBIOT_EMAIL` doesn't have to be a *deliverable* address on a mailboxless box — it's just the handle you log in as. `you@localhost` is fine. It only needs to be a real mailbox if you use Gmail delivery.
+
+3. **Run the kernel** (as in [Install & run](#install--run-local)):
+
+   ```bash
+   export UV_PROJECT_ENVIRONMENT=venv
+   uv run uvicorn main:app --host 127.0.0.1 --port 9713 --reload
+   ```
+
+4. **Log in — the code lands in a file, not your inbox.** In the shell, `/login` with your `SYMBIOT_EMAIL`. Because Gmail is unconfigured, the kernel writes the one-time code to **`OTP.txt` at the kernel repo root** and logs a line saying so (the code itself is never logged, only its location). Read it off the box and type it back:
+
+   ```bash
+   cat OTP.txt          # e.g. "Your one-time login code is 42424242 …"
+   ```
+
+   `OTP.txt` is gitignored, overwritten on each `/login` (only the newest code ever stands), and the trust root is simply *access to the box* — the same as its SSH key. Point it elsewhere with `OTP_FILE` if you like.
+
+5. **Point the generative roles at your local model — this is the switch for generation.** Still in the shell, run **`/models`** (authed-only; you must be logged in). It opens on the current catalog and assignments, then loops on a prompt:
+
+   - `add` → register your local model if it isn't a built-in. A bare name is enough — `qwen3.5:4b`, or `llama3.1:8b`, etc. — and the provider defaults to `ollama` with sensible window/output defaults filled in. (You can spell out the provider, context window, and output ceiling if you want.)
+   - `assign` → point each role at your local model: assign `reply`, then `rerank`, then `enrich`, `tool_decision`, `tool_confirm`, `conversation_compress`. Assigning `qwen3.5:4b` (already a built-in) needs no `add` first.
+   - blank line → done.
+
+   Once every role points at an Ollama-provider model, every generative call goes straight to your local Ollama. Verify with `/models` again — the assignments should all name your local model. That's a fully-local symbiot: **Gmail off (→ `OTP.txt`) + all roles on Ollama (→ local generation) + embedding always local.**
+
+### What `/models` can and can't do
+
+- **Register / edit / delete your own models** freely — but the four built-ins are code-owned: you can *assign* them to roles, but not edit their characteristics (a boot reconcile would overwrite the edit) or delete them (they ship with the kernel).
+- **Delete is refused while a role still points at the model** — reassign the role first; the refusal names which roles are holding it.
+- **`nomic-embed-text` (embedding) is a hard requirement, not a role you can reassign** — its 768-dimensional vector width is what the pgvector tables are typed to, so swapping it is a full re-embed migration, not a command edit. Every box runs it as-is.
 
 ## Configuration (`.env`)
 
@@ -192,7 +280,8 @@ cp .env.example .env
 | `TEST_DATABASE_URL` | Optional; the test suite's database. Defaults to `DATABASE_URL` with a `_test` suffix. |
 | `SYMBIOT_EMAIL` | The one human allowed to log in, seeded at startup. |
 | `KERNEL_SECRET` | Server secret HMAC'ing codes + tokens. Generate with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. |
-| `GMAIL_CREDENTIALS_FILE`, `GMAIL_SENDER` | Gmail API service-account key path and the mailbox it sends as — see [Email (Gmail API)](#email-gmail-api). |
+| `GMAIL_CREDENTIALS_FILE`, `GMAIL_SENDER` | Gmail API service-account key path and the mailbox it sends as — see [Email (Gmail API)](#email-gmail-api). **Leave both blank to run mailboxless:** the login code is then written to `OTP_FILE` instead of emailed (see [Running fully local](#running-fully-local-no-cloud-api-no-gmail)). |
+| `OTP_FILE` | Override; where the login code is written when Gmail is unconfigured. Default `OTP.txt` at the repo root (gitignored). Ignored entirely when Gmail *is* configured. |
 | `LOGIN_REISSUE_INTERVAL_SECONDS` | Override; minimum gap between two issued codes for one symbiot. Default `60`. A second `/login` inside the window keeps the existing code and emails nothing. |
 | `MAX_VERIFY_ATTEMPTS` | Override; wrong guesses a single live code absorbs before the database burns it. Default `5`. |
 | `RATE_LIMIT_ENABLED` | Override; the edge limiter. Default on; set `0`/`false`/`no`/`off` to disable. |
@@ -201,11 +290,14 @@ cp .env.example .env
 | `GC_DISTANCE` | Override; the cosine-distance pre-filter the sweep uses to nominate near-twin type pairs before the model confirms them. Default `0.2`. Loosen to catch synonyms that embed further apart; the by-hand smoke (`test/qa/0002_*`) prints real distances to tune against. |
 | `SCALEWAY_API_KEY`, `SCALEWAY_API_BASE_URL` | The primary generative provider (see [Models](#models-embedding-local-and-generation-cloud-with-a-local-fallback)). Base URL defaults to `https://api.scaleway.ai/v1`. An empty key just means the primary tier can't answer and the ladder falls through to Mistral. |
 | `MISTRAL_API_KEY` | The fallback generative provider, reached at Mistral's own web API. Empty means that tier is skipped and the ladder falls through to the local Ollama model. |
-| `RERANK_MODEL`, `REPLY_MODEL` | Override; the router's and the reply's generative model. Both default to `glm-5.2` (Scaleway). Point either at a local name (e.g. `qwen3.5:4b`) to roll that path back to on-box generation. `GENERATIVE_FALLBACK_MODEL` (`mistral-large-latest`) and `GENERATIVE_LOCAL_FALLBACK_MODEL` (`qwen3.5:4b`) name the two fallback tiers. |
+| `RERANK_MODEL`, `REPLY_MODEL`, `ENRICH_MODEL`, `TOOL_DECISION_MODEL`, `TOOL_CONFIRM_MODEL`, `CONVERSATION_COMPRESS_MODEL` | Override; the **seed defaults** for each generative role's assignment. These are read *once*, to seed a role's row the first time the box boots with the `model_role` table empty; after that the assignment lives in the database and is changed with the **`/models` command**, not here (see [Models](#models-embedding-local-and-generation-cloud-with-a-local-fallback) and [Running fully local](#running-fully-local-no-cloud-api-no-gmail)). All default to `glm-5.2` (Scaleway). Setting one here only changes what a *fresh* box seeds; to change a running box, use `/models`. |
+| `GENERATIVE_FALLBACK_MODEL`, `GENERATIVE_LOCAL_FALLBACK_MODEL` | Override; the two tiers a *cloud* (`scaleway`) call falls through to on an outage — `mistral-large-latest` then `qwen3.5:4b`. Unlike the role assignments above, these are ladder mechanics, not `/models`-managed. |
 
 ## Email (Gmail API)
 
-The real `EmailClient` sends through the **Gmail API** as a Google Workspace mailbox, authenticated by a **GCP service account with domain-wide delegation** (no interactive OAuth, ideal for a headless service). The service account holds no mailbox of its own — it *impersonates* a real Workspace user (`GMAIL_SENDER`) and sends as them, using the narrow `gmail.send` scope (send only, no mailbox read). The account's JSON key lives on each box (gitignored, never committed); `GMAIL_CREDENTIALS_FILE` points at it. Until both are set the client refuses to send rather than pretend, and the test suite never needs them (it uses the fake). The Google libraries and the key are loaded lazily on the first send, so import and tests never touch them ([`email_client.py`](./services/email_client.py)).
+This is the **hosted** login-delivery path. If you're running mailboxless (a home box with no Workspace), skip this entire section — leave `GMAIL_CREDENTIALS_FILE`/`GMAIL_SENDER` blank and the code goes to `OTP.txt` instead (see [Running fully local](#running-fully-local-no-cloud-api-no-gmail)). The setup below is only for a box that *does* email the code.
+
+The Gmail `EmailClient` sends through the **Gmail API** as a Google Workspace mailbox, authenticated by a **GCP service account with domain-wide delegation** (no interactive OAuth, ideal for a headless service). The service account holds no mailbox of its own — it *impersonates* a real Workspace user (`GMAIL_SENDER`) and sends as them, using the narrow `gmail.send` scope (send only, no mailbox read). The account's JSON key lives on each box (gitignored, never committed); `GMAIL_CREDENTIALS_FILE` points at it. Until both are set the client refuses to send rather than pretend, and the test suite never needs them (it uses the fake). The Google libraries and the key are loaded lazily on the first send, so import and tests never touch them ([`email_client.py`](./services/email_client.py)).
 
 ### One-time setup
 

@@ -1,16 +1,20 @@
-"""Email delivery behind a single interface.
+"""Message delivery behind a single interface.
 
 The kernel depends on the *capability* to send a message, not on Gmail in particular —
 so the identity flow is built and tested against this interface,
 and the test suite swaps in a fake that records messages instead of putting them on the wire.
-Real delivery (GmailEmailClient) is the one piece that needs live credentials;
-everything else is exercised without them.
+Two real deliveries live here, chosen per box (main.py picks between them by config):
+GmailEmailClient puts the message on the wire and is the one piece that needs live credentials;
+FileEmailClient writes it to a local file for a mailboxless box, needing nothing external at all.
+Everything else is exercised without either.
 """
 
 import base64
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Protocol
+
+from core import logs
 
 # The narrowest scope that can send:
 # it grants sending only, not reading the mailbox.
@@ -43,6 +47,34 @@ class FakeEmailClient:
 
     def send(self, to: str, subject: str, body: str) -> None:
         self.sent.append(SentMessage(to=to, subject=subject, body=body))
+
+
+class FileEmailClient:
+    """Writes the message to a local file instead of the wire — the mailboxless box's delivery.
+
+    The kernel reaches for this when no Gmail is configured (main.py),
+    so a box with nothing but a local Ollama can still stand up:
+    login needs a code to reach a human, and here the human is the operator who owns the box,
+    so the code reaching disk *is* it reaching them — the same trust root as the box's SSH key.
+
+    Each send overwrites the file whole rather than appending:
+    the identity flow keeps only one live code per symbiot (a fresh /login overwrites the last),
+    so the file mirrors that — the newest code is the only one on disk,
+    and a stale one is never left lying around to be mistaken for current.
+    A console line signposts *that* a code was written and *where*, but never the code itself:
+    the logs are a shared stream, the file is the private drop,
+    and only the drop should ever hold the secret.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def send(self, to: str, subject: str, body: str) -> None:
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write(f"To: {to}\nSubject: {subject}\n\n{body}\n")
+        logs.get("identity").info(
+            "no mailbox configured — login code for %s written to %s (read it there)", to, self.path
+        )
 
 
 class GmailEmailClient:

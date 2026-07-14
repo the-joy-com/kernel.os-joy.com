@@ -40,6 +40,7 @@ from core import db
 from services.memory import conversation
 from services.adapters import models
 from services.loop import reply
+from services.loop import zone
 from services.memory import retrieval
 
 # A small diary with a shape worth reading back:
@@ -145,8 +146,8 @@ def main() -> None:
 
             # --- the composed reply, live -----------------------------------------------------
             # An eyeball on the budget guard: the reply's context is far under the model's optimal, so it won't fire.
-            spec = models.MODELS[config.REPLY_MODEL]
-            context_tokens = models.count_tokens(reply._render(hits))
+            spec = models.for_role("reply")
+            context_tokens = models.count_tokens(reply._render(hits, zone.DEFAULT_ZONE))
             print(f"\n=== budget headroom ===")
             print(f"  reply model optimal: {spec.optimal_context_tokens} tokens; "
                   f"retrieved-context block: {context_tokens} tokens — guard will not fire")

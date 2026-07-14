@@ -118,13 +118,13 @@ def test_decide_names_the_tool_and_extracts_its_arguments(monkeypatch):
     monkeypatch.setattr(
         tools.llm, "generate_json",
         lambda prompt, schema, *, model=None: types.SimpleNamespace(
-            tool="schedule_reminder", reminder_message="call the dentist", fire_at=fire_at
+            tool="schedule_reminder", reminder_message="call the dentist", fire_at=fire_at, channels=None
         ),
     )
     candidates = [tools.ToolCandidate("schedule_reminder", "…", 0.1)]
     decision = tools.decide("remind me to call the dentist at 9", candidates, [], fire_at, "UTC")
     assert decision.tool == "schedule_reminder"
-    assert decision.args == {"reminder_message": "call the dentist", "fire_at": fire_at}
+    assert decision.args == {"reminder_message": "call the dentist", "fire_at": fire_at, "channels": None}
 
 
 def test_decide_returns_no_tool_when_the_model_declines(monkeypatch):

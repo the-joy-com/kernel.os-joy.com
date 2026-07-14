@@ -27,14 +27,60 @@ the honest answer when there is nothing on record and nothing yet said to lean o
 from datetime import datetime
 
 from core import config
-from services.memory import conversation
-from services.adapters import llm
-from services.loop import persona
-from services.memory import retrieval
+from services.adapters import llm, models
+from services.loop import persona, zone
+from services.memory import conversation, retrieval
 
 # What the diary block reads when the librarian found nothing —
 # so the prompt always has a coherent line where the memories go, never a blank the model must puzzle over.
 _NO_FACTS = "(nothing on record that bears on this)"
+
+
+# The members below are ordered alphabetically, as far as the code allows:
+# the private helpers first in alphabetical order, then compose —
+# none of the helpers call each other, so define-before-use imposes no further constraint.
+def _compose_prompt(message: str, memory_block: str, voice: str, time_line: str | None) -> str:
+    # voice first (the persona sets who is speaking), then the framing instructions,
+    # then the symbiot's local time (when known),
+    # then the one compressible block of everything remembered (diary + Gist + verbatim tail),
+    # then the live message, then the closing instruction.
+    # Persona, instructions, time, and message bracket the memory block and are never condensed;
+    # the memory block is the only region the budget guard may touch.
+    # The time line is a small sacred fact like the persona — tiny, and shrinking it would be self-defeating —
+    # so it sits outside the compressible region,
+    # right after the framing, where the model reads it before the memory.
+    now = f"{time_line}\n\n" if time_line else ""
+    return (
+        f"{voice}\n\n"
+        "You are answering the human symbiot you live in symbiosis with. "
+        "Below is what you know that may bear on this and the conversation you are already in — "
+        "first your diary in time order, oldest entry first, then the earlier conversation summarised, then the most recent turns word-for-word. "
+        "Draw on them where they help; say nothing they don't support, and never invent a memory that isn't there; "
+        "use the recent turns to keep continuity, so a pronoun or a brief follow-up resolves against what was just said.\n\n"
+        f"{now}"
+        f"{memory_block}\n\n"
+        f'The human symbiot just said:\n"{message}"\n\n'
+        "Reply in your own voice — directly, as yourself, not as an assistant describing what it found."
+    )
+
+
+def _render(facts: list[retrieval.Fact], zone_name: str) -> str:
+    """The gathered facts as a plain block for the prompt — one dated line each, oldest first.
+
+    The librarian picks the facts by relevance, but they are rendered here in time order, oldest to newest,
+    so the block reads as the timeline it is and the model never mistakes relevance rank for recency:
+    a model reads a list top-to-bottom as a sequence whatever it is told, so the order is made to be the true one
+    rather than captioned as something to reason around. Which facts appear is still relevance's call; only their order is time's.
+    Each line leads with the fact's effective date read in the symbiot's local zone,
+    so the model can reason about when things happened, then the fact's own words verbatim.
+    The date is localised, not taken straight off the UTC column,
+    so it lands on the same calendar as the "now" the prompt states —
+    without that a fact from late evening reads as the next day, and the model compares two clocks that don't agree.
+    An empty list renders the single honest line saying nothing was found."""
+    if not facts:
+        return _NO_FACTS
+    ordered = sorted(facts, key=lambda f: f.effective_at)
+    return "\n".join(f"- [{zone.local_date(f.effective_at, zone_name).isoformat()}] {f.raw_text}" for f in ordered)
 
 
 def _render_memory(facts_block: str, gist_block: str, tail_block: str) -> str:
@@ -51,65 +97,18 @@ def _render_memory(facts_block: str, gist_block: str, tail_block: str) -> str:
     )
 
 
-def _compose_prompt(message: str, memory_block: str, voice: str, time_line: str | None) -> str:
-    # voice first (the persona sets who is speaking), then the framing instructions,
-    # then the symbiot's local time (when known),
-    # then the one compressible block of everything remembered (diary + Gist + verbatim tail),
-    # then the live message, then the closing instruction.
-    # Persona, instructions, time, and message bracket the memory block and are never condensed;
-    # the memory block is the only region the budget guard may touch.
-    # The time line is a small sacred fact like the persona — tiny, and shrinking it would be self-defeating —
-    # so it sits outside the compressible region,
-    # right after the framing, where the model reads it before the memory.
-    now = f"{time_line}\n\n" if time_line else ""
-    return (
-        f"{voice}\n\n"
-        "You are answering the human symbiot you live in symbiosis with. "
-        "Below is what you know that may bear on this and the conversation you are already in — "
-        "first your diary, then the earlier conversation summarised, then the most recent turns word-for-word. "
-        "Draw on them where they help; say nothing they don't support, and never invent a memory that isn't there; "
-        "use the recent turns to keep continuity, so a pronoun or a brief follow-up resolves against what was just said.\n\n"
-        f"{now}"
-        f"{memory_block}\n\n"
-        f'The human symbiot just said:\n"{message}"\n\n'
-        "Reply in your own voice — directly, as yourself, not as an assistant describing what it found."
-    )
+def _render_tail(tail: list[conversation.Turn], zone_name: str) -> str:
+    """The verbatim tail as a plain block — one stamped, role-tagged line per turn, oldest first.
 
-
-def _render_now(now_local: datetime, zone_name: str) -> str:
-    """The one-line local-time reference the reply reasons about time against — the human's clock, not the server's.
-
-    States the symbiot's current local date and time and its zone,
-    so a mention of the hour, a "this evening", or a "how long ago" is read in the human's day rather than UTC —
-    which is what the reply spoke in when it had no clock at all.
-    Kept to a single sentence, and held outside the compressible memory block,
-    so it is never squeezed away on an overrun."""
-    stamp = now_local.strftime("%A %d %B %Y, %H:%M")
-    return (
-        f"For reference, the human symbiot's local date and time right now is {stamp} ({zone_name}). "
-        "Reason about any mention of time — today, tonight, how long ago — in their local time, not UTC."
-    )
-
-
-def _render(facts: list[retrieval.Fact]) -> str:
-    """The gathered facts as a plain block for the prompt — one dated line each, most relevant first.
-
-    Each line leads with the fact's effective date, so the model can reason about when things happened,
-    then the fact's own words verbatim.
-    An empty list renders the single honest line saying nothing was found."""
-    if not facts:
-        return _NO_FACTS
-    return "\n".join(f"- [{f.effective_at.date().isoformat()}] {f.raw_text}" for f in facts)
-
-
-def _render_tail(tail: list[conversation.Turn]) -> str:
-    """The verbatim tail as a plain block — one role-tagged line per turn, oldest first.
-
-    Each turn is tagged with who spoke, so the exchange reads top-to-bottom as it happened.
+    Each turn leads with the local time it was said and who spoke,
+    so the exchange reads top-to-bottom as it happened
+    and the model can order things said the same day rather than guessing from how they read.
     An empty tail renders the single honest line saying the conversation has only just begun."""
     if not tail:
         return conversation._NO_TAIL
-    return "\n".join(f"{conversation._speaker(t.role)}: {t.text}" for t in tail)
+    return "\n".join(
+        f"[{conversation._stamp(t.created_at, zone_name)}] {conversation._speaker(t.role)}: {t.text}" for t in tail
+    )
 
 
 def compose(
@@ -139,12 +138,17 @@ def compose(
     simply omits the time line rather than asserting a wrong one.
     """
     voice = persona.load()
-    facts_block = _render(context)
+    # Render fact dates in the symbiot's local zone so they share the calendar the time line states;
+    # a by-hand or anon call that names no zone falls back to UTC, the old server-clock behaviour made explicit.
+    facts_block = _render(context, zone_name or zone.DEFAULT_ZONE)
     gist_block = conv.gist if conv.gist else conversation._NO_GIST
-    tail_block = _render_tail(conv.tail)
+    tail_block = _render_tail(conv.tail, zone_name or zone.DEFAULT_ZONE)
     memory_block = _render_memory(facts_block, gist_block, tail_block)
-    time_line = _render_now(now_local, zone_name) if now_local is not None and zone_name else None
+    time_line = zone.render_now(now_local, zone_name) if now_local is not None and zone_name else None
     prompt = _compose_prompt(message, memory_block, voice, time_line)
     # The whole remembered block is the compressible region — diary and conversation alike —
     # so an overrun condenses what is remembered, never the persona, the instructions, or the live message bracketing it.
-    return llm.generate(prompt, model=config.REPLY_MODEL, context=memory_block)
+    # The reply's model is resolved from the store by role (models.role_name), not read from a config constant,
+    # so an operator's reassignment through /models takes effect here — resolved in the parent and, when this
+    # runs in a spawned child, from the store the child loads for itself.
+    return llm.generate(prompt, model=models.role_name("reply"), context=memory_block)

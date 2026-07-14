@@ -50,6 +50,15 @@ os.environ["REMINDER_ENABLED"] = "0"
 # even though a dev .env might carry a VAPID key, this pins it empty
 # (load_dotenv won't override an env var already set, blank or not).
 os.environ["VAPID_PRIVATE_KEY"] = ""
+# Gmail stays unconfigured the same way and for the same reason:
+# the notification email channel builds its own client from config
+# (not the login route's injected fake),
+# so a dev .env carrying real credentials would otherwise let a sweep
+# that fires a reminder or a missive reach real Gmail.
+# Pinned empty, the email channel is off unless a test opts in
+# by monkeypatching config and swapping in a recorder (see test_notify.py).
+os.environ["GMAIL_CREDENTIALS_FILE"] = ""
+os.environ["GMAIL_SENDER"] = ""
 
 
 # The front-door lock: refuse a non-test database before the app is even imported,
@@ -91,7 +100,9 @@ import pytest
 
 from core import db
 from services import identity
+from services.adapters import models
 from services.adapters.email_client import FakeEmailClient
+from services.memory import model_config
 from main import app, get_email_client
 from core.rate_limit import limiter
 
@@ -124,13 +135,19 @@ def clean_db(client):
         _assert_test_database(conn)
         # schema_ontology and diary_facts CASCADE onto their join and per-model embedding tables;
         # embedding_model is left alone — it holds the active-model seed the migration wrote, not test data.
+        # model and model_role ARE wiped and re-seeded below: they are config, not test data, but the /models
+        # command's tests mutate them, so each test starts from the reconciled baseline rather than inheriting
+        # a prior test's edits — and the resolver cache is reloaded to match, undoing any cache write a /models
+        # POST made (models.reload_from_conn), so the two never drift for the next test.
         conn.execute(
             "TRUNCATE symbiot, login_code, session, intake, missive, reply_channel, "
             "schema_ontology, diary_facts, conversation_item, conversation_gist, enrichment, "
-            "tool_catalog, reminder "
+            "tool_catalog, reminder, notification_preference, model, model_role "
             "RESTART IDENTITY CASCADE"
         )
         conn.execute("INSERT INTO symbiot (email) VALUES (%s)", (SYMBIOT_EMAIL,))
+        model_config.reconcile_and_seed(conn)
+        models.reload_from_conn(conn)
     yield
 
 

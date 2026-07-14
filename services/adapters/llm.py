@@ -212,7 +212,7 @@ def _output_cap(override: int | None, model_name: str) -> int | None:
     budget it must fit — the truncation after it (llm._summarise) still holds the promise.
     An unmapped model has no figure, so its `override` passes through and an ordinary call is left uncapped
     (None), the historical local-Ollama default."""
-    spec = models.MODELS.get(model_name)
+    spec = models.spec(model_name)
     cap = spec.max_output_tokens if spec is not None else None
     if override is not None:
         return min(override, cap) if cap is not None else override
@@ -237,7 +237,7 @@ def _call(*, model: str, prompt: str, schema: type[BaseModel] | None = None, tem
     so neither a transport failure nor a blank answer passes as a half-read decision
     or reaches the symbiot as silence.
     """
-    spec = models.MODELS.get(model)
+    spec = models.spec(model)
     provider = spec.provider if spec is not None else "ollama"
     if provider == "scaleway":
         try:
@@ -272,7 +272,7 @@ def _fit(prompt: str, context: str | None, model_name: str) -> str:
     An over-budget prompt with no `context` to condense raises rather than being sent:
     a prompt that grew that large with nothing marked summarisable is a bug to surface, not to paper over.
     """
-    spec = models.MODELS.get(model_name)
+    spec = models.spec(model_name)
     if spec is None:
         return prompt
     budget = int(spec.optimal_context_tokens * (1 - config.CONTEXT_SAFETY_MARGIN))
@@ -321,8 +321,8 @@ def generate(prompt: str, *, model: str | None = None, context: str | None = Non
     The counterpart to generate_json for the reply the read path composes:
     prose the caller cannot — and should not — hold to a schema,
     so no `response_format` is sent and the model is free to emit natural language rather than JSON.
-    model defaults to the router's generative model (config.RERANK_MODEL);
-    the reply path passes config.REPLY_MODEL, which may point at a different model than the router's.
+    model defaults to the model assigned the router's rerank role (models.role_name("rerank"));
+    the reply path passes the model assigned its own role, which may point at a different one than the router's.
     context, when given, is the summarisable slice of `prompt` the budget guard may condense
     if the prompt overruns the model's optimal window (see _fit) — for the reply, the folded-in facts.
 
@@ -335,7 +335,7 @@ def generate(prompt: str, *, model: str | None = None, context: str | None = Non
     but it removes the avoidable variance, so each answers as consistently as it can and the same diary tends to reproduce the same reply.
     An empty response raises rather than returning a blank reply that would reach the symbiot as silence.
     """
-    model_name = model or config.RERANK_MODEL
+    model_name = model or models.role_name("rerank")
     return _call(model=model_name, prompt=_fit(prompt, context, model_name), temperature=0)
 
 
@@ -352,7 +352,7 @@ def generate_json(
     A reply that breaks the model's constraints raises here
     rather than slipping through as a half-read decision that would quietly mis-file a fact —
     the provider's schema is best-effort guidance, but this validation is the guarantee, whichever tier answered.
-    model defaults to the router's generative model (config.RERANK_MODEL);
+    model defaults to the model assigned the router's rerank role (models.role_name("rerank"));
     a caller that wants a different model passes its own.
     context, when given, is the summarisable slice of `prompt` the budget guard may condense
     if the prompt overruns the model's optimal window (see _fit); the router's prompts are bounded, so they leave it unset.
@@ -361,6 +361,6 @@ def generate_json(
     every call through here is a fast classification-style judgment,
     and sampling is pinned to temperature 0 so the same inputs score the same way twice.
     """
-    model_name = model or config.RERANK_MODEL
+    model_name = model or models.role_name("rerank")
     reply = _call(model=model_name, prompt=_fit(prompt, context, model_name), schema=schema, temperature=0)
     return schema.model_validate_json(reply)

@@ -8,6 +8,8 @@ record_utterance's own token counting is checked against models.count_tokens dir
 and the "exactly one source" invariant is checked at the database, where the schema — not the calling code — holds it.
 """
 
+from datetime import datetime, timezone
+
 import psycopg
 import pytest
 
@@ -234,7 +236,10 @@ def test_fold_crosses_the_boundary_as_a_schema_not_free_text(monkeypatch):
         raise AssertionError("fold must not use the free-text generate — meta-commentary could bleed into the Gist")
     monkeypatch.setattr(conversation.llm, "generate", _no_free_text)
 
-    out = conversation.fold("summary so far", [conversation.Turn(role="symbiot", text="hello")])
+    out = conversation.fold(
+        "summary so far",
+        [conversation.Turn(role="symbiot", text="hello", created_at=datetime(2026, 7, 1, tzinfo=timezone.utc))],
+    )
 
     assert out == "the merged paragraph"
     assert seen["schema"] is conversation._FoldReply

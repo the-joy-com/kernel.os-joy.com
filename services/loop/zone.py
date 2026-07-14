@@ -25,7 +25,7 @@ A zone name resolves to the correct offset for the instant it is read,
 which is exactly what now_for does — it is the one place a stored name becomes a concrete local moment.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import available_timezones, ZoneInfo
 
 from pydantic import BaseModel
@@ -50,6 +50,21 @@ class _ZoneReply(BaseModel):
     timezone: str | None = None
 
 
+# The members below are ordered alphabetically, as far as the code allows:
+# _infer_prompt first (infer calls it), then the rest in alphabetical order.
+def _infer_prompt(location: str) -> str:
+    return (
+        "You are given a place a person says they are in, in their own words.\n"
+        f'Place: "{location}"\n\n'
+        "Return the IANA timezone identifier for that place — for example 'Europe/Paris', "
+        "'America/New_York', 'Asia/Tokyo', 'Australia/Sydney'. Read the place out of the words even when "
+        "they are casual ('just landed in NYC' is 'America/New_York', 'back home in Strasbourg' is "
+        "'Europe/Paris').\n"
+        "If the input names no place you can turn into a timezone, return null — do not guess.\n\n"
+        'Return JSON only: {"timezone": "<IANA name>"} or {"timezone": null}.'
+    )
+
+
 def infer(location: str) -> str | None:
     """Read a place named in plain words and return its IANA timezone, or None when it can't be placed.
 
@@ -64,6 +79,34 @@ def infer(location: str) -> str | None:
     reply = llm.generate_json(_infer_prompt(location), _ZoneReply)
     name = (reply.timezone or "").strip()
     return name if name in available_timezones() else None
+
+
+def local(moment: datetime, zone_name: str) -> datetime:
+    """`moment` read on the human's clock — the same absolute instant, expressed in `zone_name`.
+
+    The read-path companion to now_for:
+    now_for says what the local moment is right now,
+    this re-expresses a stored instant in the human's zone so its date and its time of day are the ones they would name.
+    A stored timestamp is an absolute instant (a TIMESTAMPTZ column), and which wall-clock reading it shows
+    depends entirely on the zone it is viewed from —
+    so without this a fact or a turn from late evening slips to the next day, or an early morning to the day before,
+    merely because the store keeps UTC while the reply speaks in the human's local time,
+    and the model is handed a "now" and a remembered moment on two different clocks.
+    Falls back to UTC on a name that no longer resolves, for the same reason now_for does:
+    a wrong-but-defined reading on a render is recoverable, a crash composing a reply is not.
+    """
+    try:
+        return moment.astimezone(ZoneInfo(zone_name))
+    except Exception:
+        return moment.astimezone(ZoneInfo(DEFAULT_ZONE))
+
+
+def local_date(moment: datetime, zone_name: str) -> date:
+    """The calendar day `moment` fell on in `zone_name` — the human's day, not the server's.
+
+    The date half of local(): the local instant reduced to its calendar day,
+    for the fact lines that carry a date but no time of day."""
+    return local(moment, zone_name).date()
 
 
 def now_for(zone_name: str) -> datetime:
@@ -93,6 +136,25 @@ def of(conn, symbiot_id: int) -> str:
     return row[0] if row and row[0] else DEFAULT_ZONE
 
 
+def render_now(now_local: datetime, zone_name: str) -> str:
+    """The one-line current-time reference a prompt reasons about time against — the human's clock, not the server's.
+
+    States the symbiot's current local date and time and its zone,
+    so a mention of the hour, a "this evening", or a "how long ago" is read in the human's day rather than UTC —
+    which is what the machine spoke in when it had no clock at all.
+    now_local is expected already expressed in the symbiot's zone (now_for returns it so);
+    the line renders its wall-clock reading as given and names the zone alongside it.
+    The one home for this line, so every path that hands the model a present states it identically:
+    the fast reply on the critical path and the deep follow-up composed a beat later both read it from here.
+    Kept to a single sentence, and its callers hold it outside the compressible memory block,
+    so it is never squeezed away on an overrun."""
+    stamp = now_local.strftime("%A %d %B %Y, %H:%M")
+    return (
+        f"For reference, the human symbiot's local date and time right now is {stamp} ({zone_name}). "
+        "Reason about any mention of time — today, tonight, how long ago — in their local time, not UTC."
+    )
+
+
 def set_for(conn, symbiot_id: int, location: str) -> str | None:
     """Infer the timezone for a place the symbiot named and store it on the symbiot; return the zone set.
 
@@ -108,16 +170,3 @@ def set_for(conn, symbiot_id: int, location: str) -> str | None:
         return None
     conn.execute("UPDATE symbiot SET timezone = %s WHERE id = %s", (zone, symbiot_id))
     return zone
-
-
-def _infer_prompt(location: str) -> str:
-    return (
-        "You are given a place a person says they are in, in their own words.\n"
-        f'Place: "{location}"\n\n'
-        "Return the IANA timezone identifier for that place — for example 'Europe/Paris', "
-        "'America/New_York', 'Asia/Tokyo', 'Australia/Sydney'. Read the place out of the words even when "
-        "they are casual ('just landed in NYC' is 'America/New_York', 'back home in Strasbourg' is "
-        "'Europe/Paris').\n"
-        "If the input names no place you can turn into a timezone, return null — do not guess.\n\n"
-        'Return JSON only: {"timezone": "<IANA name>"} or {"timezone": null}.'
-    )

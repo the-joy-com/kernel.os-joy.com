@@ -8,7 +8,7 @@ The store reads and the /timezone route (authed only) are exercised end to end a
 with the inference faked so no test makes a network call.
 """
 
-from datetime import datetime, timezone as dt_timezone
+from datetime import date, datetime, timezone as dt_timezone
 
 from core import db
 from core import protocol
@@ -56,6 +56,21 @@ def test_now_for_is_aware_and_falls_back_to_utc_on_a_bad_zone():
     # A real zone resolves to an aware local time; a name that doesn't resolve falls back to UTC, never raises.
     assert zone.now_for("Asia/Tokyo").tzinfo is not None
     assert zone.now_for("Nowhere/Bogus").utcoffset() == datetime.now(dt_timezone.utc).utcoffset()
+
+
+def test_local_date_reads_the_instant_in_the_symbiots_day_not_utc():
+    # An instant that is already the next day east of Greenwich must read as that local day, not the UTC one —
+    # the exact skew the fix closes: 13:00 UTC is past midnight in Auckland, so the fact belongs to the 14th there.
+    instant = datetime(2026, 7, 13, 13, 0, tzinfo=dt_timezone.utc)
+    assert instant.date() == date(2026, 7, 13)                      # the UTC date, the old wrong-calendar behaviour
+    assert zone.local_date(instant, "Pacific/Auckland") == date(2026, 7, 14)  # the symbiot's actual day
+    assert zone.local_date(instant, "UTC") == date(2026, 7, 13)     # UTC symbiot sees the plain column date
+
+
+def test_local_date_falls_back_to_utc_on_a_bad_zone():
+    # A name that no longer resolves reads as the UTC day rather than raising, mirroring now_for's fallback.
+    instant = datetime(2026, 7, 13, 13, 0, tzinfo=dt_timezone.utc)
+    assert zone.local_date(instant, "Nowhere/Bogus") == date(2026, 7, 13)
 
 
 def test_of_defaults_to_utc_until_a_zone_is_set(client):

@@ -22,8 +22,12 @@ from services.memory import conversation
 from services import identity
 from core import logs
 from core import protocol
+from services.adapters import models
+from services.memory import model_config
+from services.memory import notification_prefs
 from services.memory import ontology_gc
 from services.adapters import push
+from services.loop import notify
 from services.tools import tools
 from services.loop import worker
 from services.loop import zone
@@ -31,6 +35,8 @@ from core.dtos import (
     DeliveredRequest,
     IntakeRequest,
     LoginRequest,
+    ModelConfigRequest,
+    NotificationPreferenceRequest,
     PushSubscriptionRequest,
     SeenRequest,
     TimezoneRequest,
@@ -41,7 +47,7 @@ from core.dtos import (
 # so the module is reached by its function rather than imported as `intake` (which the handler would shadow).
 from services.memory.intake import mark_delivered, read_outcome, record_message, recover_orphaned
 from services.loop.missive import mark_seen, unseen_for_symbiot
-from services.adapters.email_client import EmailClient, GmailEmailClient
+from services.adapters.email_client import EmailClient, FileEmailClient, GmailEmailClient
 from core.rate_limit import RateLimitMiddleware
 
 # The single source the envelope reports.
@@ -60,6 +66,14 @@ async def lifespan(app: FastAPI):
     # Migrations are idempotent, so this is safe on every boot.
     db.open_pool(config.DATABASE_URL)
     db.migrate_and_seed(db.get_pool(), config.SYMBIOT_EMAIL)
+    # Bring the model configuration in line with code now the schema is in place, then warm the resolver's cache:
+    # reconcile_and_seed upserts the builtin models and seeds any unset role from its config default (idempotent,
+    # no network — unlike the tool reconcile it embeds nothing — so it always runs, tests included), and
+    # reload_from_conn reads the store into the in-process cache so the parent resolves models without ever
+    # taking the lazy direct-connection path a spawned child uses.
+    with db.get_pool().connection() as conn:
+        model_config.reconcile_and_seed(conn)
+        models.reload_from_conn(conn)
     # Bring the tool catalog in line with the code registry now the schema is in place:
     # the code registry is the source of truth for which tools exist,
     # and this reconcile embeds a new or changed descriptor so recall can match a message against it.
@@ -191,7 +205,15 @@ def envelope(msg: str, data=None) -> dict:
 # --- dependencies ---------------------------------------------------------
 
 # Built once; tests override this dependency to inject a fake that records mail.
-_email_client = GmailEmailClient(config.GMAIL_CREDENTIALS_FILE, config.GMAIL_SENDER)
+# Which delivery a box gets is a config choice, made here so the rest of the code depends only on the interface:
+# with Gmail wired, the code is emailed;
+# with no mailbox configured, it's written to a local file the operator reads off the box (see FileEmailClient) —
+# so a fully-local install can still log a human in.
+_email_client: EmailClient = (
+    GmailEmailClient(config.GMAIL_CREDENTIALS_FILE, config.GMAIL_SENDER)
+    if config.GMAIL_CREDENTIALS_FILE and config.GMAIL_SENDER
+    else FileEmailClient(config.OTP_FILE)
+)
 
 
 def get_email_client() -> EmailClient:
@@ -388,6 +410,127 @@ def logout(
     return envelope(protocol.LOGGED_OUT, {"authed": False})
 
 
+def _models_state(conn) -> dict:
+    """The full model configuration the shell renders — catalog, current assignments, and the assignable roles.
+
+    Returned by every /models response (read, successful write, and refusal alike), so the shell always
+    re-renders from one source rather than trusting what it thinks it changed.
+    """
+    return {
+        "catalog": model_config.catalog(conn),
+        "roles": model_config.roles(conn),
+        "assignable_roles": list(model_config.ASSIGNABLE_ROLES),
+    }
+
+
+@app.get("/models")
+def read_models(
+    conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)
+) -> dict:
+    """Report the model catalog and the role assignments — authed only, the /models command's read.
+
+    Authed-gated like /timezone and /notifications, and for a kindred reason: this is operator configuration,
+    not something a visitor has any version of. The model config is box-level (one per kernel, not per symbiot),
+    but the gate is still a live session — only the operator, having logged in, should see or shape which models
+    the box runs. The shell opens on this state so it shows what is set before changing anything.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    return envelope(protocol.MODELS, _models_state(conn))
+
+
+@app.post("/models")
+def set_models(
+    body: ModelConfigRequest,
+    conn=Depends(db.get_conn),
+    token: str | None = Depends(bearer_token),
+) -> dict:
+    """Change the model configuration — register/edit a model, delete one, or assign a role — authed only.
+
+    Authed-gated as the read above. The three verbs share the one route (see ModelConfigRequest); the store
+    enforces the rules (a builtin can't be edited or deleted, a model in use can't be deleted, a role must be
+    real and its model must exist) and raises ModelConfigError with a legible reason, which comes back as
+    MODEL_REFUSED with the reason in data — the request was shape-valid, only the change was refused.
+    A missing required field for the named action is refused the same way rather than 422'd, so the shell
+    always gets the uniform state-plus-maybe-reason shape back.
+    On a successful write the in-process resolver cache is refreshed (models.reload_from_conn) so the change
+    takes effect for the parent immediately, and any child spawned after loads it fresh from the store itself.
+    Either way the reply carries the full current state, so the shell re-renders from one source.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    try:
+        if body.action == "register":
+            if not body.name:
+                raise model_config.ModelConfigError("a model needs a name to register")
+            model_config.upsert_model(
+                conn,
+                body.name,
+                provider=body.provider,
+                optimal_context_tokens=body.optimal_context_tokens,
+                max_output_tokens=body.max_output_tokens,
+            )
+        elif body.action == "delete":
+            if not body.name:
+                raise model_config.ModelConfigError("a model needs a name to delete")
+            model_config.delete_model(conn, body.name)
+        elif body.action == "assign":
+            if not body.role or not body.model:
+                raise model_config.ModelConfigError("an assignment needs both a role and a model")
+            model_config.set_role(conn, body.role, body.model)
+    except model_config.ModelConfigError as exc:
+        return envelope(protocol.MODEL_REFUSED, {**_models_state(conn), "reason": str(exc)})
+    # The write is committed when this connection's `with` block closes after the response; refresh the
+    # resolver cache from the same connection now so the parent resolves the new config on the very next call.
+    models.reload_from_conn(conn)
+    return envelope(protocol.MODELS, _models_state(conn))
+
+
+@app.get("/notifications")
+def notifications(
+    conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)
+) -> dict:
+    """Report which notification channels the symbiot has on — authed only, the /notifications command's read.
+
+    Every channel that exists, mapped to whether this symbiot allows it (on by default until they turn it off),
+    so the shell renders one toggle per channel already in the right position.
+    Authed-gated the same way /timezone is, and for the same reason: a preference belongs to a particular
+    symbiot, so there is no anonymous version to serve, and the shell never advertises the command to a visitor.
+    A caller with no live session is turned away with NOT_AUTHED rather than shown a stranger's defaults.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    channels = notification_prefs.preferences(conn, symbiot_id, notify.ALL_CHANNELS)
+    return envelope(protocol.NOTIFICATIONS, {"channels": channels})
+
+
+@app.post("/notifications")
+def set_notification(
+    body: NotificationPreferenceRequest,
+    conn=Depends(db.get_conn),
+    token: str | None = Depends(bearer_token),
+) -> dict:
+    """Turn one notification channel on or off for the symbiot — authed only, the /notifications command's write.
+
+    A channel switched off here is never fired for this symbiot again, whatever asks to reach them and however
+    they phrase it (the dispatcher checks this before every fan-out); switched back on, it fires as before.
+    Authed-gated like /timezone — a preference has no anonymous version — so no session is turned away with
+    NOT_AUTHED. A channel name that isn't one that exists writes nothing: the set of real channels lives in
+    code, not as a rule duplicated here, so an unknown slug is a clean no-op rather than a phantom preference.
+    Either way the reply carries the full, current per-channel state, so the shell re-renders from one source.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    if body.channel in notify.ALL_CHANNELS:
+        notification_prefs.set_channel(conn, symbiot_id, body.channel, body.enabled)
+    channels = notification_prefs.preferences(conn, symbiot_id, notify.ALL_CHANNELS)
+    return envelope(protocol.NOTIFICATIONS, {"channels": channels})
+
+
 @app.get("/push/key")
 def push_key() -> dict:
     # The public application server key the shell subscribes with.
@@ -421,6 +564,25 @@ def status(
 ) -> dict:
     st = identity.session_status(conn, token)
     return envelope(protocol.AUTHED if st["authed"] else protocol.NOT_AUTHED, st)
+
+
+@app.get("/timezone")
+def read_timezone(
+    conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)
+) -> dict:
+    """Report the symbiot's stored local timezone — authed only, so the shell can open on the current value.
+
+    The read half of the /timezone command:
+    the shell asks this first so it can show the zone already set ("your local time is currently Europe/Paris")
+    rather than prompting into the void, while still letting the human re-name where they are.
+    Authed-gated exactly like the write below, and for the same reason —
+    a timezone belongs to a particular symbiot, so a caller with no live session is turned away with NOT_AUTHED.
+    The stored name is always a usable zone (the column defaults to UTC), so this never comes back empty.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    return envelope(protocol.TIMEZONE_SET, {"timezone": zone.of(conn, symbiot_id)})
 
 
 @app.post("/timezone")

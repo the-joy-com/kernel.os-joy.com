@@ -248,10 +248,12 @@ def test_push_subscribe_route_stays_anonymous_without_a_session(client):
     assert _channel_symbiot(r.json()["data"]["id"]) is None
 
 
-# --- notify_inbox: nudging a symbiot that a missive is waiting -------------------------
+# --- fan_out: the notification layer's web-push leg -----------------------------------
+# The dispatcher that decides channels and narrowing is tested in test_notify.py; this is only
+# the transport it hands a built payload to — fan it to a symbiot's subscriptions, prune the dead.
 
 
-def test_notify_inbox_pushes_to_every_channel_the_symbiot_has(client, monkeypatch):
+def test_fan_out_pushes_a_payload_to_every_channel_the_symbiot_has(client, monkeypatch):
     monkeypatch.setattr(config, "VAPID_PRIVATE_KEY", TEST_VAPID_KEY)
     sent = []
     monkeypatch.setattr(
@@ -261,41 +263,33 @@ def test_notify_inbox_pushes_to_every_channel_the_symbiot_has(client, monkeypatc
     with db.get_pool().connection() as conn:
         push.save_subscription(conn, "https://push.example/d1", "k", "a", sid)
         push.save_subscription(conn, "https://push.example/d2", "k", "a", sid)
-    push.notify_inbox(db.get_pool(), sid)
+    payload = {"kind": "traffic waiting", "title": "T", "body": "B", "url": "/inbox"}
+    push.fan_out(db.get_pool(), sid, payload)
     assert {endpoint for endpoint, _ in sent} == {
         "https://push.example/d1",
         "https://push.example/d2",
     }
-    assert all(payload == {"kind": "traffic waiting"} for _, payload in sent)  # content-free nudge
+    assert all(p == payload for _, p in sent)  # the transport sends the payload as given, untouched
 
 
-def test_notify_inbox_is_silent_when_push_is_off(client, monkeypatch):
+def test_fan_out_is_silent_when_push_is_off(client, monkeypatch):
     called = []
     monkeypatch.setattr(push, "_send", lambda *a: called.append(1) or False)
     sid = _symbiot_id()
     with db.get_pool().connection() as conn:
         push.save_subscription(conn, "https://push.example/off", "k", "a", sid)
-    push.notify_inbox(db.get_pool(), sid)
+    push.fan_out(db.get_pool(), sid, {"kind": "traffic waiting"})
     assert called == []
 
 
-def test_notify_inbox_is_silent_when_the_symbiot_has_no_channel(client, monkeypatch):
-    monkeypatch.setattr(config, "VAPID_PRIVATE_KEY", TEST_VAPID_KEY)
-    called = []
-    monkeypatch.setattr(push, "_send", lambda *a: called.append(1) or False)
-    push.notify_inbox(db.get_pool(), _symbiot_id())  # nobody registered a channel
-    assert called == []
-
-
-def test_notify_inbox_prunes_a_dead_channel(client, monkeypatch):
-    # A 404/410 makes _send return True; the dead address is pruned so the kernel stops
-    # pushing into the void.
+def test_fan_out_prunes_a_dead_channel(client, monkeypatch):
+    # A 404/410 makes _send return True; the dead address is pruned so the kernel stops pushing into the void.
     monkeypatch.setattr(config, "VAPID_PRIVATE_KEY", TEST_VAPID_KEY)
     monkeypatch.setattr(push, "_send", lambda *a: True)  # the push service says gone
     sid = _symbiot_id()
     with db.get_pool().connection() as conn:
         cid = push.save_subscription(conn, "https://push.example/dead", "k", "a", sid)
-    push.notify_inbox(db.get_pool(), sid)
+    push.fan_out(db.get_pool(), sid, {"kind": "traffic waiting"})
     with db.get_pool().connection() as conn:
         remaining = conn.execute(
             "SELECT count(*) FROM reply_channel WHERE id = %s", (cid,)

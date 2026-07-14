@@ -41,6 +41,7 @@ from services.memory import enrichment
 from services.loop import execution
 from services.memory import intake
 from services.loop import missive
+from services.loop import notify
 from services.memory import ontology
 from services.adapters import push
 from services.tools import reminder
@@ -207,16 +208,18 @@ def _enrich_one() -> bool:
     vector recall plus the ontology walk out from it — and, only when that reach adds something the fast answer didn't,
     the machine sends an enriched follow-up. All of it off the path the symbiot waited on, so the fast reply carries no cost from it.
     Each pass finds an answered, authed message with no enrichment yet (next_to_enrich),
-    claims that message's pass so no other worker runs it at the same time (claim),
+    claims the symbiot's enrichment so no other worker forms a deep reply for it at the same time (claim),
     gathers the deep facts and the origin reference the follow-up must situate itself against (deep_search, origin_reference),
     and gates-and-composes on the heavy model (compose) — which stays silent unless the enrichment is worth the interruption.
 
     The whole pass runs inside one transaction on one connection, under a non-blocking advisory lock claimed up front —
-    the same shape, and the same reason, as the compression fold:
-    without the lock two sweeps could both run the deep reach and the composing call and both deliver a follow-up for the one message.
-    With it, the second worker's claim comes back False and it skips the message this pass rather than blocking on the first.
+    the same shape, and the same reason, as the compression fold, but keyed on the symbiot rather than the message:
+    without the lock, two adjacent messages could each run the deep reach and the composing call at once,
+    neither seeing the other's follow-up yet, and both deliver near-identical deep replies.
+    With it, the second worker's claim comes back False and it skips the symbiot this pass rather than blocking,
+    so its next message stays eligible until the first is committed and on the stream for the gate to weigh against.
     Holding the connection across the model call is the cost of a transaction-scoped lock, and a fair one here:
-    only this one message's pass is in flight at a time, so it pins a single pooled slot briefly, never the reply path.
+    only one deep reply for a symbiot is in flight at a time, so it pins a single pooled slot briefly, never the reply path.
     A follow-up and its provenance row commit together — sent-and-recorded atomically — so a crash before the commit
     leaves nothing sent and the message still eligible, and a commit records the pass so it is never re-run;
     exactly-once falls out of the UNIQUE intake_id the same way ingestion's does, the lock only keeping concurrent passes from racing to it.
@@ -229,13 +232,18 @@ def _enrich_one() -> bool:
             if pending is None:
                 return False
             intake_id, symbiot_id, message, answer = pending
-            if not enrichment.claim(conn, intake_id):
-                # Another worker owns this message's pass; skip it cleanly rather than
-                # race it to a duplicate follow-up. It stays eligible for next pass.
+            if not enrichment.claim(conn, symbiot_id):
+                # Another worker is already forming a deep reply for this symbiot;
+                # skip cleanly rather than race it to a duplicate follow-up — this message stays eligible for the next pass.
                 return False
             related = deep_retrieval.deep_search(conn, message, exclude_intake_id=intake_id)
             origin = enrichment.origin_reference(conn, symbiot_id, intake_id, message, answer)
-            surface, follow_up = enrichment.compose(origin, related)
+            # The symbiot's zone and local now, so the deep facts' dates render in the human's local day
+            # and the follow-up — composed a beat after the fast answer — reasons about "now" against a real present,
+            # the same current-time reference the fast reply already states rather than the void the deep pass had before.
+            zone_name = zone.of(conn, symbiot_id)
+            now_local = zone.now_for(zone_name)
+            surface, follow_up = enrichment.compose(origin, related, zone_name=zone_name, now_local=now_local)
             if surface:
                 # Raise the missive and mirror it onto the conversation stream in this same transaction,
                 # so the follow-up and the provenance row that records it commit together — sent and recorded atomically.
@@ -249,7 +257,11 @@ def _enrich_one() -> bool:
     # Nudge the symbiot that a missive is waiting — outside the transaction, so a slow push never holds a connection,
     # and best-effort, because the record already stands: the follow-up surfaces on the next /inbox open regardless.
     if missive_id is not None:
-        push.notify_inbox(pool, symbiot_id)
+        # A follow-up the kernel raised on its own — no tool, no request behind it — so it fans out to every
+        # channel there is (the dispatcher then drops any the symbiot has globally disabled). Titled as the
+        # symbiot's own reaching-out, not by the internal pass that produced it.
+        notification = notify.Notification(title="The Joy", body=follow_up, pointer="/inbox")
+        notify.dispatch(pool, symbiot_id, notification, list(notify.ALL_CHANNELS))
     return True
 
 
@@ -292,14 +304,19 @@ def _fire_one() -> bool:
             due = reminder.claim_due(conn)
             if due is None:
                 return False
-            reminder_id, symbiot_id, body = due
+            reminder_id, symbiot_id, body, channels = due
             # Raise the missive and mirror it onto the stream in this same transaction, then stamp the reminder,
             # so the line the kernel says on its own is remembered and the reminder is recorded delivered —
             # sent and recorded atomically, the same shape the enrichment follow-up commits under.
             missive_id = missive.raise_for(conn, symbiot_id, body)
             conversation.record_utterance(conn, symbiot_id, "machine", body, missive_id=missive_id)
             reminder.mark_fired(conn, reminder_id)
-    push.notify_inbox(pool, symbiot_id)
+    # Fan the reminder out over the channels the symbiot chose when they set it, or — when they named none —
+    # the whole set the tool supports. Empty and null both mean "they didn't narrow it", so both fall back to
+    # the full set; the dispatcher then drops any channel they've since globally disabled.
+    fire_channels = list(channels) if channels else list(reminder.SUPPORTED_CHANNELS)
+    notification = notify.Notification(title="Reminder", body=body, pointer="/inbox")
+    notify.dispatch(pool, symbiot_id, notification, fire_channels)
     return True
 
 

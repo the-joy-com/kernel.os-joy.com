@@ -21,3 +21,7 @@ gmail-credentials*.json
 # The public half (persona/public.md) is versioned; only the private slot stays local.
 persona/private.md
 
+# The login code dropped here on a mailboxless box (FileEmailClient, config.OTP_FILE).
+# A short-lived secret the operator reads off the box — never committed.
+OTP.txt
+

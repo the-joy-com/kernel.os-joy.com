@@ -141,7 +141,7 @@ def test_generate_returns_free_text_with_no_schema_grammar(monkeypatch):
     assert fake.captured["json"]["reasoning_effort"] == "none"  # thinking off, Scaleway's documented way
     assert fake.captured["json"]["stream"] is False
     assert fake.captured["json"]["temperature"] == 0  # sampling pinned, not left to the provider's default
-    assert fake.captured["json"]["max_tokens"] == llm.models.MODELS["glm-5.2"].max_output_tokens  # the reply's runaway guard
+    assert fake.captured["json"]["max_tokens"] == llm.models.BUILTIN_MODELS["glm-5.2"].max_output_tokens  # the reply's runaway guard
     assert fake.captured["base_url"] == llm.config.SCALEWAY_API_BASE_URL
 
 
@@ -232,7 +232,7 @@ def test_summarise_target_is_clamped_to_the_tier_ceiling(monkeypatch):
     monkeypatch.setattr(llm, "OpenAI", fake)
     monkeypatch.setattr(llm.models, "truncate_tokens", lambda text, n: text)
 
-    ceiling = llm.models.MODELS["glm-5.2"].max_output_tokens
+    ceiling = llm.models.BUILTIN_MODELS["glm-5.2"].max_output_tokens
     llm._summarise("a context far larger than the tier can emit", ceiling + 50_000, "glm-5.2")
 
     assert fake.captured["json"]["max_tokens"] == ceiling  # clamped to what Scaleway accepts, not the huge target
@@ -256,7 +256,7 @@ def test_ladder_falls_over_to_mistral_on_a_scaleway_outage(monkeypatch):
     assert mistral.captured["json"]["model"] == llm.config.GENERATIVE_FALLBACK_MODEL
     # The output ceiling is resolved per tier, from the model about to answer — so the Mistral tier is held
     # to Mistral's own ceiling, not the primary's, a cap it is guaranteed to support.
-    assert mistral.captured["json"]["max_tokens"] == llm.models.MODELS[llm.config.GENERATIVE_FALLBACK_MODEL].max_output_tokens
+    assert mistral.captured["json"]["max_tokens"] == llm.models.BUILTIN_MODELS[llm.config.GENERATIVE_FALLBACK_MODEL].max_output_tokens
 
 
 def test_ladder_falls_to_local_ollama_when_both_clouds_are_down(monkeypatch):
@@ -273,7 +273,7 @@ def test_ladder_falls_to_local_ollama_when_both_clouds_are_down(monkeypatch):
     assert local.captured["json"]["model"] == llm.config.GENERATIVE_LOCAL_FALLBACK_MODEL
     # The local tier caps output through Ollama's `num_predict` (unbounded by default), resolved from the
     # local model's own ceiling — like the cloud tiers above it, each held to its own.
-    assert local.captured["json"]["options"]["num_predict"] == llm.models.MODELS[llm.config.GENERATIVE_LOCAL_FALLBACK_MODEL].max_output_tokens
+    assert local.captured["json"]["options"]["num_predict"] == llm.models.BUILTIN_MODELS[llm.config.GENERATIVE_LOCAL_FALLBACK_MODEL].max_output_tokens
 
 
 def test_ladder_surfaces_a_scaleway_4xx_without_falling_over(monkeypatch):

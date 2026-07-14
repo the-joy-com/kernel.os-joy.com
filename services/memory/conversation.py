@@ -47,12 +47,14 @@ then the module's functions in alphabetical order.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from pydantic import BaseModel, Field
 
 from core import config
 from services.adapters import llm
 from services.adapters import models
+from services.loop import zone
 
 # What the two short-term blocks read when there is nothing yet —
 # a fresh symbiot, an empty store —
@@ -71,16 +73,20 @@ _FOLD_LOCK_NAMESPACE = 0x0F01D
 
 @dataclass(frozen=True)
 class Turn:
-    """One utterance of the verbatim tail: who said it and the words they said.
+    """One utterance of the verbatim tail: who said it, when, and the words they said.
 
     role is 'symbiot' or 'machine';
     text is resolved through the stream's pointer at read time (intake.message, intake.answer, or a missive body),
-    never stored on the item itself.
-    Frozen and made of plain strings so it crosses the reply's process boundary
+    never stored on the item itself;
+    created_at is when the turn was written onto the stream (its TIMESTAMPTZ, an absolute instant),
+    carried so the render can stamp each turn with the local time it was said —
+    which is the only signal the model has for the order of things said the same day.
+    Frozen and made of plain, picklable parts so it crosses the reply's process boundary
     (the killable child, execution.run_with_deadline) as cleanly as a retrieval.Fact does."""
 
     role: str
     text: str
+    created_at: datetime
 
 
 @dataclass(frozen=True)
@@ -100,6 +106,13 @@ def _speaker(role: str) -> str:
     # The tag each turn wears in the prompt, so the exchange reads top-to-bottom as it happened.
     # The machine reads these as a transcript of itself and the human it lives with.
     return "The human symbiot" if role == "symbiot" else "You"
+
+
+def _stamp(created_at: datetime, zone_name: str) -> str:
+    # The local time a turn was said, weekday and clock (e.g. "Sun 21:10"), read in the symbiot's zone.
+    # Weekday rather than a bare time so a run of turns still reads in order across a midnight,
+    # without carrying a full date on every line; the prompt's "now" line supplies the year and month.
+    return zone.local(created_at, zone_name).strftime("%a %H:%M")
 
 
 def claim_fold(conn, symbiot_id: int) -> bool:
@@ -200,7 +213,7 @@ def fold(gist_text: str | None, turns: list[Turn]) -> str:
         f"{context}"
     )
     reply = llm.generate_json(
-        prompt, _FoldReply, model=config.CONVERSATION_COMPRESS_MODEL, context=context
+        prompt, _FoldReply, model=models.role_name("conversation_compress"), context=context
     )
     return models.truncate_tokens(reply.summary, target)
 
@@ -211,7 +224,7 @@ def gist_budget() -> int:
     A fraction of the reply model's optimal window (config), so it travels with the model a fallback might switch to.
     It is a cap the fold holds as a promise, not a target the model may drift past:
     the merge names it and the result is hard-truncated to it (fold)."""
-    optimal = models.MODELS[config.REPLY_MODEL].optimal_context_tokens
+    optimal = models.for_role("reply").optimal_context_tokens
     return int(optimal * config.CONVERSATION_GIST_BUDGET_FRACTION)
 
 
@@ -272,7 +285,8 @@ def pending_for_fold(
                    WHEN t.intake_id IS NOT NULL AND t.role = 'symbiot' THEN i.message
                    WHEN t.intake_id IS NOT NULL AND t.role = 'machine' THEN i.answer
                    WHEN t.missive_id IS NOT NULL THEN m.body
-               END AS text
+               END AS text,
+               t.created_at
         FROM (
             SELECT *, SUM(token_count) OVER (ORDER BY id DESC) AS running
             FROM conversation_item
@@ -288,7 +302,7 @@ def pending_for_fold(
     ).fetchall()
     if not rows:
         return [], cutoff
-    turns = [Turn(role=r[1], text=r[2]) for r in rows]
+    turns = [Turn(role=r[1], text=r[2], created_at=r[3]) for r in rows]
     new_cutoff = rows[-1][0]
     return turns, new_cutoff
 
@@ -324,7 +338,8 @@ def recent(conn, symbiot_id: int, *, exclude_intake_id: int | None = None) -> Co
                    WHEN ci.intake_id IS NOT NULL AND ci.role = 'symbiot' THEN i.message
                    WHEN ci.intake_id IS NOT NULL AND ci.role = 'machine' THEN i.answer
                    WHEN ci.missive_id IS NOT NULL THEN m.body
-               END AS text
+               END AS text,
+               ci.created_at
         FROM conversation_item ci
         LEFT JOIN intake  i ON i.id = ci.intake_id
         LEFT JOIN missive m ON m.id = ci.missive_id
@@ -335,7 +350,7 @@ def recent(conn, symbiot_id: int, *, exclude_intake_id: int | None = None) -> Co
         """,
         {"symbiot": symbiot_id, "cutoff": cutoff, "exclude": exclude_intake_id},
     ).fetchall()
-    tail = [Turn(role=r[0], text=r[1]) for r in rows]
+    tail = [Turn(role=r[0], text=r[1], created_at=r[2]) for r in rows]
     return Conversation(gist=gist_row[0] if gist_row is not None else None, tail=tail)
 
 
@@ -403,5 +418,5 @@ def verbatim_budget() -> int:
     once the turns past the cutoff sum beyond it (next_symbiot_to_fold),
     the sweep folds the oldest of them into the Gist (pending_for_fold) until the verbatim tail is back within this size.
     So the budget governs *when* to fold and *how much*, and a lagging sweep only makes the tail temporarily fatter — never blind."""
-    optimal = models.MODELS[config.REPLY_MODEL].optimal_context_tokens
+    optimal = models.for_role("reply").optimal_context_tokens
     return int(optimal * config.CONVERSATION_VERBATIM_BUDGET_FRACTION)

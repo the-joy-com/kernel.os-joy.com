@@ -43,7 +43,9 @@ SYMBIOT_EMAIL = os.getenv("SYMBIOT_EMAIL", "").strip().lower()
 KERNEL_SECRET = os.getenv("KERNEL_SECRET", "dev-insecure-secret")
 
 # Gmail API: path to the service-account key and the mailbox it sends as.
-# When unset, the real email client refuses to send rather than pretend to.
+# When unset, the real email client refuses to send rather than pretend to —
+# and the kernel falls back to the mailboxless local channel below,
+# so a box with no Gmail wiring can still deliver a login code (see main.py's client selection).
 GMAIL_CREDENTIALS_FILE = os.getenv("GMAIL_CREDENTIALS_FILE", "").strip()
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "").strip()
 
@@ -62,6 +64,15 @@ PERSONA_PUBLIC_FILE = os.getenv(
 PERSONA_PRIVATE_FILE = os.getenv(
     "PERSONA_PRIVATE_FILE", os.path.join(_REPO_ROOT, "persona", "private.md")
 )
+
+# Where the login code lands when there is no mailbox to send it to.
+# On a box with Gmail wired, the code is emailed and this file is never touched;
+# on a mailboxless box — a friend's home server running everything on Ollama —
+# the code is written here instead,
+# and the operator (who controls the box, the same trust root as its SSH key) reads it straight off disk.
+# Anchored to the repo root so it lands somewhere obvious,
+# and gitignored, since a login code is a short-lived secret that must never be committed.
+OTP_FILE = os.getenv("OTP_FILE", os.path.join(_REPO_ROOT, "OTP.txt"))
 
 # Lifetimes for the two short-lived secrets.
 # Codes are deliberately brief;
@@ -138,6 +149,12 @@ VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
 # A contact URI (mailto: or https:) the push service can reach the app owner at,
 # sent in every push's VAPID claims. Ignored when there's no key to sign with.
 VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "").strip()
+
+# Where the shell lives — the origin an email notification links back to.
+# A web push carries a path the shell's service worker deep-links to on its own,
+# but an email has nowhere to poll back to, so its "open The Joy" link needs the whole URL;
+# this is that base, defaulting to the production shell and overridable for a dev box.
+SHELL_URL = os.getenv("SHELL_URL", "https://shell.os-joy.com").strip().rstrip("/")
 
 # Ollama on the box (embedding.py, and the generative ladder's last-resort tier in llm.py).
 # The embedding model runs locally — no external inference API for it —

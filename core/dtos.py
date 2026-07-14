@@ -8,6 +8,8 @@ Outbound DTOs are the envelope (in main.py),
 and only get their own DTO class if a second route makes a generic worth it.
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -57,6 +59,54 @@ class LoginRequest(BaseModel):
     address: str = Field(max_length=320)
 
 
+class ModelConfigRequest(BaseModel):
+    """One change to the model configuration — the body of POST /models.
+
+    Three actions share the one route, told apart by `action`,
+    because they are the one command's three verbs
+    (the /models command drives all of them),
+    and each returns the same full state so the shell re-renders from one source:
+      - "register": add or edit an operator model. `name` is required;
+        provider and the two window figures are optional
+        and default to sensible local values (see model_config.upsert_model),
+        so a bare name works.
+      - "delete": remove an operator model. `name` is required.
+      - "assign": point a role at a catalog model. `role` and `model` are required.
+    The route validates the fields each action needs and surfaces a refusal
+    (a builtin edited, a model in use, an unknown role)
+    as a legible reason rather than a 422 —
+    the fields are shape-valid, the *change* is what's refused.
+    Everything is capped as a stray-input guard; real names and slugs are short.
+    """
+
+    action: Literal["register", "delete", "assign"]
+    # register / delete: the model's own name (the exact id its provider answers to).
+    name: str | None = Field(default=None, max_length=128)
+    # register: the characteristics, all optional — an omitted one takes a sensible default.
+    provider: str | None = Field(default=None, max_length=64)
+    optimal_context_tokens: int | None = Field(default=None, ge=1, le=10_000_000)
+    max_output_tokens: int | None = Field(default=None, ge=1, le=10_000_000)
+    # assign: which role, and which catalog model to point it at.
+    role: str | None = Field(default=None, max_length=64)
+    model: str | None = Field(default=None, max_length=128)
+
+
+class NotificationPreferenceRequest(BaseModel):
+    """A symbiot flipping one notification channel on or off — the body of POST /notifications.
+
+    channel names which one ('web_push', 'email');
+    the route checks it against the channels that actually exist (notify.ALL_CHANNELS)
+    and no-ops a name that isn't one,
+    so an unknown slug can't write a phantom preference —
+    the single source for the channel set stays in code, not duplicated as a rule here.
+    enabled is the position: false to silence the channel, true to allow it again.
+    Capped as a stray-input guard; a real slug is short.
+    """
+
+    channel: str = Field(min_length=1, max_length=64)
+    enabled: bool
+
+
 class PushKeys(BaseModel):
     """The client key material a push payload is encrypted against.
 
@@ -85,10 +135,11 @@ class PushSubscriptionRequest(BaseModel):
 class SeenRequest(BaseModel):
     """The inbox message ids the shell is reporting it has shown to the symbiot.
 
-    When the shell surfaces an inbox message it POSTs its id here, and the kernel marks it
-    seen so /inbox stops offering it on the next open (see the /inbox/seen route).
-    The list may be empty: the shell sometimes has nothing new to acknowledge, and that's a
-    clean no-op rather than a validation error.
+    When the shell surfaces an inbox message it POSTs its id here,
+    and the kernel marks it seen so /inbox stops offering it on the next open
+    (see the /inbox/seen route).
+    The list may be empty: the shell sometimes has nothing new to acknowledge,
+    and that's a clean no-op rather than a validation error.
     It's capped so a stray client can't ship an unbounded array.
     """
 

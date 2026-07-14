@@ -25,13 +25,15 @@ def _intake(message: str = "remind me to call the dentist") -> int:
         ).fetchone()[0]
 
 
-def _seed_reminder(body: str, fire_sql: str) -> int:
+def _seed_reminder(body: str, fire_sql: str, channels=None) -> int:
     # A reminder due (or not) per fire_sql, unfired — the row the firing sweep reads.
+    # channels null (the default) is "the symbiot named none", which fires over the tool's whole supported set.
     intake_id = _intake()
     with db.get_pool().connection() as conn:
         return conn.execute(
-            f"INSERT INTO reminder (intake_id, symbiot_id, body, fire_at) VALUES (%s, %s, %s, {fire_sql}) RETURNING id",
-            (intake_id, SEEDED_SYMBIOT_ID, body),
+            f"INSERT INTO reminder (intake_id, symbiot_id, body, fire_at, channels) "
+            f"VALUES (%s, %s, %s, {fire_sql}, %s) RETURNING id",
+            (intake_id, SEEDED_SYMBIOT_ID, body, channels),
         ).fetchone()[0]
 
 
@@ -97,3 +99,44 @@ def test_fire_one_delivers_a_due_reminder_as_a_missive_exactly_once(client):
             "SELECT count(*) FROM missive WHERE symbiot_id = %s", (SEEDED_SYMBIOT_ID,)
         ).fetchone()[0]
     assert missives == 1
+
+
+def test_executor_stores_the_channels_the_symbiot_named(client):
+    intake_id = _intake()
+    fire_at = datetime(2030, 1, 1, 9, 0, tzinfo=timezone.utc)
+    decision = tools.Decision(
+        "schedule_reminder",
+        {"reminder_message": "call the dentist", "fire_at": fire_at, "channels": ["email"]},
+    )
+    now = datetime(2026, 7, 14, 9, 0, tzinfo=timezone.utc)
+    with db.get_pool().connection() as conn:
+        tools.execute(conn, decision, SEEDED_SYMBIOT_ID, intake_id, now, "Europe/Paris")
+        stored = conn.execute(
+            "SELECT channels FROM reminder WHERE intake_id = %s", (intake_id,)
+        ).fetchone()[0]
+    # Narrowed to the one they asked for; the firing sweep will fan over exactly this.
+    assert stored == ["email"]
+
+
+def test_fire_one_fans_over_the_channels_the_reminder_stored(client, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        worker.notify, "dispatch",
+        lambda pool, sid, notification, channels: captured.update(channels=channels, body=notification.body),
+    )
+    _seed_reminder("call the dentist", "now() - interval '1 minute'", ["email"])
+    assert worker._fire_one() is True
+    assert captured["channels"] == ["email"]  # only the channel the symbiot named
+    assert captured["body"] == "call the dentist"
+
+
+def test_fire_one_fans_over_all_supported_channels_when_none_were_named(client, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        worker.notify, "dispatch",
+        lambda pool, sid, notification, channels: captured.update(channels=channels),
+    )
+    _seed_reminder("call the dentist", "now() - interval '1 minute'")  # channels null — none named
+    assert worker._fire_one() is True
+    # No narrowing means the whole set the tool supports.
+    assert captured["channels"] == list(reminder.SUPPORTED_CHANNELS)

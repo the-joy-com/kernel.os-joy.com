@@ -54,6 +54,26 @@ def test_compose_folds_persona_facts_and_message_into_the_prompt(monkeypatch):
     assert "boxing with Jeremy" in captured["context"]
 
 
+def test_compose_orders_diary_facts_oldest_first_regardless_of_relevance(monkeypatch):
+    # The librarian hands facts most-relevant-first; the prompt must render them in time order instead,
+    # so the model reads position as chronology rather than mistaking relevance rank for recency.
+    monkeypatch.setattr(reply.persona, "load", lambda: "VOICE")
+    captured = {}
+    monkeypatch.setattr(
+        reply.llm, "generate",
+        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt) or "ok",
+    )
+    facts = [  # relevance order: the newer fact ranked higher, so it arrives first
+        _fact(1, "the newer thing", datetime(2026, 7, 10, tzinfo=timezone.utc), rank=0.9),
+        _fact(2, "the older thing", datetime(2026, 7, 1, tzinfo=timezone.utc), rank=0.4),
+    ]
+
+    reply.compose("what happened?", facts, _convo())
+
+    prompt = captured["prompt"]
+    assert prompt.index("the older thing") < prompt.index("the newer thing")  # oldest first, not most-relevant first
+
+
 def test_compose_folds_short_term_memory_gist_then_verbatim_tail(monkeypatch):
     # Short-term memory reaches the prompt as the Gist followed by the role-tagged verbatim tail,
     # and it is part of the one compressible context block — diary and conversation alike.
@@ -66,8 +86,8 @@ def test_compose_folds_short_term_memory_gist_then_verbatim_tail(monkeypatch):
     conv = _convo(
         gist="Earlier they told me about two projects.",
         tail=[
-            conversation.Turn(role="symbiot", text="show me the projects"),
-            conversation.Turn(role="machine", text="here are Alpha and Beta"),
+            conversation.Turn(role="symbiot", text="show me the projects", created_at=datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)),
+            conversation.Turn(role="machine", text="here are Alpha and Beta", created_at=datetime(2026, 7, 1, 12, 1, tzinfo=timezone.utc)),
         ],
     )
     facts = [_fact(1, "a fact", datetime(2026, 7, 1, tzinfo=timezone.utc))]
@@ -99,7 +119,7 @@ def test_compose_marks_the_whole_memory_summarisable_and_never_the_persona_or_me
     )
     conv = _convo(
         gist="a summarised backstory",
-        tail=[conversation.Turn(role="symbiot", text="a recent verbatim turn")],
+        tail=[conversation.Turn(role="symbiot", text="a recent verbatim turn", created_at=datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc))],
     )
     facts = [_fact(1, "a dated fact", datetime(2026, 7, 1, tzinfo=timezone.utc))]
 
@@ -136,6 +156,31 @@ def test_compose_states_the_symbiot_local_time_when_the_zone_is_known(monkeypatc
     assert "Asia/Tokyo" in prompt
     # The time reference is a sacred one-liner, never folded into the compressible memory block.
     assert "18:30" not in captured["context"]
+
+
+def test_compose_stamps_each_recent_turn_with_its_local_time(monkeypatch):
+    # Every tail turn carries the local time it was said, so the model can order things said the same day
+    # instead of guessing from how they read — and the stamp is in the symbiot's zone, not the server's UTC.
+    # The turn was said at 18:30 UTC, which in Tokyo (+9) is 03:30 the next day — so the weekday flips too,
+    # which is exactly why the stamp carries the weekday and not a bare clock.
+    monkeypatch.setattr(reply.persona, "load", lambda: "VOICE")
+    captured = {}
+    monkeypatch.setattr(
+        reply.llm, "generate",
+        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt) or "ok",
+    )
+    conv = _convo(tail=[
+        conversation.Turn(
+            role="symbiot", text="waiting at the laundromat",
+            created_at=datetime(2026, 7, 13, 18, 30, tzinfo=timezone.utc),  # a Monday in UTC
+        ),
+    ])
+
+    reply.compose("done yet?", [], conv, now_local=datetime(2026, 7, 14, 3, 40, tzinfo=timezone.utc), zone_name="Asia/Tokyo")
+
+    prompt = captured["prompt"]
+    assert "[Tue 03:30] The human symbiot: waiting at the laundromat" in prompt  # the local stamp
+    assert "Mon 18:30" not in prompt  # never the UTC reading
 
 
 def test_compose_omits_the_time_line_when_the_zone_is_unknown(monkeypatch):

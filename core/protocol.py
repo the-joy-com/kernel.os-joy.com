@@ -46,6 +46,13 @@ LOGIN_FAILED = "that code didn't work — try again"  # POST /login/verify — w
 LOGIN_SENT = "if that address is registered, a login code is on its way"
 NOT_AUTHED = "not authenticated"  # GET /status — no live session
 
+# Notifications: the symbiot's per-channel enable/disable (authed only).
+NOTIFICATIONS = "notifications"  # GET/POST /notifications — the current per-channel state rides in data.channels
+
+# Models: the operator's model catalog and role assignments (authed only, box-level).
+MODELS = "models"  # GET /models and a successful POST — the full state (catalog, roles, assignable_roles) rides in data
+MODEL_REFUSED = "that model change didn't take"  # POST /models — the change was refused; data.reason says why, alongside the unchanged state
+
 # Timezone: the symbiot sets its local zone from a place it names (authed only).
 TIMEZONE_SET = "time hack"  # POST /timezone — the place was placed; the IANA zone set rides in data.timezone
 TIMEZONE_UNCLEAR = "say again"  # POST /timezone — the place named no zone we could resolve; nothing stored

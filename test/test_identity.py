@@ -206,3 +206,36 @@ def test_logout_idempotent_when_unauthed(client):  # B206
     out = client.post("/logout")  # no token at all
     assert out.status_code == 200
     assert out.json()["data"]["authed"] is False  # clean no-op, never errors
+
+
+# --- the mailboxless delivery: a login code on disk, for a box with no Gmail -------------------
+
+def test_file_channel_writes_the_code_to_disk(tmp_path):
+    # On a box with no mailbox, the login code reaches the operator by landing in a file they read off the box.
+    # The client honours the same send(to, subject, body) interface the identity flow already calls,
+    # so nothing above it knows or cares that delivery went to disk instead of the wire.
+    from services.adapters.email_client import FileEmailClient
+
+    path = tmp_path / "OTP.txt"
+    channel = FileEmailClient(str(path))
+    channel.send(to="me@example.com", subject="Your Joy login code", body="Your one-time login code is 42424242")
+
+    written = path.read_text(encoding="utf-8")
+    assert "42424242" in written  # the code the operator will read and type back
+    assert "me@example.com" in written  # whose code, so a shared box isn't ambiguous
+
+
+def test_file_channel_overwrites_so_only_the_newest_code_stands(tmp_path):
+    # The identity flow keeps one live code per symbiot — a fresh /login overwrites the last —
+    # so the file must mirror that: a second send replaces the first whole, never appends,
+    # leaving no stale code on disk to be mistaken for the current one.
+    from services.adapters.email_client import FileEmailClient
+
+    path = tmp_path / "OTP.txt"
+    channel = FileEmailClient(str(path))
+    channel.send(to="me@example.com", subject="Your Joy login code", body="code 11111111")
+    channel.send(to="me@example.com", subject="Your Joy login code", body="code 22222222")
+
+    written = path.read_text(encoding="utf-8")
+    assert "22222222" in written
+    assert "11111111" not in written  # the stale code is gone, not sitting above the new one

@@ -71,7 +71,7 @@ def _stub_reach(monkeypatch, related, decision):
     # the deep reach returns a fixed list, and the gate-and-compose returns a fixed (surface, message).
     # So the orchestration — eligibility, claim, delivery, record — is exercised without vectors or a model call.
     monkeypatch.setattr(worker.deep_retrieval, "deep_search", lambda conn, message, **kw: related)
-    monkeypatch.setattr(worker.enrichment, "compose", lambda origin, rel: decision)
+    monkeypatch.setattr(worker.enrichment, "compose", lambda origin, rel, **kw: decision)
 
 
 def test_enrich_sends_a_follow_up_when_the_pass_surfaces(client, monkeypatch):
@@ -138,7 +138,7 @@ def test_enrich_takes_the_oldest_first(client, monkeypatch):
     sent = []
     monkeypatch.setattr(worker.deep_retrieval, "deep_search", lambda conn, message, **kw: _one_related())
     # Record which message's text the compose saw, so we can prove the older one went first.
-    monkeypatch.setattr(worker.enrichment, "compose", lambda origin, rel: (sent.append(origin.message), (False, ""))[1])
+    monkeypatch.setattr(worker.enrichment, "compose", lambda origin, rel, **kw: (sent.append(origin.message), (False, ""))[1])
     _intake(message="older")
     _intake(message="newer")
 
@@ -147,17 +147,21 @@ def test_enrich_takes_the_oldest_first(client, monkeypatch):
     assert sent == ["older"]
 
 
-def test_enrich_skips_a_message_whose_pass_another_worker_holds(client, monkeypatch):
-    # The race guard, proven end to end: while one worker holds a message's pass, a second sweep must claim nothing,
-    # send nothing, and record nothing — then, once the claim is let go, the pass goes through as normal.
+def test_enrich_skips_a_symbiot_whose_pass_another_worker_holds(client, monkeypatch):
+    # The race guard, proven end to end: while one worker holds a symbiot's enrichment, a second sweep must claim nothing,
+    # send nothing, and record nothing — so two adjacent messages can't each form a deep reply at once.
+    # Once the claim is let go, the pass goes through as normal.
+    # Burn an intake id on a never-eligible anonymous row first, so the eligible message's intake id differs from the
+    # symbiot id it belongs to — the lock must key on the symbiot, and holding intake_id by mistake would not catch here.
     _stub_reach(monkeypatch, _one_related(), (True, "the follow-up"))
-    intake_id = _intake()
+    _intake(symbiot_id=None)
+    _intake()
 
     with db.get_pool().connection() as holder:
         with holder.transaction():
-            assert enrichment.claim(holder, intake_id) is True
+            assert enrichment.claim(holder, SEEDED_SYMBIOT_ID) is True
 
-            assert worker._enrich_one() is False  # couldn't claim — skipped this pass
+            assert worker._enrich_one() is False  # couldn't claim the symbiot — skipped this pass
             assert _missives() == []               # nothing sent
             assert _enrichments() == []            # nothing recorded
 
@@ -178,7 +182,7 @@ def test_compose_suppresses_without_a_model_call_when_the_reach_found_nothing(cl
     # No deep facts means no new ground to weigh, so the gate suppresses before spending the metered model call.
     called = []
     monkeypatch.setattr(enrichment.llm, "generate_json", lambda *a, **k: called.append(1))
-    origin = enrichment.Origin(message="m", answer="a", since=[])
+    origin = enrichment.Origin(message="m", answer="a", recent=[])
 
     assert enrichment.compose(origin, []) == (False, "")
     assert called == []  # the model was never reached
@@ -190,9 +194,42 @@ def test_compose_surfaces_when_the_model_says_so(client, monkeypatch):
         enrichment.llm, "generate_json",
         lambda *a, **k: enrichment._EnrichmentReply(surface=True, message="  the follow-up  "),
     )
-    origin = enrichment.Origin(message="m", answer="a", since=[])
+    origin = enrichment.Origin(message="m", answer="a", recent=[])
 
     assert enrichment.compose(origin, _one_related()) == (True, "the follow-up")  # trimmed
+
+
+def test_compose_states_the_symbiot_local_time_on_the_deep_prompt(client, monkeypatch):
+    # The deep follow-up gets the same current-time line the fast reply does, so it reasons about "now"
+    # against a real present rather than the void it composed in before — and reads it in the human's zone.
+    monkeypatch.setattr(enrichment.persona, "load", lambda: "VOICE")
+    captured = {}
+    monkeypatch.setattr(
+        enrichment.llm, "generate_json",
+        lambda prompt, schema, **k: captured.update(prompt=prompt) or enrichment._EnrichmentReply(surface=False),
+    )
+    origin = enrichment.Origin(message="m", answer="a", recent=[])
+    now_local = datetime(2026, 7, 13, 18, 30, tzinfo=timezone.utc)
+
+    enrichment.compose(origin, _one_related(), zone_name="Asia/Tokyo", now_local=now_local)
+
+    assert "Monday 13 July 2026, 18:30" in captured["prompt"]
+    assert "Asia/Tokyo" in captured["prompt"]
+
+
+def test_compose_omits_the_time_line_on_the_deep_prompt_when_no_now_is_given(client, monkeypatch):
+    # No local now handed in (a by-hand call): the deep prompt asserts no time at all rather than a wrong one.
+    monkeypatch.setattr(enrichment.persona, "load", lambda: "VOICE")
+    captured = {}
+    monkeypatch.setattr(
+        enrichment.llm, "generate_json",
+        lambda prompt, schema, **k: captured.update(prompt=prompt) or enrichment._EnrichmentReply(surface=False),
+    )
+    origin = enrichment.Origin(message="m", answer="a", recent=[])
+
+    enrichment.compose(origin, _one_related())
+
+    assert "local date and time right now" not in captured["prompt"]
 
 
 def test_compose_downgrades_an_empty_surface_to_a_suppress(client, monkeypatch):
@@ -202,7 +239,7 @@ def test_compose_downgrades_an_empty_surface_to_a_suppress(client, monkeypatch):
         enrichment.llm, "generate_json",
         lambda *a, **k: enrichment._EnrichmentReply(surface=True, message="   "),
     )
-    origin = enrichment.Origin(message="m", answer="a", since=[])
+    origin = enrichment.Origin(message="m", answer="a", recent=[])
 
     assert enrichment.compose(origin, _one_related()) == (False, "")
 
@@ -213,35 +250,53 @@ def test_compose_suppresses_when_the_model_declines(client, monkeypatch):
         enrichment.llm, "generate_json",
         lambda *a, **k: enrichment._EnrichmentReply(surface=False, message="ignored"),
     )
-    origin = enrichment.Origin(message="m", answer="a", since=[])
+    origin = enrichment.Origin(message="m", answer="a", recent=[])
 
     assert enrichment.compose(origin, _one_related()) == (False, "")
 
 
-def test_origin_reference_gathers_the_turns_since_the_answer(client):
-    # The three legs of the origin reference: the prompting message, its fast answer, and everything said since.
-    # Seed the exchange being enriched (M, both its stream turns), then two later turns and a missive —
-    # the "since" must be exactly the three later utterances, in order, and never M's own two.
-    m = _intake(message="which project?", answer="the weather app")
-    _item("symbiot", intake_id=m)   # M's own turns — must be excluded from "since"
-    _item("machine", intake_id=m)
-    later = _intake(message="thanks", answer="anytime")
-    _item("symbiot", intake_id=later)
-    _item("machine", intake_id=later)
+def test_render_related_orders_deep_facts_oldest_first():
+    # deep_search hands facts by relevance (vector distance, then ontology siblings); the render must put them
+    # in time order, oldest first, so the deep follow-up reads them as a timeline rather than a relevance ranking.
+    related = [
+        deep_retrieval.Related(id=1, raw_text="newer deep fact", effective_at=datetime(2026, 7, 10, tzinfo=timezone.utc), distance=0.1),
+        deep_retrieval.Related(id=2, raw_text="older deep fact", effective_at=datetime(2026, 7, 1, tzinfo=timezone.utc), distance=0.2),
+    ]
+
+    block = enrichment._render_related(related, "UTC")
+
+    assert block.index("older deep fact") < block.index("newer deep fact")  # oldest first, not nearest-distance first
+
+
+def test_origin_reference_gathers_the_recent_conversation_including_prior_follow_ups(client):
+    # The three legs: the prompting message, its fast answer, and the recent conversation around it.
+    # The recent leg must carry a follow-up already sent on an EARLIER message — a missive with a lower id —
+    # because that is the very thing the gate has to see to refuse to repeat itself;
+    # it must also drop this exchange's own two turns, and include anything said after.
+    earlier = _intake(message="i'm exhausted", answer="rest up")
+    _item("symbiot", intake_id=earlier)
+    _item("machine", intake_id=earlier)
     with db.get_pool().connection() as conn:
-        missive_id = conn.execute(
+        prior = conn.execute(
             "INSERT INTO missive (symbiot_id, body) VALUES (%s, %s) RETURNING id",
-            (SEEDED_SYMBIOT_ID, "a nudge"),
+            (SEEDED_SYMBIOT_ID, "and you slept badly all week"),
         ).fetchone()[0]
-    _item("machine", missive_id=missive_id)
+    _item("machine", missive_id=prior)   # an earlier deep reply — a lower id than M, must still be in view
+
+    m = _intake(message="still so tired", answer="get some sleep")
+    _item("symbiot", intake_id=m)   # M's own turns — must be excluded
+    _item("machine", intake_id=m)
+    _item("symbiot", intake_id=_intake(message="thanks", answer="anytime"))  # a turn after M
 
     with db.get_pool().connection() as conn:
-        origin = enrichment.origin_reference(conn, SEEDED_SYMBIOT_ID, m, "which project?", "the weather app")
+        origin = enrichment.origin_reference(conn, SEEDED_SYMBIOT_ID, m, "still so tired", "get some sleep")
 
-    assert origin.message == "which project?"
-    assert origin.answer == "the weather app"
-    assert origin.since == [
-        conversation.Turn("symbiot", "thanks"),
-        conversation.Turn("machine", "anytime"),
-        conversation.Turn("machine", "a nudge"),
+    assert origin.message == "still so tired"
+    assert origin.answer == "get some sleep"
+    # Compare role and text only — each turn also carries its created_at (a DB-assigned instant, not fixed here).
+    assert [(t.role, t.text) for t in origin.recent] == [
+        ("symbiot", "i'm exhausted"),
+        ("machine", "rest up"),
+        ("machine", "and you slept badly all week"),  # the earlier follow-up, now in view
+        ("symbiot", "thanks"),
     ]

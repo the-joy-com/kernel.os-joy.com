@@ -8,9 +8,10 @@ both count and truncate on the same measure, so the assertions are about the cou
 from services.adapters import models
 
 
-def test_the_map_carries_provider_and_optimal_context():
-    # The registry the budget guard reads: each model names its provider and the window it reads well.
-    qwen = models.MODELS["qwen3.5:4b"]
+def test_the_builtin_seed_carries_provider_and_optimal_context():
+    # The builtin catalog the store is seeded from and the resolver falls back to:
+    # each model names its provider and the window it reads well.
+    qwen = models.BUILTIN_MODELS["qwen3.5:4b"]
     assert qwen.provider == "ollama"
     # The optimal is the effective window, deliberately well below qwen3.5:4b's ~262K advertised maximum.
     assert 0 < qwen.optimal_context_tokens < 262_144
