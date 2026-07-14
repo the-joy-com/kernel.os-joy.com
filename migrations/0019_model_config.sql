@@ -48,7 +48,7 @@ CREATE TABLE model (
 );
 
 -- The assignment: one row per generative role, naming the catalog model that plays it.
--- role is the stable slug the kernel resolves against ('reply', 'rerank', 'enrich', 'tool_decision', 'tool_confirm', 'conversation_compress') —
+-- role is the stable slug the kernel resolves against (the live set is BUILTIN_ROLES in adapters/models.py — 'reply', 'rerank', 'mint', 'enrich', and the rest) —
 -- PRIMARY KEY, so a role holds exactly one standing assignment and the write is a plain upsert.
 -- model_name references the catalog:
 -- ON DELETE RESTRICT so a model a role still points at cannot be deleted out from under it
