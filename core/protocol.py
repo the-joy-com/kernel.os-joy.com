@@ -49,6 +49,9 @@ NOT_AUTHED = "not authenticated"  # GET /status — no live session
 # Notifications: the symbiot's per-channel enable/disable (authed only).
 NOTIFICATIONS = "notifications"  # GET/POST /notifications — the current per-channel state rides in data.channels
 
+# Observe: the observability corner's read surface, one word per card (authed only).
+OBSERVE_ECHOES = "observe echoes"  # GET /observe/echoes — the scored redundancy rides in data (clusters, singles, scored)
+
 # Models: the operator's model catalog and role assignments (authed only, box-level).
 MODELS = "models"  # GET /models and a successful POST — the full state (catalog, roles, assignable_roles) rides in data
 MODEL_REFUSED = "that model change didn't take"  # POST /models — the change was refused; data.reason says why, alongside the unchanged state

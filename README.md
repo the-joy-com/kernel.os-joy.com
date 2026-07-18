@@ -235,13 +235,12 @@ There is no master switch. Local-ness is the sum of two independent config decis
    MISTRAL_API_KEY=                 # blank → no Mistral
    ```
 
-   > `SYMBIOT_EMAIL` doesn't have to be a *deliverable* address on a mailboxless box — it's just the handle you log in as. `you@localhost` is fine. It only needs to be a real mailbox if you use Gmail delivery.
+   > `SYMBIOT_EMAIL` doesn't have to be a *deliverable* address on a mailboxless box — it's just the handle you log in as. `you@domain.com` is fine. It only needs to be a real mailbox if you use Gmail delivery.
 
 3. **Run the kernel** (as in [Install & run](#install--run-local)):
 
    ```bash
-   export UV_PROJECT_ENVIRONMENT=venv
-   uv run uvicorn main:app --host 127.0.0.1 --port 9713 --reload
+   export UV_PROJECT_ENVIRONMENT=venv && uv run uvicorn main:app --host 127.0.0.1 --port 9713 --reload
    ```
 
 4. **Log in — the code lands in a file, not your inbox.** In the shell, `/login` with your `SYMBIOT_EMAIL`. Because Gmail is unconfigured, the kernel writes the one-time code to **`OTP.txt` at the kernel repo root** and logs a line saying so (the code itself is never logged, only its location). Read it off the box and type it back:

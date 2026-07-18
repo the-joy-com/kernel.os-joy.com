@@ -25,6 +25,7 @@ from core import protocol
 from services.adapters import models
 from services.memory import model_config
 from services.memory import notification_prefs
+from services import observe
 from services.memory import ontology_gc
 from services.memory import presence
 from services.adapters import push
@@ -536,6 +537,65 @@ def set_notification(
         notification_prefs.set_channel(conn, symbiot_id, body.channel, body.enabled)
     channels = notification_prefs.preferences(conn, symbiot_id, notify.ALL_CHANNELS)
     return envelope(protocol.NOTIFICATIONS, {"channels": channels})
+
+
+@app.get("/observe/echoes")
+def observe_machine_echoes(
+    conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)
+) -> dict:
+    """The echoes lens: the symbiot's recent machine utterances, scored for redundancy — authed only, the /observe hub's first card.
+
+    The first citizen of the observability corner (see services/observe.py). Read-only:
+    it reports what the machine has already said, each line tagged with the mechanism that raised it
+    (a fast reply, a deep follow-up, a note) and the human line it answered,
+    and groups the near-duplicates into echo clusters so the more-or-less repeats can be seen at a glance —
+    it writes nothing and touches no path the loop runs on, so opening it can never change how the machine behaves.
+    Authed-gated like /timezone and /notifications: a symbiot's own output is not an anonymous thing to show,
+    so a caller with no live session is turned away with NOT_AUTHED rather than shown a stranger's stream.
+    Each line's instant is rendered in the symbiot's own zone — the same clock the reply was spoken on —
+    so the shell prints a ready label rather than re-deriving the local time itself.
+    `scored` is False when the embedder was unreachable: the lens then falls back to the plain mirror
+    (every line a single) rather than erroring, so the surface still shows something honest.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    zone_name = zone.of(conn, symbiot_id)
+    result = observe.machine_echoes(conn, symbiot_id)
+
+    def render(u: observe.MachineUterrance) -> dict:
+        return {
+            # mechanism: which part of the loop produced this line, read for free from the stream row's pointer.
+            # 'quick' is a fast reply on the reply path, 'deep' a Tier 2 enrichment follow-up,
+            # 'note' a line the kernel raised on its own (a reminder, a relay).
+            # It says whether redundancy is the fast voice repeating, the deep voice repeating,
+            # or the two echoing each other across kinds.
+            "mechanism": u.mechanism,
+            # text: the words themselves, resolved from wherever they live durably (the intake answer or the missive body).
+            "text": u.text,
+            # trigger: the human line this answered, so an echo reads in context — set only for a 'quick' reply,
+            # which answers one specific message; a 'deep' follow-up or a 'note' has no single line behind it, so null.
+            "trigger": u.trigger,
+            # when: the instant it was said, rendered on the symbiot's own clock so the shell prints it as-is.
+            "when": zone.local(u.created_at, zone_name).strftime("%a %d %b, %H:%M"),
+        }
+
+    return envelope(
+        protocol.OBSERVE_ECHOES,
+        {
+            # scored: False only when the embedder was unreachable — the lens then falls back to the plain mirror
+            # (every line a single) rather than erroring, so the shell can say so and still show something.
+            "scored": result.scored,
+            # clusters: the echo groups, strongest first; similarity is the closest pair inside the group,
+            # members the lines that clustered, oldest first.
+            "clusters": [
+                {"similarity": round(c.similarity, 2), "members": [render(u) for u in c.members]}
+                for c in result.clusters
+            ],
+            # singles: the lines that echoed nothing, oldest first.
+            "singles": [render(u) for u in result.singles],
+        },
+    )
 
 
 @app.get("/push/key")
