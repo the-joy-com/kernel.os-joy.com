@@ -6,7 +6,7 @@ The first principle here is that **seeing is not fixing**. An observability surf
 
 ## the `/observe` surface: a hub of cards
 
-`/observe` is not a single view. It is a **hub of cards**, each card a distinct lens onto something worth watching, with room for the corner to grow one card at a time. Today it holds exactly one inhabitant — the **echoes** card — and the frame is built to hold the rest as they are earned. This is the narrow-first shape made concrete: one door open, a wall ready for the others.
+`/observe` is not a single view. It is a **hub of cards**, each card a distinct lens onto something worth watching, with room for the corner to grow one card at a time. Today it holds two — the **echoes** card and the **reminders** card — and the frame is built to hold the rest as they are earned. This is the narrow-first shape made concrete: the doors that are open are open, a wall ready for the others.
 
 The command is authed-only, hidden from `/help` until there's a session, cut to the same cloth as [`/timezone`](../shell.os-joy.com/src/zone.ts) and [`/notifications`](../shell.os-joy.com/src/notifications.ts): a symbiot's own output is not an anonymous thing to show, so a caller with no live session is turned away. Opening the hub draws the card frames instantly; each card then **loads its own data independently**, behind a quiet in-card spinner, so no card blocks the hub or another card. That is the worker pool's "one slow unit must never freeze the whole" discipline, brought to the observe surface — and it is what lets future cards each light up on their own clock.
 
@@ -16,13 +16,15 @@ flowchart TD
     S -->|no| REF["refused — /login first<br/>(never reaches the kernel)"]
     S -->|yes| HUB["hub draws the card frames at once"]
     HUB --> C1["echoes card"]
-    HUB -.->|room for more| C2["future card"]
-    C1 --> SPIN["in-card spinner<br/>while it loads its own data"]
-    SPIN --> GET["GET /observe/echoes<br/>(authed)"]
-    GET --> KERNEL[["kernel: read + score<br/>(read-only)"]]
-    KERNEL --> SUM["card fills with a count<br/>e.g. '2 possible echoes'"]
-    SUM --> OPEN["open the card"]
-    OPEN --> VIEW["the clustered view,<br/>rendered from the same fetch"]
+    HUB --> C2["reminders card"]
+    HUB -.->|room for more| C3["future card"]
+    C1 --> SPIN["in-card spinner<br/>while each loads its own data"]
+    C2 --> SPIN
+    SPIN --> GET["GET /observe/echoes · /observe/reminders<br/>(authed)"]
+    GET --> KERNEL[["kernel: read (+ score for echoes)<br/>(read-only)"]]
+    KERNEL --> SUM["card fills with a count<br/>e.g. '2 possible echoes' · '3 recent'"]
+    SUM --> OPEN["open a card"]
+    OPEN --> VIEW["its view,<br/>rendered from the same fetch"]
 ```
 
 Because knowing how many echoes there are *is* the full comparison — you cannot count clusters without measuring every pair — the card's own load does the real work once, and opening the card then renders from what it already computed, so the click itself is instant.
@@ -78,8 +80,16 @@ Three knobs shape the echoes lens, and all three are defaults meant to move agai
 
 The threshold is the one that earned its tuning already, and it is a clean illustration of the observe-first ethic. The [by-hand smoke](../test/qa/0009_observe_echoes_smoke.py) files three paraphrases of one thought and one unrelated line, embeds them live, and prints the real pairwise numbers. They came back with a wide, clean gap: unrelated lines sit around **0.55–0.60**, clear paraphrases around **0.80–0.88**. The first default, 0.85, was set blind and sat too high in that gap — it clustered only the closest paraphrase pair and wrongly left an obvious third alone. Seeing the real numbers moved it to **0.75**, comfortably in the gap: low enough to catch a loose paraphrase, high enough to leave unrelated lines apart. The threshold wasn't decided in the abstract; it was decided in front of the evidence.
 
+## the reminders lens
+
+The second card answers a different question — not *what did I repeat?* but *what did I do that no one asked for?* When the [reminder tool](tool-calling.md) grew too eager and began scheduling reminders off lines that only mentioned a future task, sharpening its decision was a judgment call, and a judgment call needs evidence to be trusted. This card is that evidence: the most recently scheduled reminders, newest first, each shown **with the human line that triggered it**. The pairing is the whole point — a reminder sitting under a message that never asked to be reminded is the over-eagerness caught in the act, a row to read rather than a suspicion to argue about.
+
+It is a plainer lens than echoes: no embedder, no scoring, just a read. [`observe.recent_reminders`](../services/observe.py) joins the [reminder ledger](../migrations/0017_tools_and_reminders.sql) to its triggering [intake](../migrations/0002_intake.sql) — every reminder is raised from a message, so the join always resolves — and hands back the line said, the line to be said back, when it fires, whether it has, and the channels it rides. The fire and set times are stamped on the symbiot's own clock, so the shell prints them as-is. Read-only and off the loop's path like the rest of the corner. Its window — how many reminders back it reaches — is the same kind of un-tuned default as the echoes window: generous for now, to be set against real use rather than guessed at blind.
+
+The value it earns is the next round of hardening. The reminder fix sharpened the decision prompt on reasoning alone; the real false positives this card surfaces are the concrete examples that would sharpen it further — the observe-first loop again, the instrument that makes a fault legible feeding the fix that removes it.
+
 ## where it lives
 
-- **kernel** — [`services/observe.py`](../services/observe.py): the read (`recent_utterances`) and the scoring (`echoes`), the whole read side of the corner. [`services/echo.py`](../services/echo.py): the cosine measure and the echo threshold, shared with the enrichment guard so lens and fix agree on *more-or-less-the-same*. [`main.py`](../main.py): the authed `GET /observe/echoes` route. [`services/adapters/embedding.py`](../services/adapters/embedding.py): `embed_many`, the batch embed the lens leans on. The protocol word `observe echoes` lives in [`core/protocol.py`](../core/protocol.py).
-- **shell** — [`src/observe.ts`](../shell.os-joy.com/src/observe.ts): the `/observe` flow — the hub, the card's self-load, and the clustered render. The `cards` primitive that draws the bordered, keyboard-first hub lives in [`src/term.ts`](../shell.os-joy.com/src/term.ts), a sibling of `readLine` and `checklist`.
-- **proof** — [`test/test_observe.py`](../test/test_observe.py) pins the gather, the clustering, the degrade path, and the route shape with the embedder faked; [`test/qa/0009_observe_echoes_smoke.py`](../test/qa/0009_observe_echoes_smoke.py) proves the real embedding actually clusters paraphrases against a live model, and is where the threshold is tuned.
+- **kernel** — [`services/observe.py`](../services/observe.py): the reads behind both cards — `recent_utterances` and the `echoes` scoring for the first, `recent_reminders` for the second — the whole read side of the corner. [`services/echo.py`](../services/echo.py): the cosine measure and the echo threshold, shared with the enrichment guard so lens and fix agree on *more-or-less-the-same*. [`main.py`](../main.py): the authed `GET /observe/echoes` and `GET /observe/reminders` routes. [`services/adapters/embedding.py`](../services/adapters/embedding.py): `embed_many`, the batch embed the echoes lens leans on. The protocol words `observe echoes` and `observe reminders` live in [`core/protocol.py`](../core/protocol.py).
+- **shell** — [`src/observe.ts`](../shell.os-joy.com/src/observe.ts): the `/observe` flow — the hub, each card's self-load, and the two renders (the clustered echoes view, the paired reminders list). The `cards` primitive that draws the bordered, keyboard-first hub lives in [`src/term.ts`](../shell.os-joy.com/src/term.ts), a sibling of `readLine` and `checklist`.
+- **proof** — [`test/test_observe.py`](../test/test_observe.py) pins both reads: the echoes gather, clustering, degrade path, and route shape with the embedder faked, and the reminders pairing, ordering, and route gate; [`test/qa/0009_observe_echoes_smoke.py`](../test/qa/0009_observe_echoes_smoke.py) proves the real embedding actually clusters paraphrases against a live model, and is where the threshold is tuned; [`test/qa/0010_observe_reminders_smoke.py`](../test/qa/0010_observe_reminders_smoke.py) drives the real two-gate seam against live models, proving the sharpened decision schedules an explicit request and declines a bare mention, then renders the pairing the card shows.

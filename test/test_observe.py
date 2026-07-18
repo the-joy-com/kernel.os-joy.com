@@ -1,9 +1,13 @@
-"""Observe: the read behind the /observe hub's echoes card.
+"""Observe: the reads behind the /observe hub's cards.
 
 recent_utterances is a pure read over the machine side of the conversation stream, so the tests pin the two
 things it must get right and nothing it doesn't: that each utterance is resolved to its words and labelled by
 the mechanism that raised it (a fast reply, a deep follow-up, a note), and that the stream's own order is
 handed back oldest-first with the symbiot's own lines left out. It writes nothing, so there is no write to check.
+
+recent_reminders is the read behind the second card: a plain join of the reminder ledger to its triggering
+intake, so the tests pin what that card is for — each reminder paired with the human line that triggered it,
+newest first — and that the route gates on a session and renders its times on the symbiot's own clock.
 """
 
 from core import db
@@ -68,8 +72,24 @@ def _item(role, *, intake_id=None, missive_id=None, symbiot_id=SEEDED_SYMBIOT_ID
     ).fetchone()[0])
 
 
+def _reminder(trigger, body, *, fire_at_sql="now() + interval '1 day'", fired=False,
+              symbiot_id=SEEDED_SYMBIOT_ID, channels=None) -> int:
+    # A reminder is only ever raised from a message, so it carries a triggering intake — seed one for it.
+    intake_id = _intake(message=trigger, answer="ok", symbiot_id=symbiot_id)
+    fired_sql = "now()" if fired else "NULL"
+    return _with_conn(lambda c: c.execute(
+        f"INSERT INTO reminder (intake_id, symbiot_id, body, fire_at, fired_at, channels) "
+        f"VALUES (%s, %s, %s, {fire_at_sql}, {fired_sql}, %s) RETURNING id",
+        (intake_id, symbiot_id, body, channels),
+    ).fetchone()[0])
+
+
 def _recent(**kwargs):
     return _with_conn(lambda c: observe.recent_machine_utterances(c, SEEDED_SYMBIOT_ID, **kwargs))
+
+
+def _recent_reminders(**kwargs):
+    return _with_conn(lambda c: observe.recent_reminders(c, SEEDED_SYMBIOT_ID, **kwargs))
 
 
 def test_labels_each_mechanism_and_resolves_its_words(client):
@@ -237,3 +257,53 @@ def test_echoes_skips_scoring_for_a_lone_line(client, monkeypatch):
     assert result.scored is True
     assert result.clusters == []
     assert [u.text for u in result.singles] == ["only one"]
+
+
+def test_reminders_pair_each_with_its_trigger_newest_first(client):
+    # The pairing is the whole point: each reminder carries the human line that triggered it,
+    # so an over-eager schedule is legible. Newest first, the order the audit is read in.
+    _reminder("remind me to call the dentist tomorrow", "call the dentist")
+    _reminder("don't let me forget to email Sam", "email Sam", fired=True, channels=["email"])
+
+    got = _recent_reminders()
+
+    assert [r.trigger for r in got] == [
+        "don't let me forget to email Sam",
+        "remind me to call the dentist tomorrow",
+    ]
+    assert [r.body for r in got] == ["email Sam", "call the dentist"]
+    assert [r.fired for r in got] == [True, False]
+    assert [r.channels for r in got] == [["email"], None]
+
+
+def test_reminders_limit_keeps_the_newest(client):
+    for n in range(5):
+        _reminder(f"remind me n{n}", f"body{n}")
+
+    got = _recent_reminders(limit=2)
+
+    assert [r.trigger for r in got] == ["remind me n4", "remind me n3"]
+
+
+def test_reminders_route_requires_a_session(client):
+    # A symbiot's own reminders are not an anonymous thing to show, so no session is turned away.
+    body = client.get("/observe/reminders").json()
+    assert body["msg"] == "not authenticated"
+
+
+def test_reminders_route_returns_the_pairing_with_local_time_labels(client, fake_email):
+    token = _token(client, fake_email)
+    _reminder("remind me to stretch at 3", "stretch")
+
+    body = client.get("/observe/reminders", headers=_auth(token)).json()
+
+    assert body["msg"] == "observe reminders"
+    reminders = body["data"]["reminders"]
+    assert len(reminders) == 1
+    r = reminders[0]
+    assert r["trigger"] == "remind me to stretch at 3"
+    assert r["body"] == "stretch"
+    assert r["fired"] is False
+    assert r["channels"] is None
+    assert r["fire_at"], "expected a rendered local-time label"
+    assert r["created_at"], "expected a rendered local-time label"

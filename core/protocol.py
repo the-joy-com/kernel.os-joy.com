@@ -51,6 +51,7 @@ NOTIFICATIONS = "notifications"  # GET/POST /notifications — the current per-c
 
 # Observe: the observability corner's read surface, one word per card (authed only).
 OBSERVE_ECHOES = "observe echoes"  # GET /observe/echoes — the scored redundancy rides in data (clusters, singles, scored)
+OBSERVE_REMINDERS = "observe reminders"  # GET /observe/reminders — recent reminders and their triggering lines ride in data
 
 # Models: the operator's model catalog and role assignments (authed only, box-level).
 MODELS = "models"  # GET /models and a successful POST — the full state (catalog, roles, assignable_roles) rides in data

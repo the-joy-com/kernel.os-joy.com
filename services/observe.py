@@ -14,6 +14,11 @@ and labelling each by the mechanism that raised it, which falls out for free fro
 an intake pointer is a fast reply, a missive an enrichment marks is a deep follow-up, any other missive a note.
 echoes then embeds those lines and groups the near-duplicates into clusters — the *more or less* the same,
 measured as cosine closeness rather than guessed at — leaving the lines that echoed nothing to stand alone.
+
+The second card is reminders: the symbiot's most recently scheduled reminders, each paired with the human line
+that triggered it (recent_reminders). Its point is that pairing — the message said, and the reminder it produced —
+so a reminder set against a line that only *mentioned* a task, rather than asked for one, is visible at a glance,
+and the real examples can be gathered to harden the tool's judgment. A plain read of the reminder ledger, like the rest here.
 """
 
 from collections import defaultdict
@@ -27,6 +32,11 @@ from services.adapters import embedding
 # A knob left deliberately generous and un-tuned: the observe-first ethic is to set it against real output later,
 # not guess the right window blind — so it lives here as a plain default, not in config yet.
 RECENT_UTTERANCE_LIMIT = 40
+
+# How many reminders the reminders lens reaches back over — a shorter window than the utterances one,
+# because a reminder is a rarer event and the card is read to spot a bad pairing, not to scroll a stream.
+# The same un-tuned plain default, to be set against real use rather than guessed at blind.
+RECENT_REMINDER_LIMIT = 20
 
 
 @dataclass
@@ -71,6 +81,28 @@ class MachineEchoes:
     scored: bool
     clusters: list[MachineUtteranceCluster]
     singles: list[MachineUterrance]
+
+
+@dataclass
+class RecentReminder:
+    """One scheduled reminder as the reminders lens reports it — the effect and the line that triggered it.
+
+    trigger is the human message the reminder was scheduled from, the words that made the machine act;
+    it is the pairing the card exists for, since a reminder set against a line that only mentioned a task —
+    rather than asked to be reminded — is exactly the over-eagerness this lens is meant to surface.
+    body is the line to be said back when it fires.
+    fire_at is when it is due and created_at when it was scheduled, both absolute instants
+    to be rendered in the symbiot's own zone.
+    fired is whether it has already been delivered, so a pending reminder reads apart from a spent one.
+    channels is where it is to be delivered, or None when the symbiot named none and it rides every channel.
+    """
+
+    trigger: str
+    body: str
+    fire_at: datetime
+    created_at: datetime
+    fired: bool
+    channels: list[str] | None
 
 
 def held_back_count(conn, symbiot_id: int) -> int:
@@ -187,4 +219,30 @@ def recent_machine_utterances(conn, symbiot_id: int, limit: int = RECENT_UTTERAN
     return [
         MachineUterrance(mechanism=r[0], text=r[1], trigger=r[2], created_at=r[3])
         for r in reversed(rows)
+    ]
+
+
+def recent_reminders(conn, symbiot_id: int, limit: int = RECENT_REMINDER_LIMIT) -> list[RecentReminder]:
+    """The symbiot's most recently scheduled reminders, newest first, for the reminders lens.
+
+    Reads the reminder ledger and resolves each row to the human message that triggered it (intake.message),
+    so the card shows the pairing that matters for hardening the tool: the line said, and the reminder it produced.
+    Every reminder carries a triggering intake (the schedule is only ever raised from a message), so the join always resolves.
+    Newest first, the order a "last few reminders" audit is scanned in, and bounded by `limit` at that newest end.
+    A pure read: it touches the reminder and intake rows only, holds no lock, and writes nothing — off the loop's path.
+    """
+    rows = conn.execute(
+        """
+        SELECT i.message, r.body, r.fire_at, r.created_at, r.fired_at IS NOT NULL, r.channels
+        FROM reminder r
+        JOIN intake i ON i.id = r.intake_id
+        WHERE r.symbiot_id = %(symbiot)s
+        ORDER BY r.id DESC
+        LIMIT %(limit)s
+        """,
+        {"symbiot": symbiot_id, "limit": limit},
+    ).fetchall()
+    return [
+        RecentReminder(trigger=r[0], body=r[1], fire_at=r[2], created_at=r[3], fired=r[4], channels=r[5])
+        for r in rows
     ]

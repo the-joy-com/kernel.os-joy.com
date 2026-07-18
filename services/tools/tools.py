@@ -375,24 +375,36 @@ def _decide_prompt(
         else "(nothing said yet)"
     )
     return (
-        "You decide whether the human symbiot's message is asking you to use one of your tools, and if so, "
-        "which one and with what arguments.\n\n"
-        f"For reference, the human symbiot's local date and time right now is "
+        "You decide whether the human symbiot's message is asking you to use one of your tools, "
+        "and if so, which one and with what arguments.\n\n"
+        "For reference, the human symbiot's local date and time right now is "
         f"{now_local.strftime('%Y-%m-%d %H:%M')} ({zone_name}). "
-        "Resolve any time in the message against this — a relative one (\"in 20 minutes\", \"tomorrow at 9\") "
-        "and an absolute one (\"on the 14th at noon\") both become a concrete local date and time. "
+        "Resolve any time in the message against this — "
+        'a relative one ("in 20 minutes", "tomorrow at 9") '
+        'and an absolute one ("on the 14th at noon") '
+        "both become a concrete local date and time. "
         "Give it as the human's own wall-clock reading (for example 2026-07-14 20:05); "
         "do not convert it to UTC, and do not attach a timezone offset.\n\n"
         f"Your tools (name — what it does):\n{tools_block}\n\n"
         f"The recent conversation, so an argument that refers back resolves:\n{tail_block}\n\n"
         f'The human symbiot just said:\n"{message}"\n\n'
-        "Set `tool` to the name of the tool the message is asking for, and fill that tool's argument fields. "
-        f'If the message is not asking for any tool, set `tool` to "{NO_TOOL}" and leave the arguments null. '
+        "Almost every message asks for no tool at all — it is talk, not a request to act — "
+        f'so "{NO_TOOL}" is the expected answer, '
+        "and you reach for a tool only when the message plainly asks you to do that thing. "
+        "A tool fits when the human is asking you to act; "
+        "it does not fit when they are telling you something, thinking aloud, or naming a plan — "
+        "a message that merely mentions a future task or event "
+        '("I need to call the dentist tomorrow", "the meeting is at 3") '
+        "is not by itself a request to act on it. "
+        "Set `tool` to a tool's name only on a clear, explicit request for it, "
+        "and fill that tool's argument fields; "
+        f'otherwise set `tool` to "{NO_TOOL}" and leave the arguments null. '
         "Fill an argument only when the message gives it clearly; "
         "if you cannot read one with confidence — a time you are unsure of, say — "
         "leave it null rather than guessing, so the human can be asked. "
-        "For a delivery-channel argument, read the channel straight from the request "
-        "when the human names one (\"by email\" is email, \"push me\" is web push), "
+        "For a delivery-channel argument, "
+        "read the channel straight from the request when the human names one "
+        '("by email" is email, "push me" is web push), '
         "and leave it null when they name none — "
         "a null there means the default of reaching them on every channel, "
         "so never invent one they didn't mention."

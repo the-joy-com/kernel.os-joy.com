@@ -65,6 +65,7 @@ DESCRIPTION = (
     "Use this when they ask to be reminded of something later — "
     '"remind me to call the dentist tomorrow at 9", '
     '"don\'t let me forget to email Sam this evening". '
+    "It fits only an explicit request to be reminded, not a message that merely mentions a future task or event. "
     "One message, one time, one reminder."
 )
 

@@ -604,6 +604,51 @@ def observe_machine_echoes(
     )
 
 
+@app.get("/observe/reminders")
+def observe_reminders(
+    conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)
+) -> dict:
+    """The reminders lens: the symbiot's most recently scheduled reminders, each with the line that triggered it — authed only.
+
+    The observability corner's second card (see services/observe.py). Read-only like the first:
+    it reports reminders already scheduled and writes nothing, so opening it can never change how the machine behaves.
+    Its point is the pairing — the human message and the reminder it produced —
+    so an over-eager schedule (a reminder set against a line that only mentioned a task, never asked for one)
+    is visible, and the real examples can be gathered to harden the tool's judgment against them.
+    Authed-gated like the echoes card: a symbiot's own reminders are not an anonymous thing to show,
+    so a caller with no live session is turned away with NOT_AUTHED.
+    fire_at and created_at are rendered in the symbiot's own zone — the same clock the reminder was set on —
+    so the shell prints ready labels rather than re-deriving the local time itself.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    zone_name = zone.of(conn, symbiot_id)
+    reminders = observe.recent_reminders(conn, symbiot_id)
+    return envelope(
+        protocol.OBSERVE_REMINDERS,
+        {
+            "reminders": [
+                {
+                    # trigger: the human line the reminder was scheduled from — the pairing this card exists to show.
+                    "trigger": r.trigger,
+                    # body: the line to be said back when the reminder fires.
+                    "body": r.body,
+                    # fire_at: when it is (or was) due, on the symbiot's own clock.
+                    "fire_at": zone.local(r.fire_at, zone_name).strftime("%a %d %b %Y, %H:%M"),
+                    # created_at: when it was scheduled, same clock — so a suspicious pairing can be placed in time.
+                    "created_at": zone.local(r.created_at, zone_name).strftime("%a %d %b %Y, %H:%M"),
+                    # fired: whether it has already been delivered, so a pending reminder reads apart from a spent one.
+                    "fired": r.fired,
+                    # channels: where it is delivered, or null when the symbiot named none and it rides every channel.
+                    "channels": r.channels,
+                }
+                for r in reminders
+            ],
+        },
+    )
+
+
 @app.get("/push/key")
 def push_key() -> dict:
     # The public application server key the shell subscribes with.
