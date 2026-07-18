@@ -46,26 +46,27 @@ class Related:
 
 
 def deep_search(
-    conn, query_text: str, *, exclude_intake_id: int | None = None
+    conn, query_text: str, *, exclude_intake_ids: list[int] | None = None
 ) -> list[Related]:
-    """The whole deep reach for one message: vector recall, then the ontology walk out from it.
+    """The whole deep reach for one message or burst: vector recall, then the ontology walk out from it.
 
     Recall the nearest facts by meaning, then expand along the concepts they are filed under to their siblings,
     and return the two joined — the recalled facts first, in distance order, then the walked-in siblings,
     de-duplicated so a fact reached both ways appears once (its recall entry, which carries the measured distance, wins).
-    The message's own fact is excluded throughout, so a message never enriches itself.
+    The facts the reaching message or burst became are excluded throughout, so a message never enriches itself —
+    a single message excludes its own one fact, a burst enrichment excludes every member's fact.
     An empty list means the diary held nothing that bears on the message by meaning — the signal to send no enrichment.
     """
-    recalled = recall_facts(conn, query_text, exclude_intake_id=exclude_intake_id)
+    recalled = recall_facts(conn, query_text, exclude_intake_ids=exclude_intake_ids)
     siblings = expand_by_concept(
-        conn, [f.id for f in recalled], exclude_intake_id=exclude_intake_id
+        conn, [f.id for f in recalled], exclude_intake_ids=exclude_intake_ids
     )
     seen = {f.id for f in recalled}
     return recalled + [s for s in siblings if s.id not in seen]
 
 
 def expand_by_concept(
-    conn, seed_ids: list[int], *, exclude_intake_id: int | None = None, limit: int | None = None
+    conn, seed_ids: list[int], *, exclude_intake_ids: list[int] | None = None, limit: int | None = None
 ) -> list[Related]:
     """The sibling facts filed under the same concepts as the seed facts — the ontology-walk movement.
 
@@ -75,7 +76,7 @@ def expand_by_concept(
     Facts sharing more of the seeds' concepts come first — the ordering the walk has in place of a distance —
     with effective time breaking the tie, the fresher of two equally-connected facts leading.
 
-    The seeds themselves are excluded (they are already in hand from recall), and so is the message's own fact.
+    The seeds themselves are excluded (they are already in hand from recall), and so are the reaching messages' own facts.
     An empty seed set returns an empty list — nothing was recalled to walk out from — so the caller need not special-case it.
     Distance is None on everything here: these facts were reached through the tree, not measured against the query.
     """
@@ -97,18 +98,18 @@ def expand_by_concept(
         JOIN concepts    c  ON c.ontology_id = link.ontology_id
         JOIN diary_facts df ON df.id = link.diary_fact_id
         WHERE df.id <> ALL(%(seeds)s)
-          AND (%(exclude)s::bigint IS NULL OR df.intake_id IS DISTINCT FROM %(exclude)s::bigint)
+          AND (df.intake_id IS NULL OR df.intake_id <> ALL(%(exclude)s::bigint[]))
         GROUP BY df.id, df.raw_text, effective_at
         ORDER BY shared DESC, effective_at DESC
         LIMIT %(limit)s
         """,
-        {"seeds": seed_ids, "exclude": exclude_intake_id, "limit": limit},
+        {"seeds": seed_ids, "exclude": exclude_intake_ids or [], "limit": limit},
     ).fetchall()
     return [Related(r[0], r[1], r[2], None) for r in rows]
 
 
 def recall_facts(
-    conn, query_text: str, *, exclude_intake_id: int | None = None, limit: int | None = None
+    conn, query_text: str, *, exclude_intake_ids: list[int] | None = None, limit: int | None = None
 ) -> list[Related]:
     """The nearest diary facts to `query_text` by meaning, nearest first — the vector-recall movement.
 
@@ -117,9 +118,9 @@ def recall_facts(
     Reads through active_diary_fact_embedding — the view that always resolves to the live model's set —
     so a model swap costs this query nothing and it never names a versioned table, the same stance the router reads under.
 
-    exclude_intake_id drops the fact this very message became, when it has already been filed:
+    exclude_intake_ids drops the facts the reaching message or burst became, when they have already been filed:
     a message must never enrich itself with the fact it turned into, the same boundary the reply keeps for its own tail.
-    (Ingestion may not have filed it yet; the filter is simply a no-op when the fact isn't there.)
+    (Ingestion may not have filed them yet; the filter is simply a no-op when a fact isn't there.)
 
     ef_search — the HNSW working-set width — is opened per query, comfortably above the pool,
     for the same reason the router opens it: a set no wider than the result would cap recall from the very first fact.
@@ -145,10 +146,10 @@ def recall_facts(
                    e.embedding <=> %(q)s::vector AS distance
             FROM active_diary_fact_embedding e
             JOIN diary_facts df ON df.id = e.diary_fact_id
-            WHERE (%(exclude)s::bigint IS NULL OR df.intake_id IS DISTINCT FROM %(exclude)s::bigint)
+            WHERE (df.intake_id IS NULL OR df.intake_id <> ALL(%(exclude)s::bigint[]))
             ORDER BY e.embedding <=> %(q)s::vector
             LIMIT %(limit)s
             """,
-            {"q": vector_literal, "exclude": exclude_intake_id, "limit": limit},
+            {"q": vector_literal, "exclude": exclude_intake_ids or [], "limit": limit},
         ).fetchall()
     return [Related(r[0], r[1], r[2], r[3]) for r in rows]

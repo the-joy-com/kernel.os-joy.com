@@ -205,59 +205,74 @@ def _decide_tool(
 
 
 def _enrich_one() -> bool:
-    """Run the deep second pass on one answered message, sending a follow-up if it earns one. True if there was one to run.
+    """Run the deep second pass on the oldest settled burst, sending a follow-up if it earns one. True if there was one to run.
 
-    Tier 2's background half, cut from the ingestion sweep's cloth:
-    once a message's fast reply is settled, this reaches deeper into the diary by meaning (deep_retrieval.deep_search) —
-    vector recall plus the ontology walk out from it — and, only when that reach adds something the fast answer didn't,
-    the machine sends an enriched follow-up. All of it off the path the symbiot waited on, so the fast reply carries no cost from it.
-    Each pass finds an answered, authed message with no enrichment yet (next_to_enrich),
-    claims the symbiot's enrichment so no other worker forms a deep reply for it at the same time (claim),
-    gathers the deep facts and the origin reference the follow-up must situate itself against (deep_search, origin_reference),
-    and gates-and-composes on the heavy model (compose) — which stays silent unless the enrichment is worth the interruption.
+    Tier 2's background half, cut from the ingestion sweep's cloth, and debounced at the source:
+    a message is not enriched the instant it is answered — the pass waits until the conversation has gone quiet (config.ENRICH_SETTLE_SECONDS),
+    and then reaches deeper on the whole burst it ended, as one unit (next_burst_to_enrich).
+    So an active back-and-forth no longer fires a deep pass per line over overlapping diary facts,
+    and the follow-up never interrupts the exchange while it is still live. All of it off the path the symbiot waited on.
+    Each pass finds the oldest settled burst, claims the symbiot's enrichment so no other worker forms a deep reply for it at once (claim),
+    speaks the burst as one — its messages joined for the deep reach and the origin's "what they said", its answers for "what you already said" —
+    gathers the deep facts and the origin reference (deep_search, origin_reference, excluding every member so the burst never enriches itself),
+    and gates-and-composes on the heavy model (compose), which stays silent unless the enrichment is worth the interruption.
+
+    Downstream of the gate is the guarantee: even a surfaced follow-up is held back if it echoes a deep reply already sent (is_echo_of_prior) —
+    measured all-time by cosine closeness, so the near-duplicate the debounce didn't prevent is caught before it is delivered.
 
     The whole pass runs inside one transaction on one connection, under a non-blocking advisory lock claimed up front —
     the same shape, and the same reason, as the compression fold, but keyed on the symbiot rather than the message:
-    without the lock, two adjacent messages could each run the deep reach and the composing call at once,
-    neither seeing the other's follow-up yet, and both deliver near-identical deep replies.
-    With it, the second worker's claim comes back False and it skips the symbiot this pass rather than blocking,
-    so its next message stays eligible until the first is committed and on the stream for the gate to weigh against.
-    Holding the connection across the model call is the cost of a transaction-scoped lock, and a fair one here:
-    only one deep reply for a symbiot is in flight at a time, so it pins a single pooled slot briefly, never the reply path.
-    A follow-up and its provenance row commit together — sent-and-recorded atomically — so a crash before the commit
-    leaves nothing sent and the message still eligible, and a commit records the pass so it is never re-run;
+    with it, a second worker's claim comes back False and it skips the symbiot this pass rather than blocking,
+    so the burst stays eligible until the first pass commits, and the second never races it to a duplicate.
+    Every member's provenance row commits with the follow-up (record_burst) — sent-and-recorded atomically —
+    so a crash before the commit leaves nothing sent and the burst still eligible, and a commit records the pass so it is never re-run;
     exactly-once falls out of the UNIQUE intake_id the same way ingestion's does, the lock only keeping concurrent passes from racing to it.
     """
     pool = db.get_pool()
     missive_id = None
+    follow_up = ""
+    symbiot_id = None
     with pool.connection() as conn:
         with conn.transaction():
-            pending = enrichment.next_to_enrich(conn)
-            if pending is None:
+            burst = enrichment.next_burst_to_enrich(conn, config.ENRICH_SETTLE_SECONDS)
+            if burst is None:
                 return False
-            intake_id, symbiot_id, message, answer = pending
+            symbiot_id = burst.symbiot_id
             if not enrichment.claim(conn, symbiot_id):
                 # Another worker is already forming a deep reply for this symbiot;
-                # skip cleanly rather than race it to a duplicate follow-up — this message stays eligible for the next pass.
+                # skip cleanly rather than race it to a duplicate follow-up — this burst stays eligible for the next pass.
                 return False
-            related = deep_retrieval.deep_search(conn, message, exclude_intake_id=intake_id)
-            origin = enrichment.origin_reference(conn, symbiot_id, intake_id, message, answer)
+            member_ids = [m.intake_id for m in burst.members]
+            # Speak the burst as one: its messages joined for the deep query and the "what they said" leg,
+            # its fast answers joined for the "what you already said" leg the gate must not restate.
+            messages = "\n\n".join(m.message for m in burst.members)
+            answers = "\n\n".join(m.answer for m in burst.members)
+            related = deep_retrieval.deep_search(conn, messages, exclude_intake_ids=member_ids)
+            origin = enrichment.origin_reference(conn, symbiot_id, member_ids, messages, answers)
             # The symbiot's zone and local now, so the deep facts' dates render in the human's local day
-            # and the follow-up — composed a beat after the fast answer — reasons about "now" against a real present,
+            # and the follow-up — composed a beat after the burst settled — reasons about "now" against a real present,
             # the same current-time reference the fast reply already states rather than the void the deep pass had before.
             zone_name = zone.of(conn, symbiot_id)
             now_local = zone.now_for(zone_name)
             surface, follow_up = enrichment.compose(origin, related, zone_name=zone_name, now_local=now_local)
+            # The downstream guard: hold a surfaced follow-up that echoes one already sent, whatever its age (all-time, measured).
+            # echo_suppressed marks the difference for the audit trail — a follow-up the guard muzzled, not a gate that stayed silent.
+            echo_suppressed = False
             if surface:
-                # Raise the missive and mirror it onto the conversation stream in this same transaction,
-                # so the follow-up and the provenance row that records it commit together — sent and recorded atomically.
-                # missive.deliver is deliberately not called: it opens its own transaction and would split the send
-                # from the record, so its two data-access steps are replicated here to land under this pass's one commit.
-                missive_id = missive.raise_for(conn, symbiot_id, follow_up)
-                conversation.record_utterance(
-                    conn, symbiot_id, "machine", follow_up, missive_id=missive_id
-                )
-            enrichment.record(conn, intake_id, symbiot_id, missive_id)
+                if enrichment.is_echo_of_prior(conn, symbiot_id, follow_up):
+                    echo_suppressed = True
+                else:
+                    # Raise the missive and mirror it onto the conversation stream in this same transaction,
+                    # so the follow-up and the provenance rows that record it commit together — sent and recorded atomically.
+                    # missive.deliver is deliberately not called: it opens its own transaction and would split the send
+                    # from the record, so its two data-access steps are replicated here to land under this pass's one commit.
+                    missive_id = missive.raise_for(conn, symbiot_id, follow_up)
+                    conversation.record_utterance(
+                        conn, symbiot_id, "machine", follow_up, missive_id=missive_id
+                    )
+            # Record every member of the burst as considered — the anchor carrying the outcome (the missive if one surfaced,
+            # or echo_suppressed if the guard held it), the rest as plain suppressed passes — so none stays eligible on its own.
+            enrichment.record_burst(conn, burst.members, symbiot_id, missive_id, echo_suppressed=echo_suppressed)
     # Nudge the symbiot that a missive is waiting — outside the transaction, so a slow push never holds a connection,
     # and best-effort, because the record already stands: the follow-up surfaces on the next /inbox open regardless.
     if missive_id is not None:
@@ -355,7 +370,7 @@ def _gather_context(
         return [], conversation.Conversation(gist=None, tail=[]), zone.DEFAULT_ZONE, []
     with pool.connection() as conn:
         facts = retrieval.search(conn, message)
-        conv = conversation.recent(conn, symbiot_id, exclude_intake_id=message_id)
+        conv = conversation.recent(conn, symbiot_id, exclude_intake_ids=[message_id])
         zone_name = zone.of(conn, symbiot_id)
         shortlist = tools.search_catalog(conn, message)
     return facts, conv, zone_name, shortlist

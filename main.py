@@ -594,6 +594,12 @@ def observe_machine_echoes(
             ],
             # singles: the lines that echoed nothing, oldest first.
             "singles": [render(u) for u in result.singles],
+            # held_back: how many deep follow-ups the echo guard suppressed as near-duplicates, all-time —
+            # the other side of the coin from the clusters above.
+            # The clusters are the redundancy that got through and reached the symbiot;
+            # this count is the redundancy the guard stopped before it was ever sent,
+            # so a follow-up the machine muzzled leaves a visible trace rather than vanishing silently.
+            "held_back": observe.held_back_count(conn, symbiot_id),
         },
     )
 

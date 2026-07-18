@@ -50,6 +50,16 @@ def _enrichment(intake_id, missive_id, symbiot_id=SEEDED_SYMBIOT_ID) -> None:
     ))
 
 
+def _enrichment_pass(intake_id, *, echo_suppressed, symbiot_id=SEEDED_SYMBIOT_ID) -> None:
+    # A suppressed enrichment pass — no missive — told apart by why it was silent:
+    # echo_suppressed true for a follow-up the guard held back, false for a gate that had nothing to add.
+    _with_conn(lambda c: c.execute(
+        "INSERT INTO enrichment (intake_id, symbiot_id, surfaced, missive_id, echo_suppressed) "
+        "VALUES (%s, %s, false, NULL, %s)",
+        (intake_id, symbiot_id, echo_suppressed),
+    ))
+
+
 def _item(role, *, intake_id=None, missive_id=None, symbiot_id=SEEDED_SYMBIOT_ID) -> int:
     return _with_conn(lambda c: c.execute(
         "INSERT INTO conversation_item (symbiot_id, role, token_count, intake_id, missive_id) "
@@ -132,6 +142,28 @@ def test_route_returns_a_scored_shape_with_a_local_time_label(client, fake_email
     assert u["text"] == "the reindex is slow"
     assert u["trigger"] == "how's it going"
     assert u["when"], "expected a rendered local-time label"
+    assert data["held_back"] == 0  # nothing has been muzzled yet, and the field is always present
+
+
+def test_held_back_count_counts_only_echo_suppressed_passes(client):
+    # The audit count is the guard's tally alone: a sent follow-up and a gate-chose-silence pass don't count,
+    # only the follow-ups the echo guard composed and then held back.
+    _enrichment(_intake("q1", "a1"), _missive("a follow-up that was sent"))  # surfaced — not held back
+    _enrichment_pass(_intake("q2", "a2"), echo_suppressed=False)             # gate chose silence — not an echo
+    _enrichment_pass(_intake("q3", "a3"), echo_suppressed=True)              # held back as an echo
+    _enrichment_pass(_intake("q4", "a4"), echo_suppressed=True)              # held back as an echo
+
+    assert _with_conn(lambda c: observe.held_back_count(c, SEEDED_SYMBIOT_ID)) == 2
+
+
+def test_route_carries_the_held_back_count(client, fake_email):
+    token = _token(client, fake_email)
+    _item("machine", intake_id=_intake(message="q", answer="only one"))  # one line — echoes short-circuits, no model
+    _enrichment_pass(_intake("q2", "a2"), echo_suppressed=True)
+
+    body = client.get("/observe/echoes", headers=_auth(token)).json()
+
+    assert body["data"]["held_back"] == 1
 
 
 def test_echoes_clusters_near_duplicates_and_leaves_the_rest_single(client, monkeypatch):

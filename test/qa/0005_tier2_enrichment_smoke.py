@@ -129,7 +129,7 @@ def main() -> None:
 
             # --- 1. the contrast: lexical misses, meaning finds -------------------------------
             lexical = [f.raw_text for f in retrieval.search(conn, MESSAGE)]
-            deep = deep_retrieval.deep_search(conn, MESSAGE, exclude_intake_id=intake_id)
+            deep = deep_retrieval.deep_search(conn, MESSAGE, exclude_intake_ids=[intake_id])
             deep_texts = [r.raw_text for r in deep]
 
             print(f"\n=== the message ===\n  {MESSAGE!r}")
@@ -157,7 +157,8 @@ def main() -> None:
             print("  ✓ the meaning-based reach surfaced themed facts the lexical reach could not")
 
             # --- 2. the enriched follow-up, composed live -------------------------------------
-            origin = enrichment.origin_reference(conn, symbiot_id, intake_id, MESSAGE, FAST_ANSWER)
+            # A single-message smoke, so the burst is this one message: exclude just its own id, and its message/answer are the whole legs.
+            origin = enrichment.origin_reference(conn, symbiot_id, [intake_id], MESSAGE, FAST_ANSWER)
             surface, follow_up = enrichment.compose(origin, deep)
             print(f"\n=== the gate-and-compose (live {config.ENRICH_MODEL}) ===")
             print(f"  fast answer it must not repeat : {FAST_ANSWER!r}")
@@ -184,8 +185,10 @@ def main() -> None:
             print(f"  enrichment row: surfaced={recorded[0]}, missive_id={recorded[1]}")
             assert recorded[0] == (missive_id is not None), "the recorded verdict disagrees with what was sent"
             # The exactly-once mirror: the message now bears an enrichment row, so the sweep would never re-run it.
-            still_eligible = enrichment.next_to_enrich(conn)
-            assert still_eligible is None or still_eligible[0] != intake_id, \
+            # Read at settle 0, where each message is its own immediately-settled burst — so if this one were still
+            # eligible it would come back as a burst carrying its id.
+            still_eligible = enrichment.next_burst_to_enrich(conn, 0)
+            assert still_eligible is None or intake_id not in [m.intake_id for m in still_eligible.members], \
                 "the enriched message is still eligible — it would be re-run"
             print("  ✓ the pass is recorded, so the sweep considers this message exactly once")
 

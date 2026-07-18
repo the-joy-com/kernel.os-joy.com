@@ -66,7 +66,7 @@ def test_expand_excludes_the_messages_own_fact(client):
     _fact("the message's own fact", [c1], intake_id=own_message)
 
     with db.get_pool().connection() as conn:
-        related = deep_retrieval.expand_by_concept(conn, [seed], exclude_intake_id=own_message)
+        related = deep_retrieval.expand_by_concept(conn, [seed], exclude_intake_ids=[own_message])
 
     assert related == []  # the only sibling was the message's own fact, excluded
 

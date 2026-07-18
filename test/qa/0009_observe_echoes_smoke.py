@@ -40,6 +40,7 @@ import psycopg
 
 from core import config
 from core import db
+from services import echo
 from services import observe
 from services.adapters import embedding
 
@@ -84,7 +85,7 @@ def main() -> None:
     print(f"database  : {config.DATABASE_URL}")
     print(f"embedding : {config.EMBEDDING_MODEL}")
     print(f"ollama    : {config.OLLAMA_BASE_URL}")
-    print(f"threshold : {observe.ECHO_THRESHOLD}  (the default an echo must clear)")
+    print(f"threshold : {echo.ECHO_THRESHOLD}  (the default an echo must clear)")
 
     pool = db.open_pool(config.DATABASE_URL)
     db.run_migrations(pool)  # idempotent — brings the dev database to the current schema if it isn't already
@@ -104,7 +105,7 @@ def main() -> None:
             pairs = []
             for i in range(len(REPLIES)):
                 for j in range(i + 1, len(REPLIES)):
-                    s = observe._cosine(vectors[i], vectors[j])
+                    s = echo.cosine(vectors[i], vectors[j])
                     pairs.append((s, i, j))
             for s, i, j in sorted(pairs, reverse=True):
                 mark = "  paraphrases" if i < len(PARAPHRASES) and j < len(PARAPHRASES) else ""
@@ -124,7 +125,7 @@ def main() -> None:
 
             # The real lens over the same lines: what the default threshold actually clusters.
             result = observe.machine_echoes(conn, symbiot_id)
-            print(f"\n=== observe.echoes at threshold {observe.ECHO_THRESHOLD} ===")
+            print(f"\n=== observe.echoes at threshold {echo.ECHO_THRESHOLD} ===")
             print(f"  scored: {result.scored}")
             for c in result.clusters:
                 print(f"  echo · {c.similarity:.3f}")

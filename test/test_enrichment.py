@@ -48,12 +48,45 @@ def _enrichments():
         ).fetchall()
 
 
+def _echo_flag(intake_id):
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "SELECT echo_suppressed FROM enrichment WHERE intake_id = %s", (intake_id,)
+        ).fetchone()[0]
+
+
 def _missives():
     with db.get_pool().connection() as conn:
         return conn.execute(
             "SELECT id, body FROM missive WHERE symbiot_id = %s ORDER BY id",
             (SEEDED_SYMBIOT_ID,),
         ).fetchall()
+
+
+def _intake_at(seconds_ago, message="a message", answer="an answer", *, symbiot_id=SEEDED_SYMBIOT_ID, status="answered") -> int:
+    # An intake row stamped a fixed distance into the past, so the burst-settling read has real gaps and a real "now" to measure.
+    with db.get_pool().connection() as conn:
+        return conn.execute(
+            "INSERT INTO intake (message, answer, symbiot_id, status, created_at) "
+            "VALUES (%s, %s, %s, %s, now() - make_interval(secs => %s)) RETURNING id",
+            (message, answer, symbiot_id, status, seconds_ago),
+        ).fetchone()[0]
+
+
+def _seed_deep_reply(body="an earlier deep reply") -> int:
+    # A surfaced enrichment: a missive the machine sent as a deep follow-up, and the provenance row that claims it.
+    # This is what prior_deep_replies reads and the echo guard measures a new candidate against.
+    intake_id = _intake()
+    with db.get_pool().connection() as conn:
+        missive_id = conn.execute(
+            "INSERT INTO missive (symbiot_id, body) VALUES (%s, %s) RETURNING id",
+            (SEEDED_SYMBIOT_ID, body),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO enrichment (intake_id, symbiot_id, surfaced, missive_id) VALUES (%s, %s, true, %s)",
+            (intake_id, SEEDED_SYMBIOT_ID, missive_id),
+        )
+    return missive_id
 
 
 def _one_related():
@@ -98,6 +131,7 @@ def test_enrich_records_a_suppressed_pass_without_a_missive(client, monkeypatch)
     assert worker._enrich_one() is True
     assert _missives() == []
     assert _enrichments() == [(intake_id, False, None)]  # considered, suppressed, no missive
+    assert _echo_flag(intake_id) is False  # the gate chose silence — not a follow-up the guard held back
 
 
 def test_enrich_skips_an_anonymous_message(client, monkeypatch):
@@ -289,7 +323,7 @@ def test_origin_reference_gathers_the_recent_conversation_including_prior_follow
     _item("symbiot", intake_id=_intake(message="thanks", answer="anytime"))  # a turn after M
 
     with db.get_pool().connection() as conn:
-        origin = enrichment.origin_reference(conn, SEEDED_SYMBIOT_ID, m, "still so tired", "get some sleep")
+        origin = enrichment.origin_reference(conn, SEEDED_SYMBIOT_ID, [m], "still so tired", "get some sleep")
 
     assert origin.message == "still so tired"
     assert origin.answer == "get some sleep"
@@ -300,3 +334,142 @@ def test_origin_reference_gathers_the_recent_conversation_including_prior_follow
         ("machine", "and you slept badly all week"),  # the earlier follow-up, now in view
         ("symbiot", "thanks"),
     ]
+
+
+# --- the burst-settling eligibility read ------------------------------------
+
+def test_next_burst_groups_messages_within_the_lull_into_one_settled_unit(client):
+    # Two answered messages a minute apart, both well past the lull: one settled burst, both members, oldest first.
+    older = _intake_at(600, message="older")   # 10 minutes ago
+    newer = _intake_at(540, message="newer")   #  9 minutes ago — 60s after the older, inside a 5-minute lull
+
+    with db.get_pool().connection() as conn:
+        burst = enrichment.next_burst_to_enrich(conn, 300)
+
+    assert burst is not None
+    assert [m.intake_id for m in burst.members] == [older, newer]  # oldest first
+    assert burst.members[-1].intake_id == newer                    # the anchor is the last message
+
+
+def test_next_burst_leaves_a_still_cooling_burst_for_later(client):
+    # A message answered inside the lull has not settled yet — the pass waits rather than enriching mid-exchange.
+    _intake_at(60, message="just now")  # a minute ago, under a 5-minute lull
+
+    with db.get_pool().connection() as conn:
+        assert enrichment.next_burst_to_enrich(conn, 300) is None
+
+
+def test_next_burst_takes_the_oldest_settled_burst_and_skips_a_cooling_one(client):
+    # An old settled burst and a fresh still-cooling one: the settled burst is returned, the cooling one left whole.
+    b1a = _intake_at(1200, message="b1a")  # 20 min ago
+    b1b = _intake_at(1140, message="b1b")  # 19 min ago — same burst as b1a (60s apart)
+    _intake_at(120, message="b2")          #  2 min ago — a new burst, still cooling
+
+    with db.get_pool().connection() as conn:
+        burst = enrichment.next_burst_to_enrich(conn, 300)
+
+    assert burst is not None
+    assert [m.intake_id for m in burst.members] == [b1a, b1b]  # the settled burst only; the cooling message is excluded
+
+
+def test_enrich_records_every_member_of_a_burst_with_one_follow_up(client, monkeypatch):
+    # The whole point of burst-as-a-unit: one deep pass over the settled burst sends at most one follow-up,
+    # and records a provenance row for every member — the anchor carrying the missive, the rest suppressed —
+    # so none is left eligible to fire a deep reply on its own.
+    monkeypatch.setattr(worker.config, "ENRICH_SETTLE_SECONDS", 300)
+    monkeypatch.setattr(worker.enrichment, "is_echo_of_prior", lambda *a, **k: False)
+    seen = {}
+    monkeypatch.setattr(worker.deep_retrieval, "deep_search", lambda conn, message, **kw: seen.update(query=message) or _one_related())
+    monkeypatch.setattr(worker.enrichment, "compose", lambda origin, rel, **kw: seen.update(message=origin.message) or (True, "one follow-up for the burst"))
+    older = _intake_at(600, message="older", answer="ans-older")
+    newer = _intake_at(540, message="newer", answer="ans-newer")
+
+    assert worker._enrich_one() is True
+
+    assert _missives() == [(1, "one follow-up for the burst")]        # exactly one follow-up for the whole burst
+    assert _enrichments() == [(older, False, None), (newer, True, 1)]  # both recorded; the anchor (newer) carries the missive
+    assert "older" in seen["query"] and "newer" in seen["query"]      # the deep reach saw the whole burst, not just one line
+    assert "older" in seen["message"] and "newer" in seen["message"]  # so did the compose's "what they said" leg
+
+
+def test_enrich_waits_on_a_burst_that_has_not_settled(client, monkeypatch):
+    # With a live lull, a just-answered message is not enriched — the sweep finds nothing settled and idles.
+    monkeypatch.setattr(worker.config, "ENRICH_SETTLE_SECONDS", 300)
+    _stub_reach(monkeypatch, _one_related(), (True, "should never send"))
+    _intake_at(30, message="fresh")  # 30s ago, well under the lull
+
+    assert worker._enrich_one() is False
+    assert _missives() == []
+    assert _enrichments() == []
+
+
+# --- the downstream echo guard ----------------------------------------------
+
+def test_prior_deep_replies_returns_only_surfaced_follow_ups(client):
+    # The guard's comparison set is deep replies actually sent — a surfaced enrichment's missive body.
+    # A suppressed pass carries no missive, so it never appears.
+    _seed_deep_reply("the first deep reply")
+    _seed_deep_reply("the second deep reply")
+    suppressed_intake = _intake()
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO enrichment (intake_id, symbiot_id, surfaced, missive_id) VALUES (%s, %s, false, NULL)",
+            (suppressed_intake, SEEDED_SYMBIOT_ID),
+        )
+
+    with db.get_pool().connection() as conn:
+        priors = enrichment.prior_deep_replies(conn, SEEDED_SYMBIOT_ID)
+
+    assert priors == ["the first deep reply", "the second deep reply"]  # both sent, the suppressed one absent
+
+
+def test_is_echo_suppresses_a_near_identical_follow_up(client, monkeypatch):
+    # A candidate that embeds identically to a prior deep reply is an echo — held back.
+    _seed_deep_reply("you tend to overcommit before travel")
+    monkeypatch.setattr(enrichment.embedding, "embed_many", lambda texts, **kw: [[1.0, 0.0], [1.0, 0.0]])
+
+    with db.get_pool().connection() as conn:
+        assert enrichment.is_echo_of_prior(conn, SEEDED_SYMBIOT_ID, "you overcommit right before a trip") is True
+
+
+def test_is_echo_allows_a_genuinely_new_follow_up(client, monkeypatch):
+    # A candidate far from every prior deep reply is not an echo — it passes.
+    _seed_deep_reply("you tend to overcommit before travel")
+    monkeypatch.setattr(enrichment.embedding, "embed_many", lambda texts, **kw: [[1.0, 0.0], [0.0, 1.0]])
+
+    with db.get_pool().connection() as conn:
+        assert enrichment.is_echo_of_prior(conn, SEEDED_SYMBIOT_ID, "the deploy finished cleanly") is False
+
+
+def test_is_echo_is_false_with_no_priors_and_never_embeds(client, monkeypatch):
+    # Nothing has been said deeply before, so there is nothing to echo — False, and no model call spent.
+    called = []
+    monkeypatch.setattr(enrichment.embedding, "embed_many", lambda *a, **k: called.append(1) or [])
+
+    with db.get_pool().connection() as conn:
+        assert enrichment.is_echo_of_prior(conn, SEEDED_SYMBIOT_ID, "a first follow-up") is False
+    assert called == []  # the embedder was never reached
+
+
+def test_is_echo_fails_open_when_the_embedder_is_down(client, monkeypatch):
+    # A blind guard must not suppress: an unreachable embedder means the follow-up is allowed, not silently eaten.
+    _seed_deep_reply("an earlier deep reply")
+    def _boom(*a, **k):
+        raise RuntimeError("embedder unreachable")
+    monkeypatch.setattr(enrichment.embedding, "embed_many", _boom)
+
+    with db.get_pool().connection() as conn:
+        assert enrichment.is_echo_of_prior(conn, SEEDED_SYMBIOT_ID, "any follow-up") is False
+
+
+def test_enrich_holds_a_follow_up_that_echoes_a_prior_deep_reply(client, monkeypatch):
+    # The guard wired into the pass: the gate surfaces, but the echo guard refuses, so nothing is sent —
+    # yet the burst is still recorded, so it is not reconsidered.
+    _stub_reach(monkeypatch, _one_related(), (True, "a near-duplicate of something already said"))
+    monkeypatch.setattr(worker.enrichment, "is_echo_of_prior", lambda *a, **k: True)
+    intake_id = _intake()
+
+    assert worker._enrich_one() is True
+    assert _missives() == []                          # the echo was held back
+    assert _enrichments() == [(intake_id, False, None)]  # but the pass is recorded, so it is spent
+    assert _echo_flag(intake_id) is True              # recorded as a muzzled follow-up, distinct from gate silence

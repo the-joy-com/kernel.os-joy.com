@@ -16,18 +16,12 @@ echoes then embeds those lines and groups the near-duplicates into clusters — 
 measured as cosine closeness rather than guessed at — leaving the lines that echoed nothing to stand alone.
 """
 
-import math
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 
+from services import echo
 from services.adapters import embedding
-
-# Cosine closeness at or above which two of my lines count as an echo — a semantic near-duplicate,
-# the "more or less the same" a hash would miss. Tuned against real nomic-embed-text output (test/qa/0009):
-# unrelated lines land around 0.55–0.60 and clear paraphrases around 0.80–0.88, so the bar sits in that gap —
-# low enough to catch a loose paraphrase, high enough to leave unrelated lines alone. Still a knob; move it if real use drifts.
-ECHO_THRESHOLD = 0.75
 
 # How far back the echoes lens reaches: the most recent machine utterances to gather.
 # A knob left deliberately generous and un-tuned: the observe-first ethic is to set it against real output later,
@@ -79,15 +73,22 @@ class MachineEchoes:
     singles: list[MachineUterrance]
 
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    """Cosine similarity of two vectors, 0 when either has no length — the closeness the echo test reads."""
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(x * x for x in b))
-    return dot / (na * nb) if na and nb else 0.0
+def held_back_count(conn, symbiot_id: int) -> int:
+    """How many deep follow-ups the echo guard has held back for this symbiot — the muzzle's audit count.
+
+    A deep reply the gate composed but the guard refused as a near-duplicate is never sent;
+    it is recorded echo_suppressed on its enrichment row (worker._enrich_one), and this counts those, all-time,
+    so the echoes card can show the other side of the coin:
+    the lens sees the redundancy that got through, and this many were stopped before delivery.
+    A pure read: no lock, no write, off the loop's path.
+    """
+    return conn.execute(
+        "SELECT count(*) FROM enrichment WHERE symbiot_id = %s AND echo_suppressed",
+        (symbiot_id,),
+    ).fetchone()[0]
 
 
-def machine_echoes(conn, symbiot_id: int, threshold: float = ECHO_THRESHOLD) -> MachineEchoes:
+def machine_echoes(conn, symbiot_id: int, threshold: float = echo.ECHO_THRESHOLD) -> MachineEchoes:
     """Score the symbiot's recent machine utterances for redundancy, grouping the near-duplicates into clusters.
 
     The gather is recent_utterances; the scoring embeds each line once — as a 'document',
@@ -125,7 +126,7 @@ def machine_echoes(conn, symbiot_id: int, threshold: float = ECHO_THRESHOLD) -> 
     sims: dict[tuple[int, int], float] = {}
     for i in range(n):
         for j in range(i + 1, n):
-            s = _cosine(vectors[i], vectors[j])
+            s = echo.cosine(vectors[i], vectors[j])
             sims[(i, j)] = s
             if s >= threshold:
                 union(i, j)

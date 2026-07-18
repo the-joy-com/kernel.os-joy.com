@@ -154,7 +154,7 @@ def test_recent_excludes_the_message_being_answered(client):
     current = _intake("the message being answered now")
     _item("symbiot", 5, intake_id=current)
 
-    conv = _with_conn(lambda c: conversation.recent(c, SEEDED_SYMBIOT_ID, exclude_intake_id=current))
+    conv = _with_conn(lambda c: conversation.recent(c, SEEDED_SYMBIOT_ID, exclude_intake_ids=[current]))
 
     assert [t.text for t in conv.tail] == ["earlier question", "earlier answer"]
 

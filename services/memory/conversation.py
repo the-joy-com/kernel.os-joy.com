@@ -330,27 +330,37 @@ def pending_for_fold(
     return turns, new_cutoff
 
 
-def recent(conn, symbiot_id: int, *, exclude_intake_id: int | None = None) -> Conversation:
-    """The short-term memory a reply should see: the current Gist, and the whole verbatim tail after it.
+def recent(conn, symbiot_id: int, *, exclude_intake_ids: list[int] | None = None) -> Conversation:
+    """What a reply reads as its short-term memory: the running summary of the conversation, then every turn since, word for word.
 
-    The tail is every turn newer than the Gist's cutoff —
-    the complete, unbroken chain from where the Gist ends up to now, no token cap on the read.
-    This is the state-consistency guarantee:
-    the Gist covers everything at or before the cutoff, the tail covers everything after it,
-    so the two meet exactly at the cutoff with no gap and no overlap, whatever the token count.
-    The size budget lives entirely in the background fold (verbatim_budget),
-    which trims the tail back by folding its oldest turns into the Gist;
-    if that fold lags, this read simply returns a fatter tail, never a hole.
-    The rows come back in chronological order, each item's words resolved through its pointer
-    (intake.message for the symbiot side, intake.answer for the machine side, a missive's body for a machine-initiated line).
+    Short-term memory comes back in two pieces that fit together with no seam.
+    The Gist is a running summary of the older conversation — everything up to a cutoff point.
+    The tail is every turn that happened after that cutoff, kept word for word, oldest first.
+    Between them they cover the whole conversation: the Gist for the distant past, the tail for the recent past,
+    meeting exactly at the cutoff so nothing is missed and nothing is counted twice.
 
-    exclude_intake_id drops the message currently being answered from the tail:
-    it was written onto the stream the instant it was received,
-    so without this it would appear both as the last tail turn and as the "current message" the prompt states separately — the same line twice.
-    Excluding it keeps the tail to what was said *before* this turn, which is exactly what "the conversation so far" means.
+    The tail is never shortened here, however long it has grown.
+    Keeping it to a sensible size is the background fold's job (verbatim_budget), not this read's:
+    the fold summarises the tail's oldest turns into the Gist over time, and if it ever falls behind,
+    this simply hands back a longer tail — never a hole in the memory.
 
-    A symbiot with no stream yet returns an empty tail and no gist —
-    the honest empty, which reply.compose renders as a single line rather than a blank.
+    The words themselves aren't stored on the stream, only a pointer to where they already live,
+    and this read follows that pointer to the real text:
+    a symbiot's line is its intake message, the machine's reply is that intake's answer,
+    and a line the machine raised on its own is a missive's body.
+
+    exclude_intake_ids leaves out the message (or messages) this turn is *about*.
+    A message is written onto the stream the moment it arrives, so without this it would show up twice —
+    once as the last turn in the tail, and again as the "current message" the prompt states on its own.
+    A fast reply excludes the single message it is answering;
+    a burst enrichment excludes every message in its burst, since those are handed to the model separately, not as background.
+    Only intake-backed turns can be excluded: a missive carries no intake id,
+    so a follow-up the machine already sent always stays in the tail —
+    which is exactly what lets the enrichment gate see it and refuse to repeat it.
+    Pass nothing (or an empty list) to exclude nothing and read the whole tail.
+
+    A symbiot who has said nothing yet gets an empty tail and no Gist —
+    the honest "nothing here", which the reply renders as a single line rather than a blank.
     """
     gist_row = current_gist(conn, symbiot_id)
     cutoff = gist_row[1] if gist_row is not None else 0
@@ -368,10 +378,10 @@ def recent(conn, symbiot_id: int, *, exclude_intake_id: int | None = None) -> Co
         LEFT JOIN missive m ON m.id = ci.missive_id
         WHERE ci.symbiot_id = %(symbiot)s
           AND ci.id > %(cutoff)s
-          AND (%(exclude)s::bigint IS NULL OR ci.intake_id IS DISTINCT FROM %(exclude)s::bigint)
+          AND (ci.intake_id IS NULL OR ci.intake_id <> ALL(%(exclude)s::bigint[]))
         ORDER BY ci.id ASC
         """,
-        {"symbiot": symbiot_id, "cutoff": cutoff, "exclude": exclude_intake_id},
+        {"symbiot": symbiot_id, "cutoff": cutoff, "exclude": exclude_intake_ids or []},
     ).fetchall()
     tail = [Turn(role=r[0], text=r[1], created_at=r[2]) for r in rows]
     return Conversation(gist=gist_row[0] if gist_row is not None else None, tail=tail)

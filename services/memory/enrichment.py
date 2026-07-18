@@ -2,31 +2,40 @@
 
 Tier 1 answers the moment a message lands, from the lexical diary reach and the running conversation.
 This module is what happens a beat later, off the critical path:
-once that answer is settled, the deep reach (deep_retrieval.py) gathers the facts that bear on the message by *meaning* rather than by shared words,
-and — only when they add something the fast answer didn't — the machine sends an enriched follow-up.
+the deep reach (deep_retrieval.py) gathers the facts that bear on what was said by *meaning* rather than by shared words,
+and — only when they add something the fast answers didn't — the machine sends an enriched follow-up.
 
-Because the pass lands after the fast reply, and the conversation may have moved on since,
+The pass does not fire per message. It fires per *lull*.
+A message is enriched only once the conversation has gone quiet for a settling interval after it (config.ENRICH_SETTLE_SECONDS),
+and then the whole burst it ended — the run of messages with no gap longer than that interval — is enriched as one unit (next_burst_to_enrich):
+one deep reach over the burst's messages, one gate-and-compose, at most one follow-up, and a provenance row for every message in it.
+This is the upstream half of not repeating itself: an active back-and-forth no longer spawns a deep pass per line over the same diary facts —
+the soil the near-duplicate follow-ups grew in — and the follow-up never interrupts the exchange while it is still live.
+
+Because the pass lands after the fast replies, and the conversation may have moved on since,
 the composing call is given the whole *origin reference* the follow-up must situate itself against, all three legs of it:
-  (a) the message that prompted the fast answer,
-  (b) the fast answer itself — so the model can see what it already said and not merely restate it, and
-  (c) the recent conversation around it — every turn since the Gist's cutoff other than this exchange's own,
+  (a) the burst's messages that prompted the fast answers,
+  (b) the fast answers themselves — so the model can see what it already said and not merely restate it, and
+  (c) the recent conversation around the burst — every turn since the Gist's cutoff other than the burst's own,
       which crucially includes the follow-ups already sent, so the gate can see what it has said deeply and not say it again.
-Legs (b) and (c) are the no-repeat basis:
-(b) guards against restating the fast answer, (c) against repeating an earlier follow-up on the same ground —
-the failure mode where two adjacent messages reach the same diary facts and each raises the same deep reply,
-because a per-message pass judged novelty against its own fast answer alone and never saw the follow-ups it had already sent.
-The compose prompt names both and forbids repeating either, so no-repeat is instructed, not left to chance.
+The compose prompt names (b) and (c) and forbids repeating either, so no-repeat is instructed, not left to chance.
 
 One structured call both gates and composes:
 it returns whether to surface at all and, if so, the follow-up's words —
 strict-Pydantic-as-decoder-grammar, the same boundary discipline the router's calls keep.
 When the deep reach found nothing, the call is skipped entirely —
 there is nothing to weigh, so no metered model call is spent.
+
+Downstream of the gate sits the guarantee the instruction alone can't make: the echo guard (is_echo_of_prior).
+A composed follow-up is measured — by the same cosine closeness the /observe echoes lens reads (services/echo.py) —
+against every deep reply the machine has ever sent this symbiot, and one that is near-identical to any of them is held back, whatever its age.
+The redundancy is durable and deep replies are rare, so the check is all-time and cheap; it fails open, never suppressing when it cannot measure.
+
 A follow-up worth sending is delivered as a missive (the kernel reaching out on its own), never as an inline reply,
 because by now it is a new turn in the conversation, not the answer to the message that started it.
 
 Delivery and the exactly-once record are the worker's to sequence (worker._enrich_one);
-this module owns the pieces: eligibility, the non-blocking claim, the origin reference, the gate-and-compose, and the provenance write.
+this module owns the pieces: eligibility, the non-blocking claim, the origin reference, the gate-and-compose, the echo guard, and the provenance write.
 """
 
 from dataclasses import dataclass
@@ -35,8 +44,10 @@ from datetime import datetime
 from pydantic import BaseModel
 
 from core import config
+from services import echo
 from services.memory import conversation
 from services.memory import deep_retrieval
+from services.adapters import embedding
 from services.adapters import llm
 from services.adapters import models
 from services.loop import persona
@@ -51,6 +62,33 @@ _ENRICH_LOCK_NAMESPACE = 0x71E2
 # so the prompt always has a coherent line rather than a blank the model must puzzle over.
 _NO_RECENT = "(nothing else has been said recently — this exchange stands alone)"
 _NO_RELATED = "(nothing further in the diary that bears on this by meaning)"
+
+
+@dataclass(frozen=True)
+class BurstMember:
+    """One answered message in a settled burst: its intake id and the exchange it holds.
+
+    intake_id is the message's row — the exactly-once key the enrichment row will bear;
+    message is the symbiot's line, answer the fast reply it already got.
+    A burst is enriched as a unit, so the members' messages join into one deep query,
+    and their answers into the "what you already said" the gate must not restate."""
+
+    intake_id: int
+    message: str
+    answer: str
+
+
+@dataclass(frozen=True)
+class Burst:
+    """A run of the symbiot's answered messages with no gap longer than the settling interval, taken as one enrichment unit.
+
+    symbiot_id is whose burst it is — the key the claim locks on.
+    members are the burst's messages, oldest first; the last is the anchor,
+    the message the follow-up (if one surfaces) is recorded against.
+    Every member gets a provenance row when the pass commits, so none is left eligible to fire again on its own."""
+
+    symbiot_id: int
+    members: list[BurstMember]
 
 
 @dataclass(frozen=True)
@@ -141,63 +179,177 @@ def compose(
     return surface, reply.message.strip() if surface else ""
 
 
-def next_to_enrich(conn) -> tuple[int, int, str, str] | None:
-    """The oldest answered message from the symbiot that hasn't been through the enrichment pass yet.
+def is_echo_of_prior(
+    conn, symbiot_id: int, follow_up: str, *, threshold: float = echo.ECHO_THRESHOLD
+) -> bool:
+    """Whether a composed follow-up echoes a deep reply already sent — the downstream guarantee, measured not hoped.
 
-    The sweep's eligibility read (worker.run_enrichment_sweep), the mirror of the enrichment table's UNIQUE intake_id:
-    an authed message — enrichment reaches the symbiot's own diary, so an anonymous line is never enriched —
-    that reached 'answered' specifically (narrower than ingestion's terminal set: there must be a fast answer *to* enrich,
-    which an 'abandoned' message never got),
-    and that has no enrichment row yet.
-    Returns (intake_id, symbiot_id, message, answer), or None when none is waiting.
-    A message just passed is excluded next time (an enrichment row now bears its id, surfaced or not),
-    and one whose pass crashed before it committed is still eligible and simply picked up again — no drop, no double.
-    A pure read: it takes no lock and moves nothing, so it never contends with a worker.
+    The gate's own no-repeat is instruction to a model; this is the check that enforces it.
+    Every deep reply the machine has ever sent this symbiot is gathered (prior_deep_replies) and, with the candidate,
+    embedded in one call as documents — so two of the machine's own lines compare symmetrically, the same stance the echoes lens takes —
+    and the candidate is an echo when the nearest of them sits at or above the threshold (services/echo.py).
+    All-time, not a window: the redundancy is durable — the same diary facts get recalled by meaning for any similar message —
+    and deep replies are rare, so the whole history is a short list and the check is cheap.
+    No prior deep replies means nothing to echo — False, without a model call.
+    It fails *open*: if the embedder is unreachable the guard does not suppress —
+    a rare repeat getting through is a smaller harm than a good follow-up silently eaten,
+    the same degrade-rather-than-lie stance the echoes lens keeps, pointed the other way.
     """
-    row = conn.execute(
-        "SELECT id, symbiot_id, message, answer FROM intake "
-        "WHERE symbiot_id IS NOT NULL "
-        "AND status = 'answered' "
-        "AND NOT EXISTS (SELECT 1 FROM enrichment WHERE enrichment.intake_id = intake.id) "
-        "ORDER BY id LIMIT 1"
-    ).fetchone()
-    return (row[0], row[1], row[2], row[3]) if row else None
+    priors = prior_deep_replies(conn, symbiot_id)
+    if not priors:
+        return False
+    try:
+        vectors = embedding.embed_many(priors + [follow_up], task="document")
+    except Exception:
+        return False
+    return echo.max_similarity(vectors[-1], vectors[:-1]) >= threshold
 
 
-def origin_reference(conn, symbiot_id: int, intake_id: int, message: str, answer: str) -> Origin:
-    """Assemble the three-legged origin reference for a message's enrichment pass.
+def next_burst_to_enrich(conn, settle_seconds: float) -> Burst | None:
+    """The oldest settled burst of the symbiot's answered-but-unenriched messages, or None when none has settled.
 
-    The message and its fast answer are already in hand (the eligibility read carried them);
-    the third leg — the recent conversation around this exchange — is read live from the stream here,
+    The sweep's eligibility read (worker.run_enrichment_sweep), and the debounce that keeps a live exchange from firing a deep pass per line.
+    It reads over the authed, 'answered', not-yet-enriched messages —
+    enrichment reaches the symbiot's own diary, so an anonymous line is never enriched,
+    and there must be a fast answer *to* enrich, which an 'abandoned' message never got —
+    groups each symbiot's into bursts (a run with no gap longer than settle_seconds between consecutive messages),
+    and returns the oldest burst that has *settled*: its last message followed by settle_seconds of quiet, with nothing newer.
+    A burst still cooling — its last message too recent — is left whole for a later pass,
+    so no member is enriched before the exchange it sits in has actually gone quiet.
+    Members come back oldest first, the last being the anchor; None when no burst has settled yet.
+    A pure read: it takes no lock and moves nothing, so it never contends with a worker.
+    With settle_seconds = 0 every message is its own immediately-settled burst — the old per-message cadence, which the test suite runs under.
+    """
+    rows = conn.execute(
+        """
+        WITH eligible AS (
+            SELECT i.id, i.symbiot_id, i.message, i.answer, i.created_at
+            FROM intake i
+            WHERE i.symbiot_id IS NOT NULL
+              AND i.status = 'answered'
+              AND NOT EXISTS (SELECT 1 FROM enrichment e WHERE e.intake_id = i.id)
+        ),
+        seq AS (
+            SELECT *,
+                   LAG(created_at)  OVER w AS prev_at,
+                   LEAD(created_at) OVER w AS next_at
+            FROM eligible
+            WINDOW w AS (PARTITION BY symbiot_id ORDER BY created_at, id)
+        ),
+        marked AS (
+            SELECT *,
+                   (prev_at IS NULL OR created_at - prev_at > make_interval(secs => %(settle)s)) AS starts_burst,
+                   (next_at IS NULL OR next_at - created_at > make_interval(secs => %(settle)s)) AS ends_burst
+            FROM seq
+        ),
+        grouped AS (
+            SELECT *,
+                   SUM(CASE WHEN starts_burst THEN 1 ELSE 0 END)
+                       OVER (PARTITION BY symbiot_id ORDER BY created_at, id) AS burst_no
+            FROM marked
+        ),
+        target AS (
+            SELECT symbiot_id, burst_no
+            FROM grouped
+            WHERE ends_burst
+              AND now() - created_at >= make_interval(secs => %(settle)s)
+            ORDER BY id
+            LIMIT 1
+        )
+        SELECT g.id, g.symbiot_id, g.message, g.answer
+        FROM grouped g
+        JOIN target t ON t.symbiot_id = g.symbiot_id AND t.burst_no = g.burst_no
+        ORDER BY g.created_at, g.id
+        """,
+        {"settle": settle_seconds},
+    ).fetchall()
+    if not rows:
+        return None
+    members = [BurstMember(intake_id=r[0], message=r[2], answer=r[3]) for r in rows]
+    return Burst(symbiot_id=rows[0][1], members=members)
+
+
+def origin_reference(
+    conn, symbiot_id: int, exclude_intake_ids: list[int], message: str, answer: str
+) -> Origin:
+    """Assemble the three-legged origin reference for a burst's enrichment pass.
+
+    The burst's messages and their fast answers are already in hand, joined by the caller into the message and answer legs;
+    the third leg — the recent conversation around the burst — is read live from the stream here,
     reusing the same verbatim tail the reply path sees (conversation.recent):
     every turn newer than the Gist's cutoff,
     resolved through the stream's pointer (intake.message / intake.answer / a missive body),
-    with this exchange's own two turns excluded so the current message and its fast answer are not fed back as if they were surrounding context.
+    with the burst's own turns (exclude_intake_ids) excluded so its messages and their fast answers are not fed back as if they were surrounding context.
     Crucially the tail carries missive bodies, so a follow-up already sent on this ground is in view here —
     the one leg that lets the gate refuse to repeat an earlier deep reply.
-    Empty when nothing else has been said recently — this exchange stands alone —
+    Empty when nothing else has been said recently — the burst stands alone —
     which the compose prompt renders as its own line.
     """
-    recent = conversation.recent(conn, symbiot_id, exclude_intake_id=intake_id).tail
+    recent = conversation.recent(conn, symbiot_id, exclude_intake_ids=exclude_intake_ids).tail
     return Origin(message=message, answer=answer, recent=recent)
 
 
-def record(conn, intake_id: int, symbiot_id: int, missive_id: int | None) -> int:
+def prior_deep_replies(conn, symbiot_id: int) -> list[str]:
+    """Every deep follow-up the machine has already sent this symbiot, as plain text — the echo guard's comparison set.
+
+    A surfaced enrichment row points at the missive it sent, whose body is the deep reply's words;
+    this joins the two and returns those bodies, all-time, oldest first (order is immaterial to the max-similarity the guard takes).
+    A suppressed pass carries no missive, so it is absent here — only replies actually sent can be echoed.
+    A pure read: no lock, no write.
+    """
+    rows = conn.execute(
+        "SELECT m.body FROM enrichment e JOIN missive m ON m.id = e.missive_id "
+        "WHERE e.symbiot_id = %s AND e.surfaced "
+        "ORDER BY e.id",
+        (symbiot_id,),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def record(conn, intake_id: int, symbiot_id: int, missive_id: int | None, *, echo_suppressed: bool = False) -> int:
     """Record that this message has been through the enrichment pass, and return the row's id.
 
     One row per message, written whether the pass surfaced a follow-up or suppressed it —
     so a message weighed and found not worth enriching is marked done and never reconsidered, the gate spent exactly once.
     surfaced is derived from whether a missive was sent (missive_id present), the one place that truth is decided,
     so it can never drift from the CHECK the schema holds.
+    echo_suppressed records *why* a pass was silent when it was:
+    true only when the gate composed a follow-up that the echo guard then held back as a near-duplicate,
+    so /observe can tell that muzzled follow-up apart from a pass that simply had nothing to add.
+    It never rides with a missive — a held echo was not sent — which the schema's CHECK enforces.
     The UNIQUE intake_id makes the write exactly-once:
     a re-run of an already-recorded pass conflicts and is refused rather than filing a second verdict.
     """
     row = conn.execute(
-        "INSERT INTO enrichment (intake_id, symbiot_id, surfaced, missive_id) "
-        "VALUES (%s, %s, %s, %s) RETURNING id",
-        (intake_id, symbiot_id, missive_id is not None, missive_id),
+        "INSERT INTO enrichment (intake_id, symbiot_id, surfaced, missive_id, echo_suppressed) "
+        "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+        (intake_id, symbiot_id, missive_id is not None, missive_id, echo_suppressed),
     ).fetchone()
     return row[0]
+
+
+def record_burst(
+    conn, members: list[BurstMember], symbiot_id: int, missive_id: int | None, *, echo_suppressed: bool = False
+) -> None:
+    """Record every message in an enriched burst as considered, exactly once each — the anchor carrying the outcome.
+
+    One provenance row per member, so no message in the burst is ever left eligible to fire a deep pass on its own —
+    the whole burst is spent together, the same "considered exactly once" the single-message pass gave each message before.
+    The burst's one outcome — a follow-up sent, or one held back as an echo — is recorded against the anchor (its last message):
+    the anchor carries the missive_id when one surfaced, or echo_suppressed when the guard held the composed follow-up.
+    Every other member records a plain suppressed pass, since at most one follow-up speaks for the whole burst.
+    surfaced falls out of missive presence in record, so the schema's CHECK can never disagree with the verdict.
+    """
+    anchor_id = members[-1].intake_id
+    for member in members:
+        is_anchor = member.intake_id == anchor_id
+        record(
+            conn,
+            member.intake_id,
+            symbiot_id,
+            missive_id if is_anchor else None,
+            echo_suppressed=echo_suppressed if is_anchor else False,
+        )
 
 
 def _compose_prompt(

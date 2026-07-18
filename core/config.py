@@ -429,9 +429,18 @@ ENRICH_ENABLED = os.getenv("ENRICH_ENABLED", "true").strip().lower() not in ("0"
 # How often the enrichment sweep looks for an answered message to reach deeper on when idle.
 # It drains back-to-back while a backlog remains;
 # this is only the idle poll,
-# kept short so a just-answered message gets its deep pass promptly,
-# while the exchange it follows is still fresh.
+# kept short so a settled burst gets its deep pass promptly once the lull below has elapsed.
 ENRICH_SWEEP_INTERVAL_SECONDS = float(os.getenv("ENRICH_SWEEP_INTERVAL_SECONDS", "10"))
+# The lull that settles a burst before it is enriched — the debounce at the source of the deep reply.
+# A message is not enriched the instant it is answered;
+# the pass waits until the conversation has gone quiet for this long after it,
+# and then enriches the whole burst it ended as one unit rather than each of its messages in turn.
+# This is what keeps an active back-and-forth from spawning a deep pass per line over overlapping diary facts —
+# the soil the near-duplicate follow-ups grow in — and from interrupting the exchange while it is still live.
+# A lone message is a burst of one and waits the same lull; the deep reply is off the critical path, so the delay costs nothing.
+# The test suite sets this to 0 so each message is its own immediately-settled burst — the old per-message cadence —
+# and the burst-grouping tests set it explicitly against rows stamped with fixed times.
+ENRICH_SETTLE_SECONDS = float(os.getenv("ENRICH_SETTLE_SECONDS", "300"))
 # The generative model that gates-and-composes the enriched follow-up.
 # The same heavy hitter that composes the replies (REPLY_MODEL), not a cheap local tier:
 # the follow-up interrupts the symbiot unprompted, so it must clear a high bar to be worth sending,

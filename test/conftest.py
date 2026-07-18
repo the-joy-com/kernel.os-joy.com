@@ -40,6 +40,11 @@ os.environ["COMPRESS_ENABLED"] = "0"
 # The Tier 2 enrichment sweep stays off under test too — its tests drive _enrich_one by hand,
 # and a live sweep would race them for the intake and enrichment tables.
 os.environ["ENRICH_ENABLED"] = "0"
+# The burst-settling lull is zeroed under test so each message is its own immediately-settled burst —
+# the per-message cadence the enrichment tests are written against, with no wall-clock wait to stand for.
+# The burst-grouping tests set it explicitly (monkeypatching config) against rows stamped with fixed times,
+# where the lull is the thing under test.
+os.environ["ENRICH_SETTLE_SECONDS"] = "0"
 # The tool-catalog reconcile stays off at test startup so it never reaches Ollama to embed a descriptor —
 # the tool tests seed the catalog by hand (or reconcile with the embedding faked).
 os.environ["TOOLS_ENABLED"] = "0"
