@@ -196,6 +196,32 @@ A cloud call tries the primary and falls to the next tier only on an *outage-cla
 
 ## Running fully local (no cloud API, no Gmail)
 
+**In a hurry? The whole recipe, copy-paste top to bottom:**
+
+```bash
+# 1. Ollama + the two models it needs
+ollama pull nomic-embed-text     # the embedder — always required
+ollama pull qwen3.5:4b           # a local chat model for generation
+
+# 2. Postgres + env — leave the Gmail and cloud-key vars BLANK in .env
+docker compose up -d
+cp .env.example .env             # set SYMBIOT_EMAIL + KERNEL_SECRET; leave GMAIL_* and *_API_KEY blank
+
+# 3. Run the kernel
+export UV_PROJECT_ENVIRONMENT=venv
+uv sync
+uv run uvicorn main:app --host 127.0.0.1 --port 9713 --reload
+```
+
+Then, in the shell:
+
+1. **`/login` with your `SYMBIOT_EMAIL`. No email is sent — the login code is written to a file: `OTP.txt` at the root of *this* (kernel) repo.** Read it with `cat OTP.txt` and type it back. (If you don't see the file: you logged in with a different address than `SYMBIOT_EMAIL`, or your Gmail vars aren't actually blank.)
+2. **`/models` → `assign` every role** (`reply`, `rerank`, `mint`, `enrich`, `tool_decision`, `tool_confirm`, `conversation_compress`) **to `qwen3.5:4b`.** Until you do, generation still points at Scaleway and fails with a 401.
+
+That's a fully-local symbiot. The rest of this section explains *why* each step is what it is — read on only if something above didn't behave.
+
+---
+
 The kernel can run with **no paid API and no Google Workspace** — everything on a box with an [Ollama](https://ollama.com) serving a couple of models. This is the setup for a home server that can't (or won't) reach Scaleway/Mistral for generation or Gmail for login. Embedding was always local; the two things that used to assume the cloud — **login delivery** and **generation** — are each independently switchable, and neither is a single "mode" flag. Here's the whole picture.
 
 ### What actually toggles "local"
