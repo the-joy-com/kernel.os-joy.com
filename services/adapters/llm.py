@@ -297,12 +297,24 @@ def _call(
     An empty reply raises inside each tier,
     so neither a transport failure nor a blank answer passes as a half-read decision
     or reaches the symbiot as silence.
+
+    IS_LOCAL=1 short-circuits the ladder entirely: every call is served by Ollama on the box.
+    Since the resolved role name is a cloud id Ollama can't serve, the call is substituted to the
+    local SLM floor (config.GENERATIVE_LOCAL_FALLBACK_MODEL) unless the role already points at an Ollama model.
     """
     spec = models.spec(model)
-    # quick override to only call Ollama locally
+    # Quick override to keep every call on the local box (IS_LOCAL=1): route to Ollama regardless of
+    # the role's resolved provider. The resolved name is a cloud id (a role points at gpt-oss-120b, glm-5.2),
+    # which Ollama can't serve — pulling it would 404 — so substitute the local SLM floor
+    # (config.GENERATIVE_LOCAL_FALLBACK_MODEL) unless the role is already assigned an Ollama model.
     if os.getenv("IS_LOCAL") == "1":
+        local = (
+            model
+            if spec is not None and spec.provider == "ollama"
+            else config.GENERATIVE_LOCAL_FALLBACK_MODEL
+        )
         return _ollama(
-            model, prompt, schema, temperature, _output_cap(max_output_tokens, model)
+            local, prompt, schema, temperature, _output_cap(max_output_tokens, local)
         )
     provider = spec.provider if spec is not None else "ollama"
     if provider == "scaleway":
