@@ -54,6 +54,7 @@ a deliberate trade of the strictly-local posture for capability and speed.
 Embedding does not make that trade — it stays on the box (embedding.py), tied to its model's vector dims.
 """
 
+import os
 from typing import TypeVar
 
 import httpx
@@ -78,7 +79,8 @@ class _Outage(Exception):
     """A generative tier failed in a way that warrants trying the next one down the ladder —
     a transport error, a timeout, a 5xx, or a 429.
     Distinct from a 4xx, which signals our own bad request
-    and is left to propagate so it surfaces rather than being masked by a fall-through."""
+    and is left to propagate so it surfaces rather than being masked by a fall-through.
+    """
 
 
 def _reasoning_effort(model_name: str) -> str:
@@ -96,7 +98,13 @@ def _reasoning_effort(model_name: str) -> str:
     return "low" if model_name.startswith("gpt-oss") else "none"
 
 
-def _scaleway(model_name: str, prompt: str, schema: type[BaseModel] | None, temperature: float | None, max_output_tokens: int | None) -> str:
+def _scaleway(
+    model_name: str,
+    prompt: str,
+    schema: type[BaseModel] | None,
+    temperature: float | None,
+    max_output_tokens: int | None,
+) -> str:
     """One generative call to Scaleway through the OpenAI-compatible client Scaleway advertises.
 
     The client is built fresh per call (fork-safety for the reply's killable child) with retries off,
@@ -129,7 +137,9 @@ def _scaleway(model_name: str, prompt: str, schema: type[BaseModel] | None, temp
         request["max_tokens"] = max_output_tokens
     try:
         if schema is not None:
-            completion = client.chat.completions.parse(response_format=schema, **request)
+            completion = client.chat.completions.parse(
+                response_format=schema, **request
+            )
         else:
             completion = client.chat.completions.create(stream=False, **request)
     except (
@@ -141,11 +151,19 @@ def _scaleway(model_name: str, prompt: str, schema: type[BaseModel] | None, temp
         raise _Outage(f"Scaleway generative call failed outage-class: {exc}") from exc
     body = completion.choices[0].message.content
     if not body:
-        raise RuntimeError(f"generative model {model_name!r} on Scaleway returned an empty response")
+        raise RuntimeError(
+            f"generative model {model_name!r} on Scaleway returned an empty response"
+        )
     return body
 
 
-def _mistral(model_name: str, prompt: str, schema: type[BaseModel] | None, temperature: float | None, max_output_tokens: int | None) -> str:
+def _mistral(
+    model_name: str,
+    prompt: str,
+    schema: type[BaseModel] | None,
+    temperature: float | None,
+    max_output_tokens: int | None,
+) -> str:
     """One generative call to Mistral's own web API through the official mistralai client.
 
     The fallback tier when Scaleway is down —
@@ -158,7 +176,10 @@ def _mistral(model_name: str, prompt: str, schema: type[BaseModel] | None, tempe
     Outage-class failures — a 5xx, a 429, or no response at all — raise _Outage to fall through to the local tier;
     a 4xx propagates as itself.
     """
-    client = Mistral(api_key=config.MISTRAL_API_KEY, timeout_ms=int(config.LLM_TIMEOUT_SECONDS * 1000))
+    client = Mistral(
+        api_key=config.MISTRAL_API_KEY,
+        timeout_ms=int(config.LLM_TIMEOUT_SECONDS * 1000),
+    )
     request: dict = {
         "messages": [{"role": "user", "content": prompt}],
         "model": model_name,
@@ -175,20 +196,34 @@ def _mistral(model_name: str, prompt: str, schema: type[BaseModel] | None, tempe
     except mistral_errors.SDKError as exc:
         status = getattr(getattr(exc, "raw_response", None), "status_code", None)
         if status is None or status >= 500 or status == 429:
-            raise _Outage(f"Mistral generative call failed outage-class: {exc}") from exc
+            raise _Outage(
+                f"Mistral generative call failed outage-class: {exc}"
+            ) from exc
         raise
-    except (httpx.TransportError, httpx.TimeoutException, mistral_errors.NoResponseError) as exc:
+    except (
+        httpx.TransportError,
+        httpx.TimeoutException,
+        mistral_errors.NoResponseError,
+    ) as exc:
         raise _Outage(f"Mistral generative call unreachable: {exc}") from exc
     body = completion.choices[0].message.content
     # Mistral may answer with content chunks rather than a bare string; flatten to the text we asked for.
     if isinstance(body, list):
         body = "".join(getattr(chunk, "text", "") for chunk in body)
     if not body:
-        raise RuntimeError(f"generative model {model_name!r} on Mistral returned an empty response")
+        raise RuntimeError(
+            f"generative model {model_name!r} on Mistral returned an empty response"
+        )
     return body
 
 
-def _ollama(model_name: str, prompt: str, schema: type[BaseModel] | None, temperature: float | None, max_output_tokens: int | None) -> str:
+def _ollama(
+    model_name: str,
+    prompt: str,
+    schema: type[BaseModel] | None,
+    temperature: float | None,
+    max_output_tokens: int | None,
+) -> str:
     """One generative call to the local Ollama model — the ladder's last resort, and the rollback target.
 
     Reached when both clouds are down, or directly when a model config points at a local name.
@@ -198,7 +233,9 @@ def _ollama(model_name: str, prompt: str, schema: type[BaseModel] | None, temper
     This is the last tier, so it raises its real errors rather than _Outage —
     there is nothing further to fall through to.
     """
-    client = ollama.Client(host=config.OLLAMA_BASE_URL, timeout=config.LLM_TIMEOUT_SECONDS)
+    client = ollama.Client(
+        host=config.OLLAMA_BASE_URL, timeout=config.LLM_TIMEOUT_SECONDS
+    )
     request = {"model": model_name, "prompt": prompt, "stream": False, "think": False}
     if schema is not None:
         request["format"] = schema.model_json_schema()
@@ -211,7 +248,9 @@ def _ollama(model_name: str, prompt: str, schema: type[BaseModel] | None, temper
         request["options"] = options
     body = client.generate(**request).response
     if not body:
-        raise RuntimeError(f"generative model {model_name!r} on Ollama returned an empty response")
+        raise RuntimeError(
+            f"generative model {model_name!r} on Ollama returned an empty response"
+        )
     return body
 
 
@@ -234,7 +273,14 @@ def _output_cap(override: int | None, model_name: str) -> int | None:
     return cap
 
 
-def _call(*, model: str, prompt: str, schema: type[BaseModel] | None = None, temperature: float | None = None, max_output_tokens: int | None = None) -> str:
+def _call(
+    *,
+    model: str,
+    prompt: str,
+    schema: type[BaseModel] | None = None,
+    temperature: float | None = None,
+    max_output_tokens: int | None = None,
+) -> str:
     """Run one generative call down the fallback ladder and return its reply text.
 
     The one place the round trip lives, shared by both public calls and the summariser beneath them.
@@ -253,22 +299,47 @@ def _call(*, model: str, prompt: str, schema: type[BaseModel] | None = None, tem
     or reaches the symbiot as silence.
     """
     spec = models.spec(model)
+    # quick override to only call Ollama locally
+    if os.getenv("IS_LOCAL") == "1":
+        return _ollama(
+            model, prompt, schema, temperature, _output_cap(max_output_tokens, model)
+        )
     provider = spec.provider if spec is not None else "ollama"
     if provider == "scaleway":
         try:
-            return _scaleway(model, prompt, schema, temperature, _output_cap(max_output_tokens, model))
+            return _scaleway(
+                model,
+                prompt,
+                schema,
+                temperature,
+                _output_cap(max_output_tokens, model),
+            )
         except _Outage:
             pass
         try:
-            return _mistral(config.GENERATIVE_FALLBACK_MODEL, prompt, schema, temperature,
-                            _output_cap(max_output_tokens, config.GENERATIVE_FALLBACK_MODEL))
+            return _mistral(
+                config.GENERATIVE_FALLBACK_MODEL,
+                prompt,
+                schema,
+                temperature,
+                _output_cap(max_output_tokens, config.GENERATIVE_FALLBACK_MODEL),
+            )
         except _Outage:
             pass
-        return _ollama(config.GENERATIVE_LOCAL_FALLBACK_MODEL, prompt, schema, temperature,
-                       _output_cap(max_output_tokens, config.GENERATIVE_LOCAL_FALLBACK_MODEL))
+        return _ollama(
+            config.GENERATIVE_LOCAL_FALLBACK_MODEL,
+            prompt,
+            schema,
+            temperature,
+            _output_cap(max_output_tokens, config.GENERATIVE_LOCAL_FALLBACK_MODEL),
+        )
     if provider == "mistral":
-        return _mistral(model, prompt, schema, temperature, _output_cap(max_output_tokens, model))
-    return _ollama(model, prompt, schema, temperature, _output_cap(max_output_tokens, model))
+        return _mistral(
+            model, prompt, schema, temperature, _output_cap(max_output_tokens, model)
+        )
+    return _ollama(
+        model, prompt, schema, temperature, _output_cap(max_output_tokens, model)
+    )
 
 
 def _fit(prompt: str, context: str | None, model_name: str) -> str:
@@ -326,11 +397,15 @@ def _summarise(context: str, target_tokens: int, model_name: str) -> str:
         "Return only the condensed notes, nothing else.\n\n"
         f"{context}"
     )
-    summary = _call(model=model_name, prompt=prompt, temperature=0, max_output_tokens=target_tokens)
+    summary = _call(
+        model=model_name, prompt=prompt, temperature=0, max_output_tokens=target_tokens
+    )
     return models.truncate_tokens(summary, target_tokens)
 
 
-def generate(prompt: str, *, model: str | None = None, context: str | None = None) -> str:
+def generate(
+    prompt: str, *, model: str | None = None, context: str | None = None
+) -> str:
     """Run one generative call and return its reply as free text.
 
     The counterpart to generate_json for the reply the read path composes:
@@ -351,11 +426,17 @@ def generate(prompt: str, *, model: str | None = None, context: str | None = Non
     An empty response raises rather than returning a blank reply that would reach the symbiot as silence.
     """
     model_name = model or models.role_name("rerank")
-    return _call(model=model_name, prompt=_fit(prompt, context, model_name), temperature=0)
+    return _call(
+        model=model_name, prompt=_fit(prompt, context, model_name), temperature=0
+    )
 
 
 def generate_json(
-    prompt: str, schema: type[M], *, model: str | None = None, context: str | None = None
+    prompt: str,
+    schema: type[M],
+    *,
+    model: str | None = None,
+    context: str | None = None,
 ) -> M:
     """Run one generative call and validate its reply into an instance of `schema`.
 
@@ -377,5 +458,10 @@ def generate_json(
     and sampling is pinned to temperature 0 so the same inputs score the same way twice.
     """
     model_name = model or models.role_name("rerank")
-    reply = _call(model=model_name, prompt=_fit(prompt, context, model_name), schema=schema, temperature=0)
+    reply = _call(
+        model=model_name,
+        prompt=_fit(prompt, context, model_name),
+        schema=schema,
+        temperature=0,
+    )
     return schema.model_validate_json(reply)

@@ -14,14 +14,10 @@ Prerequisite: [`uv`](https://docs.astral.sh/uv/getting-started/installation/) in
 
 The virtualenv is named `venv` (not uv's default `.venv`). uv reads its location from `UV_PROJECT_ENVIRONMENT`, so export that first — every `uv` command below then targets `venv/`:
 
-```bash
-export UV_PROJECT_ENVIRONMENT=venv
-```
-
 1. **Create the virtualenv and install the pinned deps** (exact versions from `uv.lock`):
 
    ```bash
-   uv sync
+   export UV_PROJECT_ENVIRONMENT=venv && uv sync
    ```
 
 2. **Start Postgres and create your `.env`:**
@@ -36,7 +32,7 @@ export UV_PROJECT_ENVIRONMENT=venv
 3. **Run the kernel locally** — uvicorn bound to localhost:
 
    ```bash
-   uv run uvicorn main:app --host 127.0.0.1 --port 9713 --reload
+   export UV_PROJECT_ENVIRONMENT=venv && uv run uvicorn main:app --host 127.0.0.1 --port 9713 --reload
    ```
 
    (`--reload` is for development; drop it in production.) Migrations and the symbiot seed run automatically on startup against `DATABASE_URL`.
@@ -320,33 +316,11 @@ cp .env.example .env
 
 ## Email (Gmail API)
 
-This is the **hosted** login-delivery path. If you're running mailboxless (a home box with no Workspace), skip this entire section — leave `GMAIL_CREDENTIALS_FILE`/`GMAIL_SENDER` blank and the code goes to `OTP.txt` instead (see [Running fully local](#running-fully-local-no-cloud-api-no-gmail)). The setup below is only for a box that *does* email the code.
+This is the **hosted** login-delivery path. If you're running mailboxless (a home box with no Workspace), skip this entirely — leave `GMAIL_CREDENTIALS_FILE`/`GMAIL_SENDER` blank and the code goes to `OTP.txt` instead (see [Running fully local](#running-fully-local-no-cloud-api-no-gmail)). This path is only for a box that *does* email the code.
 
-The Gmail `EmailClient` sends through the **Gmail API** as a Google Workspace mailbox, authenticated by a **GCP service account with domain-wide delegation** (no interactive OAuth, ideal for a headless service). The service account holds no mailbox of its own — it *impersonates* a real Workspace user (`GMAIL_SENDER`) and sends as them, using the narrow `gmail.send` scope (send only, no mailbox read). The account's JSON key lives on each box (gitignored, never committed); `GMAIL_CREDENTIALS_FILE` points at it. Until both are set the client refuses to send rather than pretend, and the test suite never needs them (it uses the fake). The Google libraries and the key are loaded lazily on the first send, so import and tests never touch them ([`email_client.py`](./services/email_client.py)).
+The Gmail `EmailClient` sends through the **Gmail API** as a Google Workspace mailbox, authenticated by a **GCP service account with domain-wide delegation** (no interactive OAuth, ideal for a headless service). The service account holds no mailbox of its own — it *impersonates* a real Workspace user (`GMAIL_SENDER`) and sends as them, using the narrow `gmail.send` scope (send only, no mailbox read). The account's JSON key lives on each box (gitignored, never committed); `GMAIL_CREDENTIALS_FILE` points at it. Until both are set the client refuses to send rather than pretend, and the test suite never needs them (it uses the fake) ([`email_client.py`](./services/adapters/email_client.py)).
 
-### One-time setup
-
-**In the GCP console** (the project that will own the service account):
-
-1. **Enable the Gmail API**: APIs & Services → Library → "Gmail API" → **Enable**.
-2. **Create a service account**: IAM & Admin → Service Accounts → **Create**. No IAM roles are needed — it authorises via delegation, not IAM.
-3. **Create a JSON key** for it (Keys → Add key → JSON) and download it. This is `GMAIL_CREDENTIALS_FILE`.
-4. Copy the service account's **Unique ID** (its OAuth2 **client ID**) from the Details tab — the next step needs it.
-
-**In the Google Workspace Admin console** (for the sender's domain):
-
-5. Security → Access and data control → **API controls** → **Manage Domain-Wide Delegation** → **Add new**.
-6. Paste the **client ID** from step 4 and authorise exactly this scope:
-
-   ```
-   https://www.googleapis.com/auth/gmail.send
-   ```
-
-Domain-wide delegation can take a few minutes to propagate; a first send that `403`s right after authorising usually just needs a short wait and a retry.
-
-**On each box** (local and server):
-
-7. Place the JSON key somewhere gitignored — e.g. `gmail-credentials.json` in the repo root (covered by `.gitignore`) — and set `GMAIL_CREDENTIALS_FILE` to its path and `GMAIL_SENDER` to the Workspace mailbox to impersonate (a *real* user in the delegated domain).
+The full one-time setup across the GCP and Workspace consoles, the prerequisites, and — if the service account is ever deleted — how to rebuild it from nothing, all live in [`doc/google-integration.md`](./doc/google-integration.md).
 
 ## Tests
 
