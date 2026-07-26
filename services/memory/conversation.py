@@ -40,6 +40,15 @@ gist_budget caps the size of the Gist,
 and verbatim_budget is the threshold the background fold trims the verbatim tail back to.
 Neither caps the read — the read carries the whole tail — so a lagging fold only makes the tail fatter, never blind.
 
+The tail shrinks on two triggers, not one.
+verbatim_budget is the *size* trigger — a tail grown past it during a live exchange is trimmed back (next_symbiot_to_fold).
+Idle is the *silence* trigger — a conversation gone quiet for a spell has its whole remaining tail collapsed into the Gist
+(next_symbiot_to_collapse, folded at a zero budget),
+so it does not sit at full width forever once the exchange is over, and the next session opens lean.
+Both land in the Gist and lose nothing;
+the second exists because the verbatim tail is never cached, so it is billed at full rate on every reply —
+which makes keeping it small an unconditional saving beside the head's cached one.
+
 The members below are ordered alphabetically, as far as the code allows:
 the two dataclasses come first and keep their dependency order
 (Conversation's fields name Turn, so Turn is defined ahead of it),
@@ -249,6 +258,42 @@ def gist_budget() -> int:
     the merge names it and the result is hard-truncated to it (fold)."""
     optimal = models.for_role("reply").optimal_context_tokens
     return int(optimal * config.CONVERSATION_GIST_BUDGET_FRACTION)
+
+
+def next_symbiot_to_collapse(conn, idle_seconds: float) -> int | None:
+    """A symbiot whose conversation has gone quiet long enough to collapse its whole verbatim tail, or None.
+
+    The idle counterpart to next_symbiot_to_fold, and the second way the rolling window shrinks.
+    Where the fold trigger fires on *size* — a tail grown past the budget during a live exchange —
+    this fires on *silence*: a symbiot with turns still verbatim past its Gist's cutoff,
+    whose most recent such turn is older than idle_seconds, has a conversation that is over for now.
+    Its tail is then folded down wholesale (the sweep calls pending_for_fold with a zero budget),
+    so the next session opens lean rather than carrying a full-width verbatim tail no reply has needed in a while —
+    and since caching only ever discounts the fixed head, never this tail,
+    shrinking it is an unconditional saving on every reply that follows, cached or not.
+    Nothing is lost: the collapsed turns live on in the Gist, and the long-term diary already holds what mattered.
+    Returns the lowest-id such symbiot for fairness and determinism, None when no conversation has gone quiet.
+    A pure read: no lock, no write, so it never contends with a reply gathering the same stream.
+    """
+    row = conn.execute(
+        """
+        WITH latest_gist AS (
+            SELECT DISTINCT ON (symbiot_id) symbiot_id, cutoff_item_id
+            FROM conversation_gist
+            ORDER BY symbiot_id, id DESC
+        )
+        SELECT ci.symbiot_id
+        FROM conversation_item ci
+        LEFT JOIN latest_gist g ON g.symbiot_id = ci.symbiot_id
+        WHERE ci.id > COALESCE(g.cutoff_item_id, 0)
+        GROUP BY ci.symbiot_id
+        HAVING MAX(ci.created_at) < NOW() - make_interval(secs => %(idle)s)
+        ORDER BY ci.symbiot_id
+        LIMIT 1
+        """,
+        {"idle": idle_seconds},
+    ).fetchone()
+    return row[0] if row else None
 
 
 def next_symbiot_to_fold(conn, budget: int) -> int | None:

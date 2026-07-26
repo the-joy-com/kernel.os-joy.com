@@ -64,6 +64,14 @@ os.environ["VAPID_PRIVATE_KEY"] = ""
 # by monkeypatching config and swapping in a recorder (see test_notify.py).
 os.environ["GMAIL_CREDENTIALS_FILE"] = ""
 os.environ["GMAIL_SENDER"] = ""
+# The Google generative rung is unwired under test, for the third time the same reason:
+# a dev .env carrying a project id would put the ladder's top rung in front of every generative call,
+# where it authenticates by ADC and answers for real — billable, slow, and past the fake entirely.
+# The suites below reach the model through llm.OpenAI (the Scaleway rung), which is what they stand in for,
+# so an empty project id makes _google raise _Outage on its first line and the ladder falls straight to that fake.
+# The top rung is not going untested by this: test_llm.py fakes the google-genai boundary directly,
+# which is where a rung's own contract belongs.
+os.environ["GOOGLE_CLOUD_PROJECT"] = ""
 
 
 # The front-door lock: refuse a non-test database before the app is even imported,

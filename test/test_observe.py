@@ -3,7 +3,7 @@
 recent_utterances is a pure read over the machine side of the conversation stream, so the tests pin the two
 things it must get right and nothing it doesn't: that each utterance is resolved to its words and labelled by
 the mechanism that raised it (a fast reply, a deep follow-up, a note), and that the stream's own order is
-handed back oldest-first with the symbiot's own lines left out. It writes nothing, so there is no write to check.
+handed back newest-first with the symbiot's own lines left out. It writes nothing, so there is no write to check.
 
 recent_reminders is the read behind the second card: a plain join of the reminder ledger to its triggering
 intake, so the tests pin what that card is for — each reminder paired with the human line that triggered it,
@@ -106,16 +106,17 @@ def test_labels_each_mechanism_and_resolves_its_words(client):
 
     got = _recent()
 
-    assert [u.mechanism for u in got] == ["quick", "deep", "note"]
+    # Newest first, so the note filed last leads and the quick reply filed first trails.
+    assert [u.mechanism for u in got] == ["note", "deep", "quick"]
     assert [u.text for u in got] == [
-        "the reindex is the slow part",
-        "the reindex is still the bottleneck",
         "café closes in ten minutes",
+        "the reindex is still the bottleneck",
+        "the reindex is the slow part",
     ]
-    assert [u.trigger for u in got] == ["how's the migration going", None, None]
+    assert [u.trigger for u in got] == [None, None, "how's the migration going"]
 
 
-def test_returns_oldest_first_and_omits_the_symbiot_side(client):
+def test_returns_newest_first_and_omits_the_symbiot_side(client):
     # A full exchange: the symbiot's line and the machine's reply, two stream rows on one intake row.
     intake_id = _intake(message="a question", answer="an answer")
     _item("symbiot", intake_id=intake_id)  # the human's own line — must not appear
@@ -125,8 +126,8 @@ def test_returns_oldest_first_and_omits_the_symbiot_side(client):
 
     got = _recent()
 
-    # Only the machine's lines, in the order they were said (oldest first), never the symbiot's own.
-    assert [u.text for u in got] == ["an answer", "a later note"]
+    # Only the machine's lines, newest first (the latest line opens the lens), never the symbiot's own.
+    assert [u.text for u in got] == ["a later note", "an answer"]
 
 
 def test_limit_keeps_the_newest(client):
@@ -135,8 +136,8 @@ def test_limit_keeps_the_newest(client):
 
     got = _recent(limit=2)
 
-    # The two newest, still handed back oldest-first within that window.
-    assert [u.text for u in got] == ["a3", "a4"]
+    # The two newest, handed back newest-first within that window.
+    assert [u.text for u in got] == ["a4", "a3"]
 
 
 def test_route_requires_a_session(client):
@@ -205,8 +206,8 @@ def test_echoes_clusters_near_duplicates_and_leaves_the_rest_single(client, monk
     assert result.scored is True
     assert len(result.clusters) == 1
     assert [u.text for u in result.clusters[0].members] == [
-        "the reindex is the slow part",
         "the reindex is still the bottleneck",
+        "the reindex is the slow part",
     ]
     assert result.clusters[0].similarity > 0.9
     assert [u.text for u in result.singles] == ["the weather is lovely today"]
@@ -224,7 +225,7 @@ def test_echoes_chains_a_run_of_near_duplicates_into_one_cluster(client, monkeyp
     result = _with_conn(lambda c: observe.machine_echoes(c, SEEDED_SYMBIOT_ID, threshold=0.9))
 
     assert len(result.clusters) == 1
-    assert [u.text for u in result.clusters[0].members] == ["a", "b", "c"]
+    assert [u.text for u in result.clusters[0].members] == ["c", "b", "a"]
     assert result.singles == []
 
 
@@ -241,7 +242,7 @@ def test_echoes_degrades_to_the_plain_mirror_when_the_embedder_is_down(client, m
 
     assert result.scored is False
     assert result.clusters == []
-    assert [u.text for u in result.singles] == ["one", "two"]
+    assert [u.text for u in result.singles] == ["two", "one"]
 
 
 def test_echoes_skips_scoring_for_a_lone_line(client, monkeypatch):

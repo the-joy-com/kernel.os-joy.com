@@ -322,8 +322,8 @@ def compose_confirmation(message: str, result: ToolResult, now_local, zone_name:
     rather than pretending anything was done.
     A free-text call like the reply, so no schema is imposed on prose (llm.generate).
     """
-    voice = persona.load()
-    return llm.generate(_confirm_prompt(message, result, voice, now_local, zone_name), model=models.role_name("tool_confirm"))
+    head = persona.head()
+    return llm.generate(_confirm_prompt(message, result, head, now_local, zone_name), model=models.role_name("tool_confirm"))
 
 
 def _decision_model(candidates: list[ToolCandidate]) -> type[BaseModel]:
@@ -411,10 +411,11 @@ def _decide_prompt(
     )
 
 
-def _confirm_prompt(message: str, result: ToolResult, voice: str, now_local, zone_name: str) -> str:
-    # voice first (who is speaking), then what happened (the tool's own result), then the instruction —
-    # confirm when it acted, ask when it could not,
+def _confirm_prompt(message: str, result: ToolResult, head: str, now_local, zone_name: str) -> str:
+    # head first (the truth-rules preamble, then the persona that says who is speaking), then what happened
+    # (the tool's own result), then the instruction — confirm when it acted, ask when it could not,
     # always in the persona's voice and never inventing facts.
+    # The head is the same fixed, cacheable prefix the reply and the enrichment lead with (persona.head).
     if result.effected:
         instruction = (
             "You have just done this for them. Confirm it back in your own voice — briefly and directly, "
@@ -427,7 +428,7 @@ def _confirm_prompt(message: str, result: ToolResult, voice: str, now_local, zon
             "briefly and directly, without pretending anything was done."
         )
     return (
-        f"{voice}\n\n"
+        f"{head}\n\n"
         f"For reference, the symbiot's local date and time right now is {now_local.isoformat()} ({zone_name}).\n\n"
         f'The human symbiot said:\n"{message}"\n\n'
         f"What happened when you acted on it:\n{result.summary}\n\n"

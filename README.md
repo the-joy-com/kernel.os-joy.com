@@ -175,20 +175,23 @@ Ollama serves on `http://127.0.0.1:11434` by default, native on both local and s
 
 **Generation is configurable at runtime**, and can run entirely on the box or lean on the cloud — your choice, changed with a command, never a code edit. Two things drive it, and it's worth keeping them apart (they map to two database tables, migration `0019`):
 
-- **The catalog** — the set of models the kernel knows how to talk to, each with the characteristics it must be driven by: its **provider** (`scaleway`, `mistral`, or `ollama`), the context **window it reads well**, and its **output ceiling**. Seven ship built-in — `glm-5.2` and `gpt-oss-120b` (Scaleway), `mistral-large-latest`, `mistral-small-latest`, and `ministral-8b-latest` (Mistral), `qwen3.5:4b` (local Ollama), and `nomic-embed-text` (the embedder). You can register your own on top of these.
-- **The role assignments** — which model, out of that catalog, does each generative job: `reply` (the composed answer), `rerank` (the router's classifications), `mint` (coining a new ontology type's definition), `enrich` (the follow-up gate), `tool_decision`, `tool_confirm`, and `conversation_compress`. Each role points at one catalog model. The defaults group into three tiers: a flagship (`glm-5.2`) for the reply, the enrichment gate, and the conversation fold; a cheaper `gpt-oss-120b` for the tool calls, minting, and the router's high-volume classifications.
+- **The catalog** — the set of models the kernel knows how to talk to, each with the characteristics it must be driven by: its **provider** (`google`, `scaleway`, `mistral`, or `ollama`), the context **window it reads well**, and its **output ceiling**. Ten ship built-in — `gemini-3.1-pro-preview`, `gemini-3.6-flash`, and `gemini-3.5-flash-lite` (Google), `glm-5.2` and `gpt-oss-120b` (Scaleway), `mistral-large-latest`, `mistral-small-latest`, and `ministral-8b-latest` (Mistral), `qwen3.5:4b` (local Ollama), and `nomic-embed-text` (the embedder). You can register your own on top of these.
+- **The role assignments** — which model, out of that catalog, does each generative job: `reply` (the composed answer), `rerank` (the router's classifications), `mint` (coining a new ontology type's definition), `enrich` (the follow-up gate), `tool_decision`, `tool_confirm`, and `conversation_compress`. Each role points at one catalog model. The defaults group into three tiers: a flagship (`glm-5.2`) for the reply, the enrichment gate, and the conversation fold; a cheaper `gpt-oss-120b` for the tool calls, minting, and the router's high-volume classifications. Each tier is fronted in the steady state by a Gemini top rung, prepended above the Scaleway primary the role resolves to (see the ladder below).
 
 Both are **operator-editable, box-level state** (not per-symbiot — a model is a property of the machine), reached through the authed **`/models` command in the shell** (see [Running fully local](#running-fully-local-no-cloud-api-no-gmail) for the walkthrough). Both are seeded from code at boot: the built-in models are reconciled from [`services/adapters/models.py`](./services/adapters/models.py), and each role is seeded from its config default (`REPLY_MODEL`, `RERANK_MODEL`, …) *only if you haven't set it* — so a fresh box behaves exactly as before these tables existed, and your own assignments are never overwritten by a later boot.
 
-When a role points at a **cloud** model (a `scaleway` provider), the call goes through a **fallback ladder**, tried per request ([`services/llm.py`](./services/llm.py)):
+When a role points at a **cloud** model (a `scaleway` provider — the tier's stable identity), the call goes through a **fallback ladder**, tried per request ([`services/llm.py`](./services/llm.py)):
 
-1. **Scaleway** (primary), reached through the OpenAI-compatible client Scaleway advertises.
-2. **Mistral — `mistral-large-latest`** (fallback), reached at Mistral's *own* web API through the official `mistralai` client — deliberately not Scaleway's Mistral, since the point is surviving Scaleway being down.
-3. **Local Ollama — `qwen3.5:4b`** (last resort), the on-box engine, kept wired so a double cloud outage still gets an answer.
+1. **Google (Gemini)** (top rung), reached on the **Agent Platform** through the `google-genai` client, authenticated by **ADC** (never an API key). This is the rung that answers in the steady state — the whole switch exists because the Agent Platform caches the large repeated prompt prefix these calls front-load, billing it once where the cheaper-per-token clouds re-bill it every turn. It is **per tier**, prepended above the Scaleway primary it fronts: a flagship primary (`glm-5.2`) is fronted by `gemini-3.1-pro-preview`, the two cheaper rungs (`gpt-oss-120b`) by `gemini-3.6-flash` (with `gemini-3.5-flash-lite` held for the day small splits from mid). Named by `GOOGLE_FLAGSHIP_MODEL`, `GOOGLE_MID_MODEL`, `GOOGLE_SMALL_MODEL`, and wired only when `GOOGLE_CLOUD_PROJECT` is set — leave it empty and this rung is skipped and the ladder starts at Scaleway, exactly as before it existed.
+2. **Scaleway**, reached through the OpenAI-compatible client Scaleway advertises.
+3. **Mistral**, reached at Mistral's *own* web API through the official `mistralai` client — deliberately not Scaleway's Mistral, since the point is surviving Scaleway being down. This rung is **per tier**, mirroring the primary: a flagship primary (`glm-5.2`) falls to `mistral-large-latest`, the two cheaper rungs (`gpt-oss-120b`) share `ministral-8b-latest`, each chosen so its window covers the primary it catches. Named by `MISTRAL_FLAGSHIP_MODEL`, `MISTRAL_MID_MODEL`, and `MISTRAL_SMALL_MODEL`.
+4. **Local Ollama — `qwen3.5:4b`** (last resort), the on-box engine, kept wired so a full cloud outage still gets an answer, named by `GENERATIVE_LOCAL_FALLBACK_MODEL`.
 
-A cloud call tries the primary and falls to the next tier only on an *outage-class* failure (transport error, timeout, 5xx, 429); a 4xx (a bad request, a bad key) surfaces at once rather than being masked. When a role points at an **Ollama** model, there is no ladder at all — the call goes straight to your local Ollama and never touches the cloud. So **pointing every role at an Ollama model, via `/models`, is what makes generation fully local** (see below). The two fallback tiers themselves are named by `GENERATIVE_FALLBACK_MODEL` and `GENERATIVE_LOCAL_FALLBACK_MODEL`.
+A cloud call tries the top rung and falls to the next only on an *outage-class* failure (transport error, timeout, 5xx, 429, an unresolvable ADC credential); a 4xx (a bad request, a bad key) surfaces at once rather than being masked. A role pointed by hand straight at a Gemini or Mistral model is a **bare call** with nothing beneath it — only the automatic top rung carries the whole chain down. When a role points at an **Ollama** model, there is no ladder at all — the call goes straight to your local Ollama and never touches the cloud. So **pointing every role at an Ollama model, via `/models`, is what makes generation fully local** (see below).
 
-> **Heads-up on the generative calls:** thinking is off on every one — on Scaleway through `reasoning_effort`, set per model (`"none"` where the model accepts it, like `glm-5.2`; `"low"` for `gpt-oss`, whose floor is low but which emits no reasoning trace there), and on the Ollama tier with `think: false`. Structured output (the router's typed JSON) goes through each SDK's official `parse` structured-output helper, which binds the decoder to the caller's Pydantic schema; temperature is 0 on every call, the router's scored judgments and the spoken reply alike. These live in how [`services/llm.py`](./services/llm.py) calls each provider, not in the schema.
+**`IS_LOCAL=1` is the one-flag shortcut to all of that.** Set it and every generative call skips the ladder entirely and goes straight to your Ollama — no matter what provider the roles resolve to. Because the roles still resolve to *cloud* ids (a name like `gpt-oss-120b` Ollama can't serve, so asking it to would 404), the call is substituted to the local floor `GENERATIVE_LOCAL_FALLBACK_MODEL` (`qwen3.5:4b`), unless a role already points at an Ollama model, in which case that one is honoured. It touches generation only — embedding was always local, and login delivery is still governed separately by the Gmail vars. So a box that wants generation local without reassigning seven roles by hand sets `IS_LOCAL=1` and pulls the one local model. **That model must actually be pulled** — `ollama pull qwen3.5:4b` (or whatever `GENERATIVE_LOCAL_FALLBACK_MODEL` names) — or the call 404s with `model '…' not found`, exactly as a cloud id would.
+
+> **Heads-up on the generative calls:** thinking is off on every one — on Google through `thinking_level` held at each model's floor (`MINIMAL` for the Flash pair, `LOW` for the Pro, since a 3.x model can't turn reasoning off at all, only down), on Scaleway through `reasoning_effort`, set per model (`"none"` where the model accepts it, like `glm-5.2`; `"low"` for `gpt-oss`, whose floor is low but which emits no reasoning trace there), and on the Ollama tier with `think: false`. Structured output (the router's typed JSON) goes through each SDK's structured-output mechanism — Scaleway's and Mistral's `parse` helpers, Google's `response_schema`, Ollama's `format` — each binding the decoder to the caller's Pydantic schema; temperature is 0 on every call, the router's scored judgments and the spoken reply alike. These live in how [`services/llm.py`](./services/llm.py) calls each provider, not in the schema.
 
 ## Running fully local (no cloud API, no Gmail)
 
@@ -199,9 +202,9 @@ A cloud call tries the primary and falls to the next tier only on an *outage-cla
 ollama pull nomic-embed-text     # the embedder — always required
 ollama pull qwen3.5:4b           # a local chat model for generation
 
-# 2. Postgres + env — leave the Gmail and cloud-key vars BLANK in .env
+# 2. Postgres + env — set IS_LOCAL=1, leave the Gmail and cloud-key vars BLANK in .env
 docker compose up -d
-cp .env.example .env             # set SYMBIOT_EMAIL + KERNEL_SECRET; leave GMAIL_* and *_API_KEY blank
+cp .env.example .env             # set SYMBIOT_EMAIL + KERNEL_SECRET + IS_LOCAL=1; leave GMAIL_* and *_API_KEY blank
 
 # 3. Run the kernel
 export UV_PROJECT_ENVIRONMENT=venv
@@ -212,25 +215,26 @@ uv run uvicorn main:app --host 127.0.0.1 --port 9713 --reload
 Then, in the shell:
 
 1. **`/login` with your `SYMBIOT_EMAIL`. No email is sent — the login code is written to a file: `OTP.txt` at the root of *this* (kernel) repo.** Read it with `cat OTP.txt` and type it back. (If you don't see the file: you logged in with a different address than `SYMBIOT_EMAIL`, or your Gmail vars aren't actually blank.)
-2. **`/models` → `assign` every role** (`reply`, `rerank`, `mint`, `enrich`, `tool_decision`, `tool_confirm`, `conversation_compress`) **to `qwen3.5:4b`.** Until you do, generation still points at Scaleway and fails with a 401.
 
-That's a fully-local symbiot. The rest of this section explains *why* each step is what it is — read on only if something above didn't behave.
+That's a fully-local symbiot — `IS_LOCAL=1` forces every generative call onto your Ollama, so you don't reassign a single role. (Prefer to keep some roles on the cloud and localise the rest? Leave `IS_LOCAL=0` and instead **`/models` → `assign` every role** — `reply`, `rerank`, `mint`, `enrich`, `tool_decision`, `tool_confirm`, `conversation_compress` — **to `qwen3.5:4b`**; until you do, generation still points at Scaleway and fails with a 401.) The rest of this section explains *why* each step is what it is — read on only if something above didn't behave.
 
 ---
 
-The kernel can run with **no paid API and no Google Workspace** — everything on a box with an [Ollama](https://ollama.com) serving a couple of models. This is the setup for a home server that can't (or won't) reach Scaleway/Mistral for generation or Gmail for login. Embedding was always local; the two things that used to assume the cloud — **login delivery** and **generation** — are each independently switchable, and neither is a single "mode" flag. Here's the whole picture.
+The kernel can run with **no paid API and no Google Workspace** — everything on a box with an [Ollama](https://ollama.com) serving a couple of models. This is the setup for a home server that can't (or won't) reach Scaleway/Mistral for generation or Gmail for login. Embedding was always local; the two things that used to assume the cloud — **login delivery** and **generation** — are each independently switchable. Here's the whole picture.
 
 ### What actually toggles "local"
 
-There is no master switch. Local-ness is the sum of two independent config decisions (plus one thing that's always local):
+Local-ness is the sum of two independent config decisions (plus one thing that's always local):
 
 | Concern | What decides it | Local when… |
 | --- | --- | --- |
 | **Login code delivery** | Whether the two Gmail vars are set (`main.py` picks the client at startup) | `GMAIL_CREDENTIALS_FILE` **and** `GMAIL_SENDER` are both blank → the code is written to a file instead of emailed |
-| **Generation** | The **provider of the model each role points at** (set via `/models`) | every role points at a model whose provider is `ollama` → calls go straight to your Ollama, the cloud is never touched |
+| **Generation** | Either `IS_LOCAL`, or the **provider of the model each role points at** (set via `/models`) | `IS_LOCAL=1` → *every* generative call is forced onto Ollama; **or**, with `IS_LOCAL=0`, every role points at a model whose provider is `ollama` → calls go straight to your Ollama, the cloud is never touched |
 | **Embedding** | Always local — `nomic-embed-text` on Ollama, not a toggle | always |
 
-> **Important — blanking the cloud API keys is *not* enough by itself.** The roles still *default* to Scaleway models (`glm-5.2` for the flagship jobs, `gpt-oss-120b` for the cheaper ones), and a Scaleway call with no key returns a `401` — a `4xx`, which does **not** fall through the ladder to Ollama; it raises. To go local you must **reassign the roles to a local model** with `/models`. Blanking the keys is optional tidiness; reassigning the roles is the actual switch for generation.
+Generation has a **master switch and a fine-grained one**, and they answer different needs. `IS_LOCAL=1` is the master switch: set it and every generative call skips the cloud ladder and goes to Ollama, whatever the roles say — the fast way to a fully-local box, no `/models` walk required. It substitutes the local floor `GENERATIVE_LOCAL_FALLBACK_MODEL` (`qwen3.5:4b`) for any role that resolves to a cloud id, while honouring any role already assigned an Ollama model — so **that local model has to be pulled** (`ollama pull qwen3.5:4b`, or whatever you point `GENERATIVE_LOCAL_FALLBACK_MODEL` at), or the call 404s with `model '…' not found`. Leaving `IS_LOCAL=0` and reassigning roles through `/models` is the fine-grained path: it lets you split the work — some roles local, some on the cloud — which the master switch can't express. Login delivery is governed separately by the Gmail vars in both cases; `IS_LOCAL` touches generation only.
+
+> **Important — blanking the cloud API keys is *not* enough by itself.** With `IS_LOCAL=0`, the roles still *default* to Scaleway models (`glm-5.2` for the flagship jobs, `gpt-oss-120b` for the cheaper ones), and a Scaleway call with no key returns a `401` — a `4xx`, which does **not** fall through the ladder to Ollama; it raises. To go local you must either set `IS_LOCAL=1` **or reassign the roles to a local model** with `/models`. Blanking the keys is optional tidiness; one of those two is the actual switch for generation.
 
 ### Step by step
 
@@ -248,12 +252,13 @@ There is no master switch. Local-ness is the sum of two independent config decis
    cp .env.example .env
    ```
 
-   In `.env`, set `SYMBIOT_EMAIL` (your login handle — see the note below), `KERNEL_SECRET`, and **leave these blank**:
+   In `.env`, set `SYMBIOT_EMAIL` (your login handle — see the note below), `KERNEL_SECRET`, `IS_LOCAL=1`, and **leave these blank**:
 
    ```bash
+   IS_LOCAL=1                       # 1 → force all generation onto Ollama; makes step 5 optional
    GMAIL_CREDENTIALS_FILE=          # blank → login code goes to a file, not email
    GMAIL_SENDER=                    # blank → same
-   SCALEWAY_API_KEY=                # blank → no Scaleway (but you must still reassign roles, below)
+   SCALEWAY_API_KEY=                # blank → no Scaleway (with IS_LOCAL=1 you needn't reassign roles)
    MISTRAL_API_KEY=                 # blank → no Mistral
    ```
 
@@ -273,7 +278,7 @@ There is no master switch. Local-ness is the sum of two independent config decis
 
    `OTP.txt` is gitignored, overwritten on each `/login` (only the newest code ever stands), and the trust root is simply *access to the box* — the same as its SSH key. Point it elsewhere with `OTP_FILE` if you like.
 
-5. **Point the generative roles at your local model — this is the switch for generation.** Still in the shell, run **`/models`** (authed-only; you must be logged in). It opens on the current catalog and assignments, then loops on a prompt:
+5. **(Only if you left `IS_LOCAL=0`.) Point the generative roles at your local model — the fine-grained switch for generation.** With `IS_LOCAL=1` set in step 2, generation is already forced local and you can skip this step; do it instead when you want to split the work role-by-role (some local, some cloud), which the master switch can't express. Still in the shell, run **`/models`** (authed-only; you must be logged in). It opens on the current catalog and assignments, then loops on a prompt:
 
    - `add` → register your local model if it isn't a built-in. A bare name is enough — `qwen3.5:4b`, or `llama3.1:8b`, etc. — and the provider defaults to `ollama` with sensible window/output defaults filled in. (You can spell out the provider, context window, and output ceiling if you want.)
    - `assign` → point each role at your local model: assign `reply`, then `rerank`, `mint`, `enrich`, `tool_decision`, `tool_confirm`, `conversation_compress`. Assigning `qwen3.5:4b` (already a built-in) needs no `add` first.
@@ -309,10 +314,12 @@ cp .env.example .env
 | `GC_ENABLED` | Override; the offline ontology duplicate-merge sweep, run in-process on a slow cadence. Default on; set `0`/`false`/`no`/`off` to disable. No external cron — it rides the app the way the intake reconcile sweep does. |
 | `GC_SWEEP_INTERVAL_SECONDS` | Override; how often that sweep wakes. Default `86400` (daily) — duplicates accrue slowly and the merge never sits on the read path. |
 | `GC_DISTANCE` | Override; the cosine-distance pre-filter the sweep uses to nominate near-twin type pairs before the model confirms them. Default `0.2`. Loosen to catch synonyms that embed further apart; the by-hand smoke (`test/qa/0002_*`) prints real distances to tune against. |
-| `SCALEWAY_API_KEY`, `SCALEWAY_API_BASE_URL` | The primary generative provider (see [Models](#models-embedding-local-and-generation-cloud-with-a-local-fallback)). Base URL defaults to `https://api.scaleway.ai/v1`. An empty key just means the primary tier can't answer and the ladder falls through to Mistral. |
+| `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` | The Gemini top rung on the Agent Platform, authenticated by ADC — no API key, nothing secret (see [Models](#models-embedding-local-and-generation-cloud-with-a-local-fallback)). Project is empty by default: leave it empty and the Gemini rung is **not wired**, and every call falls straight through to Scaleway. Location defaults to `global`. |
+| `GOOGLE_FLAGSHIP_MODEL`, `GOOGLE_MID_MODEL`, `GOOGLE_SMALL_MODEL` | Override; the Gemini model per tier, prepended above the Scaleway primary it fronts. Default `gemini-3.1-pro-preview` / `gemini-3.6-flash` / `gemini-3.6-flash` (the two cheaper tiers share one today; `gemini-3.5-flash-lite` is in the catalog, held for the split). Ladder mechanics, not `/models`-managed. |
+| `SCALEWAY_API_KEY`, `SCALEWAY_API_BASE_URL` | The second rung, beneath Google (see [Models](#models-embedding-local-and-generation-cloud-with-a-local-fallback)). Base URL defaults to `https://api.scaleway.ai/v1`. An empty key just means that rung can't answer and the ladder falls through to Mistral. |
 | `MISTRAL_API_KEY` | The fallback generative provider, reached at Mistral's own web API. Empty means that tier is skipped and the ladder falls through to the local Ollama model. |
 | `FLAGSHIP_MODEL`, `MID_MODEL`, `SMALL_MODEL`, `REPLY_MODEL`, `RERANK_MODEL`, `MINT_MODEL`, `ENRICH_MODEL`, `TOOL_DECISION_MODEL`, `TOOL_CONFIRM_MODEL`, `CONVERSATION_COMPRESS_MODEL` | Override; the **seed defaults** for each generative role's assignment, grouped into three tiers. These are read *once*, to seed a role's row the first time the box boots with the `model_role` table empty; after that the assignment lives in the database and is changed with the **`/models` command**, not here (see [Models](#models-embedding-local-and-generation-cloud-with-a-local-fallback) and [Running fully local](#running-fully-local-no-cloud-api-no-gmail)). The flagship roles (`reply`, `enrich`, `conversation_compress`) default to `glm-5.2` (Scaleway); the cheaper roles (`tool_confirm`, `tool_decision`, `mint`, and the router's `rerank`) default to `gpt-oss-120b` (Scaleway). Setting one here only changes what a *fresh* box seeds; to change a running box, use `/models`. |
-| `GENERATIVE_FALLBACK_MODEL`, `GENERATIVE_LOCAL_FALLBACK_MODEL` | Override; the two tiers a *cloud* (`scaleway`) call falls through to on an outage — `mistral-large-latest` then `qwen3.5:4b`. Unlike the role assignments above, these are ladder mechanics, not `/models`-managed. |
+| `MISTRAL_FLAGSHIP_MODEL`, `MISTRAL_MID_MODEL`, `MISTRAL_SMALL_MODEL`, `GENERATIVE_LOCAL_FALLBACK_MODEL` | Override; the tiers a *cloud* (`scaleway`) call falls through to on an outage. The Mistral rung is per tier, mirroring the primary — flagship to `mistral-large-latest`, the two cheaper rungs sharing `ministral-8b-latest` — then the single local floor `qwen3.5:4b` beneath them all. Unlike the role assignments above, these are ladder mechanics, not `/models`-managed. |
 
 ## Email (Gmail API)
 

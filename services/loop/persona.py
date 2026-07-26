@@ -1,4 +1,4 @@
-"""The machine symbiot's persona: the voice, kept as two strings split by who may read them.
+"""The machine symbiot's persona: the voice, and the fixed head every composed answer leads with.
 
 The persona is not one text but two. The public half is versioned in the repo — the
 character and the stance, in the open like the rest of The Joy — and it carries a single
@@ -7,11 +7,18 @@ The private half is never committed (it's gitignored, the same discipline the cr
 and the server secret already follow): it holds what the symbiot won't hand to the outside
 World, and it fills that token.
 
-Nothing here reads the persona into an answer yet — that's a later rung. This module only
-assembles the two stored strings into the one persona string. It errs toward always
-returning a whole, coherent voice: if the private half isn't on disk (a fresh clone, a
-contributor with no secrets), the token collapses to nothing and the public persona stands
-alone rather than raising. The token never survives into the assembled voice either way.
+`head` is what the composing calls actually reach for: the ground-rules preamble, then the assembled persona, as one block.
+It leads every high-volume prose answer — the reply, the enrichment follow-up, the tool confirmation — for two reasons at once.
+First, truth: the preamble is the contract that governs how the voice may speak, so it comes before the voice.
+Second, cost: this block is the one part of every such prompt that is byte-for-byte identical call to call,
+so a caching provider (the Gemini top rung) bills it once and then near-free.
+That only pays if every compose site shares the *same* head rather than each building its own,
+so the head is assembled here, in one place, and prepended uniformly.
+
+It errs toward always returning a whole, coherent voice:
+if the private half isn't on disk (a fresh clone, a contributor with no secrets),
+the token collapses to nothing and the public persona stands alone rather than raising.
+The token never survives into the assembled voice.
 """
 
 from pathlib import Path
@@ -20,6 +27,17 @@ from core import config
 
 # The slot cut into the public persona where the private half is spliced in.
 PLACEHOLDER = "{{ INJECT_SYMBIOSIS_CORE_PRIVATE }}"
+
+
+def head() -> str:
+    """The fixed head every composed answer leads with: the ground-rules preamble, then the persona.
+
+    The block that repeats identically across the reply, the enrichment follow-up, and the tool confirmation —
+    so it is assembled once, here, and prepended by all three the same way,
+    which is what lets a caching provider bill it a single time rather than once per call.
+    The preamble leads because the truth contract governs the voice, not the other way round.
+    """
+    return f"{preamble()}\n\n{load()}"
 
 
 def load() -> str:
@@ -31,6 +49,15 @@ def load() -> str:
     """
     public = Path(config.PERSONA_PUBLIC_FILE).read_text(encoding="utf-8")
     return public.replace(PLACEHOLDER, _read_private())
+
+
+def preamble() -> str:
+    """The ground rules — the truth contract that binds every composed answer — read from its repo file.
+
+    Versioned like the public persona (it says nothing secret, only how the machine must handle truth),
+    and stripped of surrounding whitespace so it seats cleanly at the front of the head.
+    """
+    return Path(config.PREAMBLE_FILE).read_text(encoding="utf-8").strip()
 
 
 def _read_private() -> str:

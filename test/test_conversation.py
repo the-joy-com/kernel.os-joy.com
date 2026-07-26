@@ -216,6 +216,45 @@ def test_next_symbiot_to_fold_measures_only_past_the_cutoff(client):
     assert _with_conn(lambda c: conversation.next_symbiot_to_fold(c, 90)) is None  # nothing newer than the cutoff
 
 
+def _backdate(item_id, seconds_ago):
+    # Push an item's created_at into the past so the idle read sees the conversation as having gone quiet.
+    _with_conn(lambda c: c.execute(
+        "UPDATE conversation_item SET created_at = NOW() - make_interval(secs => %s) WHERE id = %s",
+        (seconds_ago, item_id),
+    ))
+
+
+def test_next_symbiot_to_collapse_finds_a_gone_quiet_tail_and_is_silent_while_live(client):
+    # The idle trigger fires on silence, not size: a small tail is left alone while the exchange is live,
+    # and becomes eligible only once every un-folded turn has aged past the idle span.
+    intake_id = _intake("m", answer="a")
+    a = _item("symbiot", 50, intake_id=intake_id)
+    b = _item("machine", 50, intake_id=intake_id)
+
+    # Just spoken: live, so never collapsed however small the tail.
+    assert _with_conn(lambda c: conversation.next_symbiot_to_collapse(c, 1800)) is None
+    # Both un-folded turns now older than the idle span: the conversation is over for now, and eligible.
+    _backdate(a, 3600)
+    _backdate(b, 3600)
+    assert _with_conn(lambda c: conversation.next_symbiot_to_collapse(c, 1800)) == SEEDED_SYMBIOT_ID
+    # A single fresh turn among the old ones keeps the whole conversation live again — not collapsed.
+    _item("symbiot", 50, intake_id=_intake("just now"))
+    assert _with_conn(lambda c: conversation.next_symbiot_to_collapse(c, 1800)) is None
+
+
+def test_next_symbiot_to_collapse_ignores_turns_already_folded(client):
+    # Only turns past the Gist's cutoff can be collapsed; a symbiot whose tail is already fully folded
+    # has nothing left to collapse, however long it has since been quiet.
+    intake_id = _intake("m", answer="a")
+    a = _item("symbiot", 50, intake_id=intake_id)
+    b = _item("machine", 50, intake_id=intake_id)
+    _backdate(a, 3600)
+    _backdate(b, 3600)
+    _with_conn(lambda c: conversation.record_gist(c, SEEDED_SYMBIOT_ID, "folded both", b))
+
+    assert _with_conn(lambda c: conversation.next_symbiot_to_collapse(c, 1800)) is None
+
+
 # --- the fold's LLM boundary -------------------------------------------------
 
 

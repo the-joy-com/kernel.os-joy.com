@@ -19,13 +19,16 @@ concepts it expresses, and each named concept then takes that recall / re-rank /
 on its own. Once every concept has resolved to a type — reused or freshly coined — the fact is
 rendered into a deliberately thin JSON-LD payload — its `@type` links and its own raw text, with no
 particulars extracted — and persisted once: the fact row, its embedding, and one link per concept
-it earned. `ingest` is the entry point that runs the whole path; the steps below build up to it.
+it earned. `ingest` is the entry point that runs the whole path; the steps it composes are defined
+below in alphabetical order, so the running order is the one these paragraphs lay out, not the one
+the file reads in.
 """
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, create_model
 
@@ -33,11 +36,12 @@ from core import config
 from services.adapters import embedding
 from services.adapters import llm
 from services.adapters import models
+from services.loop import zone
 
 # The three bands the top re-rank score falls into, deciding what happens to the concept.
-REUSE = "reuse"  # a clear enough fit: link the fact to that existing type
 GREY = "grey"  # ambiguous: escalate to the one-shot LLM gate
 MINT = "mint"  # nothing fits: coin a new type
+REUSE = "reuse"  # a clear enough fit: link the fact to that existing type
 
 # How many of the nearest existing types the minter is shown when it coins a new one.
 # A type is never coined in a vacuum:
@@ -67,49 +71,6 @@ class Candidate:
     distance: float
 
 
-def recall_candidates(conn, embedding: list[float], limit: int | None = None) -> list[Candidate]:
-    """The nominate pass: the `limit` nearest ontology types to `embedding`, nearest first.
-
-    Reads the store through active_ontology_embedding — the view that always resolves to the live
-    model's vectors — so a model swap costs this query nothing and it never names a versioned table.
-    A merged type is excluded even if its vector lingers before the garbage pass drops it,
-    so recall never nominates a concept already folded into another.
-    An empty store returns an empty list: the first concept a diary ever sees has nothing to match,
-    which is exactly the signal to mint it.
-
-    ef_search — the HNSW working-set width — is opened per query, comfortably above the pool.
-    The index answers approximately from a set of candidates it walks the graph to fill,
-    and a set no wider than the result would cap the recall this pass exists to protect,
-    from the very first fact rather than only once the store grows.
-    It and the search run in one transaction so SET LOCAL holds across both regardless of the
-    connection's autocommit mode, and reverts at transaction end rather than leaking onto the pool.
-    """
-    if limit is None:
-        limit = config.RECALL_POOL
-    # pgvector has no psycopg adapter installed, so the vector crosses as its text literal and casts ::vector.
-    vector_literal = "[" + ",".join(repr(x) for x in embedding) + "]"
-    with conn.transaction():
-        # SET itself can't take a bind parameter; set_config(..., is_local => true) is the
-        # parameter-safe equivalent of SET LOCAL, so the width stays confined to this transaction.
-        conn.execute(
-            "SELECT set_config('hnsw.ef_search', %s, true)",
-            (str(config.RECALL_EF_SEARCH),),
-        )
-        rows = conn.execute(
-            """
-            SELECT o.id, o.type_name, o.definition,
-                   e.embedding <=> %(q)s::vector AS distance
-            FROM active_ontology_embedding e
-            JOIN schema_ontology o ON o.id = e.ontology_id
-            WHERE o.merged_into IS NULL
-            ORDER BY e.embedding <=> %(q)s::vector
-            LIMIT %(limit)s
-            """,
-            {"q": vector_literal, "limit": limit},
-        ).fetchall()
-    return [Candidate(r[0], r[1], r[2], r[3]) for r in rows]
-
-
 @dataclass(frozen=True)
 class Ranked:
     """One candidate and how well the re-rank judged it categorises the fact.
@@ -119,91 +80,6 @@ class Ranked:
 
     candidate: Candidate
     score: float
-
-
-def _rerank_prompt(fact_text: str, candidates: list[Candidate]) -> str:
-    # Each candidate is offered by name *and definition*, so the model judges meaning, not the label.
-    lines = "\n".join(f"- {c.type_name} — {c.definition}" for c in candidates)
-    return (
-        "You classify a personal diary fact against candidate concept types.\n"
-        f'Fact: "{fact_text}"\n\n'
-        "Score each candidate type from 0.0 to 1.0 by how well it *categorises* this fact: "
-        "1.0 means the fact is clearly an instance of that kind of thing, 0.0 means unrelated. "
-        "Judge the kind of thing, not mere topical closeness — a sprint and a marathon are related "
-        "yet are different kinds of act.\n\n"
-        f"Candidates (name — definition):\n{lines}\n\n"
-        'Return JSON only, one entry per candidate: '
-        '{"scores": [{"type": "<name>", "score": <0.0-1.0>}]}'
-    )
-
-
-def _rerank_reply_model(candidates: list[Candidate]) -> type[BaseModel]:
-    """Build — at runtime — the Pydantic model the re-rank reply must match for *this* candidate pool.
-
-    Why built on the fly rather than written as a normal `class ...(BaseModel)`:
-    the set of legal type names isn't known until we see the pool recall handed back,
-    and we want the schema to name exactly those — so each call constructs a fresh model
-    whose `type` field can only be one of the candidate names in front of us.
-
-    The model describes a reply shaped like:
-
-        {"scores": [{"type": "boxing_session", "score": 0.9},
-                    {"type": "friends",        "score": 0.2}]}
-
-    Two things it locks down by construction, not by cleanup afterwards:
-      - `type` is a Literal over the exact candidate names,
-        so the model can't score a type we never offered or invent a new one —
-        that value simply isn't in the grammar.
-      - `score` is a float pinned to 0.0–1.0, so an out-of-range number can't come back.
-
-    The model does double duty: its JSON schema is handed to Ollama as the decoder's grammar,
-    so the constraints hold *while* the tokens are generated, and the same model validates the
-    reply on the way back — a violation raises at the boundary instead of being silently coerced.
-    The one thing a schema can't force is *coverage* — that every candidate gets a score —
-    so an omitted candidate is defaulted to 0.0 by the caller (rerank_candidates), not here.
-    """
-    # The closed set of names the reply's `type` field may take:
-    # the names recall nominated, and nothing else. Fed to Literal below to become that constraint.
-    names = tuple(c.type_name for c in candidates)
-    # create_model defines a Pydantic model *dynamically* — the runtime equivalent of writing:
-    #     class _RerankScore(BaseModel):
-    #         type: Literal[<names>]
-    #         score: float = Field(ge=0.0, le=1.0)
-    # Each keyword is one field, valued as a (type, default) tuple;
-    # `...` (Ellipsis) marks the field required, with no default.
-    # `Literal[names]` turns the tuple of names into an enum-like type — `type` must equal one of them;
-    # `Field(ge=0.0, le=1.0)` bounds the score to the inclusive range 0.0–1.0.
-    score_entry = create_model(
-        "_RerankScore",
-        type=(Literal[names], ...),
-        score=(float, Field(ge=0.0, le=1.0)),
-    )
-    # Wrap those entries in the top-level reply object: {"scores": [ <_RerankScore>, ... ]}.
-    # One _RerankScore per candidate the model scored; the list itself is the required field.
-    return create_model("_RerankReply", scores=(list[score_entry], ...))
-
-
-def rerank_candidates(fact_text: str, candidates: list[Candidate]) -> list[Ranked]:
-    """Score every recalled candidate for how well it fits the fact, and return them best first.
-
-    A single LLM call scores the whole pool at once:
-    the fact plus each candidate's definition go in,
-    and a score from 0.0 to 1.0 per candidate comes back
-    (see llm.generate_json and _rerank_reply_model for how the reply is shaped and checked).
-
-    Two edge cases:
-      - an empty pool returns an empty list — recall found nothing, so there is nothing to score;
-      - a candidate the model forgot to score defaults to 0.0, so it just falls to the bottom.
-    """
-    if not candidates:
-        return []
-    reply = llm.generate_json(
-        _rerank_prompt(fact_text, candidates), _rerank_reply_model(candidates)
-    )
-    by_name = {s.type: s.score for s in reply.scores}
-    ranked = [Ranked(c, by_name.get(c.type_name, 0.0)) for c in candidates]
-    ranked.sort(key=lambda r: r.score, reverse=True)
-    return ranked
 
 
 def decide(ranked: list[Ranked]) -> str:
@@ -224,41 +100,146 @@ def decide(ranked: list[Ranked]) -> str:
     return GREY
 
 
-def _grey_gate_prompt(fact_text: str, candidate: Candidate) -> str:
-    # The one candidate on the fence, offered by name *and definition* so the model judges meaning.
+class _ConceptsReply(BaseModel):
+    """The naming step's answer: the distinct concepts a raw fact expresses.
+
+    A plain, module-level model — its shape never depends on the pool, so nothing is built per call.
+    `min_length=1` is folded into the decoder grammar and re-checked on the way back:
+    a diary fact is always *about* something, so an empty list is a mis-read, not a valid answer,
+    and it fails at the boundary rather than filing a fact under no concept at all."""
+
+    concepts: list[str] = Field(min_length=1)
+
+
+def _extract_concepts_prompt(fact_text: str) -> str:
     return (
-        "You decide whether one existing concept type correctly categorises a personal diary fact.\n"
+        "You read a personal diary fact and name the distinct concepts it expresses.\n"
         f'Fact: "{fact_text}"\n\n'
-        f"Candidate type: {candidate.type_name} — {candidate.definition}\n\n"
-        "Is the fact clearly an instance of that kind of thing? "
-        "Judge the kind of thing, not mere topical closeness — a sprint and a marathon are related "
-        "yet are different kinds of act.\n\n"
-        'Return JSON only: {"fits": true} if this type categorises the fact, {"fits": false} if not.'
+        "A single fact is usually several things at once — "
+        '"a boxing session with my friend Jeremy during the heat wave" is at once a boxing session, '
+        "time spent with a friend, and a spell of extreme heat.\n"
+        "Name each distinct *kind of thing* the fact is about, as a short self-contained phrase in "
+        'plain words — the kind, not the particular: "time with a friend", not "Jeremy".\n'
+        "Name only what the fact genuinely expresses; do not invent concepts it doesn't touch.\n\n"
+        'Return JSON only: {"concepts": ["<concept>", ...]}, with at least one.'
     )
 
 
-class _GreyGateReply(BaseModel):
-    """The grey-zone gate's one-bit verdict: does the candidate type categorise the fact?
+def extract_concepts(fact_text: str) -> list[str]:
+    """Name the distinct concepts a raw fact expresses — the fan-out point of the whole path.
 
-    A True reuses that type, a False coins a new one — the two outcomes the grey band defers to.
-    This is a plain, module-level model, not a per-call build like the re-rank's:
-    its shape is fixed at a single boolean, with no candidate names to fold into the grammar,
-    so nothing about it depends on the pool in front of us."""
-
-    fits: bool
-
-
-def resolve_grey(fact_text: str, top: Candidate) -> str:
-    """The grey-zone binary gate: reuse-or-mint the top candidate when the re-rank score was ambiguous.
-
-    decide() lands the top score in the grey band when it is neither a clear reuse nor a clear mint.
-    Rather than force one or the other on a shaky score, spend one fast yes/no LLM call on the single
-    best candidate — does this existing type accurately categorise the fact?
-    A yes reuses it (REUSE), a no coins a new type (MINT); this collapses the grey band to one of the
-    two live outcomes, so the caller never has to act on GREY itself.
+    One LLM call reads the fact and returns the *kinds of things* it is about, each a short
+    self-contained phrase, so that everything downstream can route each concept on its own.
+    It names, it does not file: a phrase here is the query the recall pass will embed, never a type.
+    Naming the kind and not the particular ("time with a friend", not "Jeremy") is what keeps the
+    particulars in the raw text, where the thin synthesis deliberately leaves them.
     """
-    reply = llm.generate_json(_grey_gate_prompt(fact_text, top), _GreyGateReply)
-    return REUSE if reply.fits else MINT
+    return llm.generate_json(_extract_concepts_prompt(fact_text), _ConceptsReply).concepts
+
+
+class _TemporalReply(BaseModel):
+    """When the event a fact describes actually happened, or null when the fact gives no cue.
+
+    A plain module-level model — its shape never depends on the pool, so nothing is built per call.
+    `happened_at` is an optional timestamp:
+    the model returns a resolved ISO 8601 instant when the fact carries a temporal cue,
+    and null when it names no moment at all, in which case the fact's time collapses to `created_at` at read time.
+    Pydantic parses the string back into a datetime and raises on a malformed one,
+    so a bad date fails loud at the boundary rather than being filed as a quietly wrong instant."""
+
+    happened_at: datetime | None = None
+
+
+def _temporal_prompt(fact_text: str, reference: datetime, zone_name: str) -> str:
+    # The reference instant — now, the moment the fact is being recorded —
+    # is given ONLY so relative cues ("yesterday", "last Tuesday") can be resolved to concrete instants,
+    # and it is stated in the symbiot's own local time, not the server's UTC:
+    # a "this evening" or a "3pm" is the evening and the hour of the human's day, wherever they sit,
+    # so the clock a cue is read against must be that same local clock, or every relative time drifts by their offset.
+    # It is deliberately not a default:
+    # a fact with no time expression must come back null, never fall back to this moment,
+    # or the nullable column that lets happened_at collapse to created_at at read time is pointless.
+    reference_line = reference.strftime("%A %d %B %Y, %H:%M")
+    return (
+        "You read a personal diary fact and decide when the event it describes actually happened.\n"
+        f'Fact: "{fact_text}"\n\n'
+        f"For reference, the human's local date and time right now is {reference_line} ({zone_name}). "
+        "Use this reference ONLY to resolve a relative time cue in the fact — "
+        '"yesterday", "last Tuesday", "this morning" each become a concrete moment relative to it.\n'
+        "The reference is NOT a default answer. If the fact contains no time expression at all — no "
+        "date, no relative cue, no time of day, it simply states something with no *when* (e.g. "
+        '"I live in Strasbourg") — return null. Do not substitute the reference moment for a missing '
+        "time, and never invent one.\n"
+        "When the fact does give a time, return the human's LOCAL wall-clock reading in ISO 8601 — "
+        "the date and time as it reads on their own clock, with no timezone conversion and no offset; "
+        "if it names only a day with no time of day, use 00:00:00 of that day.\n\n"
+        'Return JSON only: {"happened_at": "<ISO 8601 local wall-clock timestamp>"} or {"happened_at": null}.'
+    )
+
+
+def extract_happened_at(
+    fact_text: str, *, reference: datetime, zone_name: str = zone.DEFAULT_ZONE
+) -> datetime | None:
+    """Read the one time a fact happened out of its raw text, or None when it names no moment.
+
+    Time is the single particular the deliberately-thin write path promotes out of the raw text into structure
+    (see the build log):
+    one LLM call reads the fact against a reference instant — now, the moment it is being recorded,
+    stated in the symbiot's own local time — so a relative cue like "yesterday" resolves in the human's day,
+    and returns that event time or None.
+    None is the honest answer for a fact with no temporal cue:
+    the column stays empty and the read path stands `created_at` in for it,
+    rather than fabricating a precision the fact never carried.
+    It reads the fact whole, once, like the naming step — not per concept —
+    because a fact happens at one time whatever kinds it touches.
+    The model reads the human's local clock face; the returned reading is stamped with the symbiot's zone
+    and whatever offset the model may have attached is discarded —
+    the zone is ground truth and a model's offset is only a guess,
+    so taking the wall-clock reading and stamping the zone names the correct absolute instant,
+    which the TIMESTAMPTZ column then keeps in UTC (the same law the reminder executor holds).
+    """
+    reply = llm.generate_json(_temporal_prompt(fact_text, reference, zone_name), _TemporalReply)
+    if reply.happened_at is None:
+        return None
+    return reply.happened_at.replace(tzinfo=ZoneInfo(zone_name))
+
+
+def ingest(conn, raw_text: str, *, intake_id: int | None = None, zone_name: str = zone.DEFAULT_ZONE) -> int:
+    """The full write path for one raw diary fact, end to end — returns the filed fact's id.
+
+    Read the event clock first:
+    happened_at is pulled off the raw text (None when it names no moment),
+    resolved against now — the moment we record it, which the row's own created_at also captures —
+    read in the symbiot's own zone (zone_name), so a relative cue like "yesterday" or a bare "3pm"
+    lands on the concrete instant of the human's day rather than the server's UTC.
+    A by-hand call that names no zone falls back to UTC, the same defined-but-unlocalised default zone.py holds.
+    It is the one temporal particular this thin path promotes into structure.
+
+    Then name the concepts the fact expresses, route each to a type on its own, synthesize the thin
+    payload, and persist the fact once. The routed ids are de-duplicated first-seen-first: two concepts
+    can resolve to the same type (a fact "with a friend" naming both companionship and the friendship),
+    and a fact is linked to a concept once, not once per phrase that led there — the join table's
+    composite key would reject the second link anyway, so we collapse it here rather than trip it.
+    The payload's `@type` names are read back from the store by id, so a freshly minted type carries
+    the name the store actually holds, and both the payload and the link rows are ordered alphabetically
+    by that name — the concepts are a set, so a stable order beats the order they happened to be named in.
+
+    intake_id, when given, is the message this fact was distilled from —
+    passed straight to persist, whose UNIQUE index keeps live ingestion exactly-once;
+    a by-hand call omits it and files an unlinked fact.
+    """
+    happened_at = extract_happened_at(
+        raw_text, reference=zone.now_for(zone_name), zone_name=zone_name
+    )
+    routed = [route_concept(conn, concept) for concept in extract_concepts(raw_text)]
+    ontology_ids = list(dict.fromkeys(routed))
+    rows = conn.execute(
+        "SELECT id, type_name FROM schema_ontology WHERE id = ANY(%s)", (ontology_ids,)
+    ).fetchall()
+    name_by_id = {r[0]: r[1] for r in rows}
+    ontology_ids.sort(key=lambda ontology_id: name_by_id[ontology_id])
+    payload = synthesize([name_by_id[o] for o in ontology_ids], raw_text)
+    return persist(conn, raw_text, payload, ontology_ids, happened_at=happened_at, intake_id=intake_id)
 
 
 def _mint_prompt(fact_text: str, context: list[Ranked]) -> str:
@@ -385,132 +366,6 @@ def mint(conn, fact_text: str, ranked: list[Ranked]) -> int:
     return ontology_id
 
 
-class _ConceptsReply(BaseModel):
-    """The naming step's answer: the distinct concepts a raw fact expresses.
-
-    A plain, module-level model — its shape never depends on the pool, so nothing is built per call.
-    `min_length=1` is folded into the decoder grammar and re-checked on the way back:
-    a diary fact is always *about* something, so an empty list is a mis-read, not a valid answer,
-    and it fails at the boundary rather than filing a fact under no concept at all."""
-
-    concepts: list[str] = Field(min_length=1)
-
-
-def _extract_concepts_prompt(fact_text: str) -> str:
-    return (
-        "You read a personal diary fact and name the distinct concepts it expresses.\n"
-        f'Fact: "{fact_text}"\n\n'
-        "A single fact is usually several things at once — "
-        '"a boxing session with my friend Jeremy during the heat wave" is at once a boxing session, '
-        "time spent with a friend, and a spell of extreme heat.\n"
-        "Name each distinct *kind of thing* the fact is about, as a short self-contained phrase in "
-        'plain words — the kind, not the particular: "time with a friend", not "Jeremy".\n'
-        "Name only what the fact genuinely expresses; do not invent concepts it doesn't touch.\n\n"
-        'Return JSON only: {"concepts": ["<concept>", ...]}, with at least one.'
-    )
-
-
-def extract_concepts(fact_text: str) -> list[str]:
-    """Name the distinct concepts a raw fact expresses — the fan-out point of the whole path.
-
-    One LLM call reads the fact and returns the *kinds of things* it is about, each a short
-    self-contained phrase, so that everything downstream can route each concept on its own.
-    It names, it does not file: a phrase here is the query the recall pass will embed, never a type.
-    Naming the kind and not the particular ("time with a friend", not "Jeremy") is what keeps the
-    particulars in the raw text, where the thin synthesis deliberately leaves them.
-    """
-    return llm.generate_json(_extract_concepts_prompt(fact_text), _ConceptsReply).concepts
-
-
-class _TemporalReply(BaseModel):
-    """When the event a fact describes actually happened, or null when the fact gives no cue.
-
-    A plain module-level model — its shape never depends on the pool, so nothing is built per call.
-    `happened_at` is an optional timestamp:
-    the model returns a resolved ISO 8601 instant when the fact carries a temporal cue,
-    and null when it names no moment at all, in which case the fact's time collapses to `created_at` at read time.
-    Pydantic parses the string back into a datetime and raises on a malformed one,
-    so a bad date fails loud at the boundary rather than being filed as a quietly wrong instant."""
-
-    happened_at: datetime | None = None
-
-
-def _temporal_prompt(fact_text: str, reference: datetime) -> str:
-    # The reference instant — now, the moment the fact is being recorded —
-    # is given ONLY so relative cues ("yesterday", "last Tuesday") can be resolved to concrete instants.
-    # It is deliberately not a default:
-    # a fact with no time expression must come back null, never fall back to this moment,
-    # or the nullable column that lets happened_at collapse to created_at at read time is pointless.
-    return (
-        "You read a personal diary fact and decide when the event it describes actually happened.\n"
-        f'Fact: "{fact_text}"\n\n'
-        f"For reference, now is {reference.isoformat()} (UTC). "
-        "Use this reference ONLY to resolve a relative time cue in the fact — "
-        '"yesterday", "last Tuesday", "this morning" each become a concrete instant relative to it.\n'
-        "The reference is NOT a default answer. If the fact contains no time expression at all — no "
-        "date, no relative cue, no time of day, it simply states something with no *when* (e.g. "
-        '"I live in Strasbourg") — return null. Do not substitute the reference moment for a missing '
-        "time, and never invent one.\n"
-        "When the fact does give a time, return it as a full ISO 8601 timestamp in UTC; "
-        "if it names only a day with no time of day, use 00:00:00 of that day.\n\n"
-        'Return JSON only: {"happened_at": "<ISO 8601 UTC timestamp>"} or {"happened_at": null}.'
-    )
-
-
-def extract_happened_at(fact_text: str, *, reference: datetime) -> datetime | None:
-    """Read the one time a fact happened out of its raw text, or None when it names no moment.
-
-    Time is the single particular the deliberately-thin write path promotes out of the raw text into structure
-    (see the build log):
-    one LLM call reads the fact against a reference instant — now, the moment it is being recorded —
-    so a relative cue like "yesterday" resolves to a concrete instant, and returns that event time or None.
-    None is the honest answer for a fact with no temporal cue:
-    the column stays empty and the read path stands `created_at` in for it,
-    rather than fabricating a precision the fact never carried.
-    It reads the fact whole, once, like the naming step — not per concept —
-    because a fact happens at one time whatever kinds it touches.
-    """
-    reply = llm.generate_json(_temporal_prompt(fact_text, reference), _TemporalReply)
-    return reply.happened_at
-
-
-def route_concept(conn, concept_text: str) -> int:
-    """Route one named concept to a type id — reuse an existing one or coin a new one.
-
-    The recall / re-rank / mint-if-new trip for a single concept, run in the fact's own words:
-    embed the concept as a query, recall the nearest existing types, re-rank them for true fit,
-    and read the top score's band. A clear enough fit reuses that type; nothing fitting mints a new
-    one; the grey band in between spends one yes/no call to settle reuse-or-mint rather than guess.
-    Returns the id of the type the concept resolved to, whichever way it got there.
-    """
-    vector = embedding.embed(concept_text, task="query")
-    candidates = recall_candidates(conn, vector)
-    ranked = rerank_candidates(concept_text, candidates)
-    verdict = decide(ranked)
-    if verdict == GREY:
-        verdict = resolve_grey(concept_text, ranked[0].candidate)
-    if verdict == REUSE:
-        return ranked[0].candidate.ontology_id
-    return mint(conn, concept_text, ranked)
-
-
-def synthesize(type_names: list[str], raw_text: str) -> dict:
-    """Render a routed fact into its thin JSON-LD payload — deliberately, not an LLM step.
-
-    The payload carries exactly two things: the fact's `@type` links to the types it routed to,
-    and its own raw text verbatim. Nothing is extracted from the text into structured fields —
-    the particulars stay inside `text`, which remains the durable truth (see the build log for why
-    the first synthesis is kept this thin, and why richer structure is an open question, not a plan).
-    Both values are already in hand by the time we get here — the types from routing, the text from
-    the fact itself — so there is nothing for a model to judge, and this is plain assembly, no call.
-    The `@type` links are sorted alphabetically: the concepts a fact resolved to are a set, not a
-    sequence, so a stable order makes the payload deterministic rather than beholden to the order the
-    concepts happened to be named in — the distance- and score-ordered lists upstream keep their order,
-    which there is load-bearing; here it is not.
-    """
-    return {"@type": sorted(type_names), "text": raw_text}
-
-
 def persist(
     conn,
     raw_text: str,
@@ -575,35 +430,203 @@ def persist(
     return fact_id
 
 
-def ingest(conn, raw_text: str, *, intake_id: int | None = None) -> int:
-    """The full write path for one raw diary fact, end to end — returns the filed fact's id.
+def recall_candidates(conn, embedding: list[float], limit: int | None = None) -> list[Candidate]:
+    """The nominate pass: the `limit` nearest ontology types to `embedding`, nearest first.
 
-    Read the event clock first:
-    happened_at is pulled off the raw text (None when it names no moment),
-    resolved against now — the moment we record it, which the row's own created_at also captures —
-    so a relative cue like "yesterday" lands on a concrete instant.
-    It is the one temporal particular this thin path promotes into structure.
+    Reads the store through active_ontology_embedding — the view that always resolves to the live
+    model's vectors — so a model swap costs this query nothing and it never names a versioned table.
+    A merged type is excluded even if its vector lingers before the garbage pass drops it,
+    so recall never nominates a concept already folded into another.
+    An empty store returns an empty list: the first concept a diary ever sees has nothing to match,
+    which is exactly the signal to mint it.
 
-    Then name the concepts the fact expresses, route each to a type on its own, synthesize the thin
-    payload, and persist the fact once. The routed ids are de-duplicated first-seen-first: two concepts
-    can resolve to the same type (a fact "with a friend" naming both companionship and the friendship),
-    and a fact is linked to a concept once, not once per phrase that led there — the join table's
-    composite key would reject the second link anyway, so we collapse it here rather than trip it.
-    The payload's `@type` names are read back from the store by id, so a freshly minted type carries
-    the name the store actually holds, and both the payload and the link rows are ordered alphabetically
-    by that name — the concepts are a set, so a stable order beats the order they happened to be named in.
-
-    intake_id, when given, is the message this fact was distilled from —
-    passed straight to persist, whose UNIQUE index keeps live ingestion exactly-once;
-    a by-hand call omits it and files an unlinked fact.
+    ef_search — the HNSW working-set width — is opened per query, comfortably above the pool.
+    The index answers approximately from a set of candidates it walks the graph to fill,
+    and a set no wider than the result would cap the recall this pass exists to protect,
+    from the very first fact rather than only once the store grows.
+    It and the search run in one transaction so SET LOCAL holds across both regardless of the
+    connection's autocommit mode, and reverts at transaction end rather than leaking onto the pool.
     """
-    happened_at = extract_happened_at(raw_text, reference=datetime.now(timezone.utc))
-    routed = [route_concept(conn, concept) for concept in extract_concepts(raw_text)]
-    ontology_ids = list(dict.fromkeys(routed))
-    rows = conn.execute(
-        "SELECT id, type_name FROM schema_ontology WHERE id = ANY(%s)", (ontology_ids,)
-    ).fetchall()
-    name_by_id = {r[0]: r[1] for r in rows}
-    ontology_ids.sort(key=lambda ontology_id: name_by_id[ontology_id])
-    payload = synthesize([name_by_id[o] for o in ontology_ids], raw_text)
-    return persist(conn, raw_text, payload, ontology_ids, happened_at=happened_at, intake_id=intake_id)
+    if limit is None:
+        limit = config.RECALL_POOL
+    # pgvector has no psycopg adapter installed, so the vector crosses as its text literal and casts ::vector.
+    vector_literal = "[" + ",".join(repr(x) for x in embedding) + "]"
+    with conn.transaction():
+        # SET itself can't take a bind parameter; set_config(..., is_local => true) is the
+        # parameter-safe equivalent of SET LOCAL, so the width stays confined to this transaction.
+        conn.execute(
+            "SELECT set_config('hnsw.ef_search', %s, true)",
+            (str(config.RECALL_EF_SEARCH),),
+        )
+        rows = conn.execute(
+            """
+            SELECT o.id, o.type_name, o.definition,
+                   e.embedding <=> %(q)s::vector AS distance
+            FROM active_ontology_embedding e
+            JOIN schema_ontology o ON o.id = e.ontology_id
+            WHERE o.merged_into IS NULL
+            ORDER BY e.embedding <=> %(q)s::vector
+            LIMIT %(limit)s
+            """,
+            {"q": vector_literal, "limit": limit},
+        ).fetchall()
+    return [Candidate(r[0], r[1], r[2], r[3]) for r in rows]
+
+
+def _rerank_prompt(fact_text: str, candidates: list[Candidate]) -> str:
+    # Each candidate is offered by name *and definition*, so the model judges meaning, not the label.
+    lines = "\n".join(f"- {c.type_name} — {c.definition}" for c in candidates)
+    return (
+        "You classify a personal diary fact against candidate concept types.\n"
+        f'Fact: "{fact_text}"\n\n'
+        "Score each candidate type from 0.0 to 1.0 by how well it *categorises* this fact: "
+        "1.0 means the fact is clearly an instance of that kind of thing, 0.0 means unrelated. "
+        "Judge the kind of thing, not mere topical closeness — a sprint and a marathon are related "
+        "yet are different kinds of act.\n\n"
+        f"Candidates (name — definition):\n{lines}\n\n"
+        'Return JSON only, one entry per candidate: '
+        '{"scores": [{"type": "<name>", "score": <0.0-1.0>}]}'
+    )
+
+
+def _rerank_reply_model(candidates: list[Candidate]) -> type[BaseModel]:
+    """Build — at runtime — the Pydantic model the re-rank reply must match for *this* candidate pool.
+
+    Why built on the fly rather than written as a normal `class ...(BaseModel)`:
+    the set of legal type names isn't known until we see the pool recall handed back,
+    and we want the schema to name exactly those — so each call constructs a fresh model
+    whose `type` field can only be one of the candidate names in front of us.
+
+    The model describes a reply shaped like:
+
+        {"scores": [{"type": "boxing_session", "score": 0.9},
+                    {"type": "friends",        "score": 0.2}]}
+
+    Two things it locks down by construction, not by cleanup afterwards:
+      - `type` is a Literal over the exact candidate names,
+        so the model can't score a type we never offered or invent a new one —
+        that value simply isn't in the grammar.
+      - `score` is a float pinned to 0.0–1.0, so an out-of-range number can't come back.
+
+    The model does double duty: its JSON schema is handed to Ollama as the decoder's grammar,
+    so the constraints hold *while* the tokens are generated, and the same model validates the
+    reply on the way back — a violation raises at the boundary instead of being silently coerced.
+    The one thing a schema can't force is *coverage* — that every candidate gets a score —
+    so an omitted candidate is defaulted to 0.0 by the caller (rerank_candidates), not here.
+    """
+    # The closed set of names the reply's `type` field may take:
+    # the names recall nominated, and nothing else. Fed to Literal below to become that constraint.
+    names = tuple(c.type_name for c in candidates)
+    # create_model defines a Pydantic model *dynamically* — the runtime equivalent of writing:
+    #     class _RerankScore(BaseModel):
+    #         type: Literal[<names>]
+    #         score: float = Field(ge=0.0, le=1.0)
+    # Each keyword is one field, valued as a (type, default) tuple;
+    # `...` (Ellipsis) marks the field required, with no default.
+    # `Literal[names]` turns the tuple of names into an enum-like type — `type` must equal one of them;
+    # `Field(ge=0.0, le=1.0)` bounds the score to the inclusive range 0.0–1.0.
+    score_entry = create_model(
+        "_RerankScore",
+        type=(Literal[names], ...),
+        score=(float, Field(ge=0.0, le=1.0)),
+    )
+    # Wrap those entries in the top-level reply object: {"scores": [ <_RerankScore>, ... ]}.
+    # One _RerankScore per candidate the model scored; the list itself is the required field.
+    return create_model("_RerankReply", scores=(list[score_entry], ...))
+
+
+def rerank_candidates(fact_text: str, candidates: list[Candidate]) -> list[Ranked]:
+    """Score every recalled candidate for how well it fits the fact, and return them best first.
+
+    A single LLM call scores the whole pool at once:
+    the fact plus each candidate's definition go in,
+    and a score from 0.0 to 1.0 per candidate comes back
+    (see llm.generate_json and _rerank_reply_model for how the reply is shaped and checked).
+
+    Two edge cases:
+      - an empty pool returns an empty list — recall found nothing, so there is nothing to score;
+      - a candidate the model forgot to score defaults to 0.0, so it just falls to the bottom.
+    """
+    if not candidates:
+        return []
+    reply = llm.generate_json(
+        _rerank_prompt(fact_text, candidates), _rerank_reply_model(candidates)
+    )
+    by_name = {s.type: s.score for s in reply.scores}
+    ranked = [Ranked(c, by_name.get(c.type_name, 0.0)) for c in candidates]
+    ranked.sort(key=lambda r: r.score, reverse=True)
+    return ranked
+
+
+class _GreyGateReply(BaseModel):
+    """The grey-zone gate's one-bit verdict: does the candidate type categorise the fact?
+
+    A True reuses that type, a False coins a new one — the two outcomes the grey band defers to.
+    This is a plain, module-level model, not a per-call build like the re-rank's:
+    its shape is fixed at a single boolean, with no candidate names to fold into the grammar,
+    so nothing about it depends on the pool in front of us."""
+
+    fits: bool
+
+
+def _grey_gate_prompt(fact_text: str, candidate: Candidate) -> str:
+    # The one candidate on the fence, offered by name *and definition* so the model judges meaning.
+    return (
+        "You decide whether one existing concept type correctly categorises a personal diary fact.\n"
+        f'Fact: "{fact_text}"\n\n'
+        f"Candidate type: {candidate.type_name} — {candidate.definition}\n\n"
+        "Is the fact clearly an instance of that kind of thing? "
+        "Judge the kind of thing, not mere topical closeness — a sprint and a marathon are related "
+        "yet are different kinds of act.\n\n"
+        'Return JSON only: {"fits": true} if this type categorises the fact, {"fits": false} if not.'
+    )
+
+
+def resolve_grey(fact_text: str, top: Candidate) -> str:
+    """The grey-zone binary gate: reuse-or-mint the top candidate when the re-rank score was ambiguous.
+
+    decide() lands the top score in the grey band when it is neither a clear reuse nor a clear mint.
+    Rather than force one or the other on a shaky score, spend one fast yes/no LLM call on the single
+    best candidate — does this existing type accurately categorise the fact?
+    A yes reuses it (REUSE), a no coins a new type (MINT); this collapses the grey band to one of the
+    two live outcomes, so the caller never has to act on GREY itself.
+    """
+    reply = llm.generate_json(_grey_gate_prompt(fact_text, top), _GreyGateReply)
+    return REUSE if reply.fits else MINT
+
+
+def route_concept(conn, concept_text: str) -> int:
+    """Route one named concept to a type id — reuse an existing one or coin a new one.
+
+    The recall / re-rank / mint-if-new trip for a single concept, run in the fact's own words:
+    embed the concept as a query, recall the nearest existing types, re-rank them for true fit,
+    and read the top score's band. A clear enough fit reuses that type; nothing fitting mints a new
+    one; the grey band in between spends one yes/no call to settle reuse-or-mint rather than guess.
+    Returns the id of the type the concept resolved to, whichever way it got there.
+    """
+    vector = embedding.embed(concept_text, task="query")
+    candidates = recall_candidates(conn, vector)
+    ranked = rerank_candidates(concept_text, candidates)
+    verdict = decide(ranked)
+    if verdict == GREY:
+        verdict = resolve_grey(concept_text, ranked[0].candidate)
+    if verdict == REUSE:
+        return ranked[0].candidate.ontology_id
+    return mint(conn, concept_text, ranked)
+
+
+def synthesize(type_names: list[str], raw_text: str) -> dict:
+    """Render a routed fact into its thin JSON-LD payload — deliberately, not an LLM step.
+
+    The payload carries exactly two things: the fact's `@type` links to the types it routed to,
+    and its own raw text verbatim. Nothing is extracted from the text into structured fields —
+    the particulars stay inside `text`, which remains the durable truth (see the build log for why
+    the first synthesis is kept this thin, and why richer structure is an open question, not a plan).
+    Both values are already in hand by the time we get here — the types from routing, the text from
+    the fact itself — so there is nothing for a model to judge, and this is plain assembly, no call.
+    The `@type` links are sorted alphabetically: the concepts a fact resolved to are a set, not a
+    sequence, so a stable order makes the payload deterministic rather than beholden to the order the
+    concepts happened to be named in — the distance- and score-ordered lists upstream keep their order,
+    which there is load-bearing; here it is not.
+    """
+    return {"@type": sorted(type_names), "text": raw_text}

@@ -450,7 +450,9 @@ def test_generate_json_sends_the_fixed_flags_and_validates(monkeypatch):
     out = llm.generate_json("some prompt", _Scored)
 
     assert isinstance(out, _Scored) and out.score == 0.5
-    assert fake.captured["json"]["reasoning_effort"] == llm._reasoning_effort(llm.models.role_name("rerank"))  # thinking off, the per-model value
+    assert fake.captured["json"]["reasoning_effort"] == llm._reasoning_effort(
+        llm._scaleway_fallback(llm.models.role_name("rerank"))
+    )  # thinking off, the per-model value — of the rung that answers, the rerank primary's Scaleway catch
     assert _schema(fake) == _Scored.model_json_schema()  # the caller's model bound the decoder
     assert fake.captured["json"]["temperature"] == 0  # deterministic for a scored judgment
     assert fake.captured["base_url"] == llm.config.SCALEWAY_API_BASE_URL
@@ -501,9 +503,10 @@ def test_extract_concepts_rejects_an_empty_list(monkeypatch):
 
 
 def test_extract_happened_at_resolves_a_cue_against_the_reference(monkeypatch):
-    # The fact carries a relative cue; the model resolves it to an instant, which we parse to a datetime.
+    # The fact carries a relative cue; the model resolves it to a local wall-clock reading,
+    # which we stamp with the symbiot's zone (here the UTC default) to a concrete instant.
     # The prompt must carry both the fact and the reference moment cues resolve against.
-    fake = _FakeChat(generate='{"happened_at": "2026-07-10T00:00:00Z"}')
+    fake = _FakeChat(generate='{"happened_at": "2026-07-10T00:00:00"}')
     monkeypatch.setattr(llm, "OpenAI", fake)
     reference = datetime(2026, 7, 11, 21, 0, tzinfo=timezone.utc)
 
@@ -511,7 +514,10 @@ def test_extract_happened_at_resolves_a_cue_against_the_reference(monkeypatch):
 
     assert got == datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc)
     assert "boxing yesterday" in _prompt(fake)
-    assert reference.isoformat() in _prompt(fake)
+    # The reference is stated as the human's local clock, not an ISO UTC stamp:
+    # its wall-clock reading and the zone name both reach the prompt.
+    assert "Saturday 11 July 2026, 21:00" in _prompt(fake)
+    assert "UTC" in _prompt(fake)
 
 
 def test_extract_happened_at_returns_none_when_the_fact_names_no_moment(monkeypatch):
@@ -755,7 +761,7 @@ def test_ingest_routes_every_concept_links_all_and_files_the_thin_payload(client
         c = _add_type(conn, "heat_wave", "a spell of extreme heat", _vec(**{"2": 1.0}))
 
         # Temporal extraction is its own step with its own tests; stub it so this proves orchestration.
-        monkeypatch.setattr(ontology, "extract_happened_at", lambda text, *, reference: None)
+        monkeypatch.setattr(ontology, "extract_happened_at", lambda text, *, reference, zone_name="UTC": None)
         # Name and route the concepts out of alphabetical order, to prove the payload sorts them.
         monkeypatch.setattr(ontology, "extract_concepts",
                             lambda text: ["a heat wave", "a boxing session", "time with a friend"])
@@ -781,7 +787,7 @@ def test_ingest_dedups_concepts_that_route_to_the_same_type(client, monkeypatch)
     with db.get_pool().connection() as conn:
         a = _add_type(conn, "friends", "time spent with a friend", _vec(**{"0": 1.0}))
 
-        monkeypatch.setattr(ontology, "extract_happened_at", lambda text, *, reference: None)
+        monkeypatch.setattr(ontology, "extract_happened_at", lambda text, *, reference, zone_name="UTC": None)
         monkeypatch.setattr(ontology, "extract_concepts",
                             lambda text: ["time with a friend", "the friendship itself"])
         monkeypatch.setattr(ontology, "route_concept", lambda conn, concept: a)

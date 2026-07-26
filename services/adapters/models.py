@@ -122,21 +122,32 @@ class Model:
 # or a boot before the seed runs, still resolves a builtin rather than nothing.
 #
 # The generative roles map onto three tiers (see the tier constants in core/config.py),
-# and the models here are what those tiers default to:
-#   flagship — glm-5.2 on Scaleway, the capable model kept for the reply and the load-bearing memory;
-#   the two cheaper rungs — gpt-oss-120b on Scaleway, an order of magnitude cheaper per token;
-#   and each rung's cross-cloud fallback on Mistral — mistral-large-latest, mistral-small-latest, ministral-8b-latest —
-#   with qwen3.5:4b the single local floor beneath them all, the rollback target reached when both clouds are down.
+# and the models here are what those tiers default to, primary to local floor:
+#   flagship — gemini-3.1-pro-preview on Google, the primary the flagship roles resolve to, answering in the steady state;
+#   mid — gemini-3.6-flash on Google;
+#   small — gemini-3.5-flash-lite on Google, genuinely distinct from mid (each Gemini tier its own model);
+#   below each Gemini primary, on an outage, its Scaleway rung (config.SCALEWAY_*_MODEL) —
+#     glm-5.2 for the flagship, gpt-oss-120b for the two cheaper tiers, which share it;
+#   below Scaleway, that rung's cross-cloud Mistral catch (config.MISTRAL_*_MODEL) —
+#     mistral-large-latest for the flagship, ministral-8b-latest shared by the two cheaper tiers,
+#     with mistral-small-latest held ready for the day the cheaper tiers split;
+#   and qwen3.5:4b the single local floor beneath them all, the rollback target reached when every cloud is down.
 #
 # The context windows are each the model's *optimal*,
 # deliberately below the advertised maximum,
 # because a model reads well across only about half the window it will accept —
 # NVIDIA's RULER and its successors find recall frays past that, with no error to show for it.
-# The models advertising ~256K — glm-5.2, mistral-large-latest, mistral-small-latest — are held at 131072 (128K);
-# gpt-oss-120b and ministral-8b-latest, whose native window *is* 128K, are held at half again — 65536 —
-# past which a 128K model's own recall frays.
-# Each Mistral fallback sits at or above the window of the Scaleway primary it catches,
-# so a prompt fitted for the primary can never overflow the model that inherits it when the ladder falls.
+# gemini-3.1-pro-preview (~1M native), glm-5.2 (1M native), mistral-large-latest (Mistral Large 3, 262K),
+# and qwen3.5:4b (262K) are all held at 131072 (128K) —
+# the two millionaires far below even half their window,
+# kept there so a prompt fitted to the flagship top rung stays within reach of every rung that inherits it,
+# down to the local qwen floor, none of which reaches a million;
+# gemini-3.6-flash and gemini-3.5-flash-lite (~1M native), gpt-oss-120b, mistral-small-latest, and ministral-8b-latest
+# (whose native window *is* 128K) are all held at half again — 65536 — past which a 128K model's own recall frays,
+# and where the Gemini Flash pair is again held far below native for the same reason the flagship is.
+# So each rung, top to bottom within a tier, sits at or above the window of the rung above it that would fall to it —
+# Google above Scaleway above Mistral above the local floor —
+# and a prompt fitted for the top rung can never overflow the humbler model that inherits it when the ladder falls.
 # The output ceiling works the opposite way to the window:
 # it isn't an optimal below a degradation point
 # (a reply doesn't get worse because we let it run longer),
@@ -151,6 +162,9 @@ class Model:
 #     (its 5-minute-response rule),
 #     and a request over that is a 400 we would never fall through —
 #     so 16384 is the true ceiling, and the other Scaleway generative models are held to the same verified cap;
+#   the Gemini models permit far more output (tens of thousands of tokens),
+#     but the guard there is ours to set and is held to the same 16384, so the top rung never invites a reply
+#     the rung beneath it would have to truncate;
 #   the Mistral models enforce no request-time output cap at all
 #     (they accept an absurd max_tokens and just stop when done),
 #     so the guard there is entirely ours to set;
@@ -159,6 +173,7 @@ class Model:
 # so a fallback never truncates a reply shorter than the primary would have given —
 # one ceiling at the highest the most-constrained tier allows.
 # The keys are the exact ids each provider answers to:
+# the Gemini names are the Agent Platform's model ids,
 # "glm-5.2" is Scaleway's Generative APIs id (not the "zai-org/GLM-5.2" the model card uses),
 # and the Mistral names are Mistral's own web-API ids.
 # nomic-embed-text is the embedder, not a generative model —
@@ -166,11 +181,14 @@ class Model:
 # so its windows are listed for the catalog's completeness (0 output — never consulted)
 # but are not the budget guard's concern.
 BUILTIN_MODELS = {
+    "gemini-3.1-pro-preview": Model("google", "gemini-3.1-pro-preview", 131072, 16384),
+    "gemini-3.5-flash-lite": Model("google", "gemini-3.5-flash-lite", 65536, 16384),
+    "gemini-3.6-flash": Model("google", "gemini-3.6-flash", 65536, 16384),
     "glm-5.2": Model("scaleway", "glm-5.2", 131072, 16384),
     "gpt-oss-120b": Model("scaleway", "gpt-oss-120b", 65536, 16384),
     "ministral-8b-latest": Model("mistral", "ministral-8b-latest", 65536, 16384),
     "mistral-large-latest": Model("mistral", "mistral-large-latest", 131072, 16384),
-    "mistral-small-latest": Model("mistral", "mistral-small-latest", 131072, 16384),
+    "mistral-small-latest": Model("mistral", "mistral-small-latest", 65536, 16384),
     "nomic-embed-text": Model("ollama", "nomic-embed-text", 8192, 0),
     "qwen3.5:4b": Model("ollama", "qwen3.5:4b", 131072, 16384),
 }
@@ -374,10 +392,19 @@ def _read_store(conn) -> tuple[dict[str, Model], dict[str, str]]:
     shared by the eager parent load (through the pool)
     and the lazy child load (through a direct connection) —
     so both populate the cache identically.
+
+    A measured window wins over the code's judgment where one exists (migration 0022).
+    The judgment is a property of the model and true on every box;
+    a measurement is a property of *this* box, taken because a local model's usable window
+    depends on hardware the code cannot see.
+    So the COALESCE is the whole of how a measured machine differs from an unmeasured one:
+    everything downstream reads a window and never asks where it came from.
     """
     catalog = _rows_to_catalog(
         conn.execute(
-            "SELECT name, provider, optimal_context_tokens, max_output_tokens FROM model"
+            "SELECT name, provider, "
+            "COALESCE(measured_context_tokens, optimal_context_tokens), max_output_tokens "
+            "FROM model"
         ).fetchall()
     )
     roles = {role: model_name for (role, model_name) in conn.execute(

@@ -97,20 +97,27 @@ def catalog(conn) -> list[dict]:
     so the list reads as "what ships, then what you added".
     Each row carries whether it's a builtin,
     so the shell can show which ones it may edit and which it may only assign.
+
+    measured_context_tokens rides alongside the code's figure rather than replacing it in this view.
+    The resolver collapses the two (services.models), but a reader deserves both:
+    seeing the judgment and the measurement side by side is what makes a shrunk window legible
+    as a decision the machine took about this box, rather than a number that mysteriously disagrees with the docs.
     """
     rows = conn.execute(
-        "SELECT name, provider, optimal_context_tokens, max_output_tokens, is_builtin "
+        "SELECT name, provider, optimal_context_tokens, measured_context_tokens, "
+        "max_output_tokens, is_builtin "
         "FROM model ORDER BY is_builtin DESC, name"
     ).fetchall()
     return [
         {
-            "name": name,
-            "provider": provider,
-            "optimal_context_tokens": optimal_context_tokens,
-            "max_output_tokens": max_output_tokens,
             "is_builtin": is_builtin,
+            "max_output_tokens": max_output_tokens,
+            "measured_context_tokens": measured_context_tokens,
+            "name": name,
+            "optimal_context_tokens": optimal_context_tokens,
+            "provider": provider,
         }
-        for (name, provider, optimal_context_tokens, max_output_tokens, is_builtin) in rows
+        for (name, provider, optimal_context_tokens, measured_context_tokens, max_output_tokens, is_builtin) in rows
     ]
 
 
@@ -186,6 +193,33 @@ def delete_model(conn, name: str) -> None:
             f"{name!r} is still assigned to {', '.join(holders)} — point those role(s) at another model first"
         )
     conn.execute("DELETE FROM model WHERE name = %s", (name,))
+
+
+def measured_window(conn, name: str) -> int | None:
+    """The window measured on this box for a model, or None if it has never been measured.
+
+    The presence of a figure is what makes the probe a one-time cost:
+    a boot that finds one already recorded adopts it and never loads the model to measure again.
+    """
+    row = conn.execute(
+        "SELECT measured_context_tokens FROM model WHERE name = %s", (name,)
+    ).fetchone()
+    return row[0] if row is not None else None
+
+
+def set_measured_window(conn, name: str, tokens: int | None) -> None:
+    """Record (or clear) the window measured on this box for a model — the calibration write.
+
+    Deliberately not part of upsert_model and not reachable from /models:
+    this is a measurement of the machine, not an operator's opinion about a model,
+    and the two must not be editable through the same door
+    or a hand-typed number would be indistinguishable from an observed one.
+    Passing None clears the measurement, which is how a box is made to re-probe —
+    the resolver then falls back to the code's judgment until the next boot measures again.
+    """
+    conn.execute(
+        "UPDATE model SET measured_context_tokens = %s WHERE name = %s", (tokens, name)
+    )
 
 
 def set_role(conn, role: str, model_name: str) -> None:

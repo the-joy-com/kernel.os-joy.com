@@ -60,7 +60,7 @@ class MachineUterrance:
 class MachineUtteranceCluster:
     """A set of machine utterances that say more or less the same thing — an echo, as the lens reports it.
 
-    members are the lines that clustered together, oldest first;
+    members are the lines that clustered together, newest first;
     similarity is the strongest pairwise closeness within the set (0..1), the headline number the view shows.
     """
 
@@ -72,7 +72,7 @@ class MachineUtteranceCluster:
 class MachineEchoes:
     """The echoes lens's full answer: what clustered, what stood alone, and whether scoring ran at all.
 
-    clusters are the echo groups, strongest first; singles are the lines that echoed nothing, oldest first.
+    clusters are the echo groups, strongest first; singles are the lines that echoed nothing, newest first.
     scored is False only when the similarity pass could not run because the embedder was unreachable —
     the lens then still shows the plain mirror (every line a single) rather than erroring,
     honest that it could not measure closeness this time.
@@ -127,7 +127,7 @@ def machine_echoes(conn, symbiot_id: int, threshold: float = echo.ECHO_THRESHOLD
     so two of my own lines are compared symmetrically — and reads the cosine closeness between every pair.
     Lines at or above the threshold are joined into a cluster, transitively,
     so a chain of near-duplicates lands in one group, and a cluster's headline similarity is the strongest pair inside it;
-    a line that echoes nothing stands alone. Clusters come back strongest first, singles oldest first.
+    a line that echoes nothing stands alone. Clusters come back strongest first, their members and the singles newest first.
     Read-only, and off the loop's path: the embedding cost is paid only here, when a symbiot opens the lens.
     Fewer than two lines cannot echo, so scoring is skipped and the embedder is never called.
     If the embedder is unreachable the pass degrades rather than fails — every line comes back a single, scored False —
@@ -176,19 +176,19 @@ def machine_echoes(conn, symbiot_id: int, threshold: float = echo.ECHO_THRESHOLD
         else:
             singles.append(utterances[members[0]])
     clusters.sort(key=lambda c: c.similarity, reverse=True)
-    singles.sort(key=lambda u: u.created_at)
+    singles.sort(key=lambda u: u.created_at, reverse=True)
     return MachineEchoes(scored=True, clusters=clusters, singles=singles)
 
 
 def recent_machine_utterances(conn, symbiot_id: int, limit: int = RECENT_UTTERANCE_LIMIT) -> list[MachineUterrance]:
-    """The symbiot's most recent machine utterances, oldest first, for the echoes lens.
+    """The symbiot's most recent machine utterances, newest first, for the echoes lens.
 
     Reads the machine side of the conversation stream and resolves each row to its words and its origin:
     a fast reply's words are its intake row's answer and its trigger is that row's message;
     a missive's words are its body, and an enrichment row claiming it marks a deep follow-up ('deep');
     any other missive is a note.
-    Bounded by `limit` at the newest end (the stream's own id order), then handed back oldest-first
-    so the reader scans it the way the conversation ran — the order redundancy is easiest to see in.
+    Bounded by `limit` at the newest end (the stream's own id order) and handed back newest-first,
+    so the lens opens on the latest line — the way a symbiot scanning their own scrollback reads it.
     """
     rows = conn.execute(
         """
@@ -215,10 +215,10 @@ def recent_machine_utterances(conn, symbiot_id: int, limit: int = RECENT_UTTERAN
         """,
         {"symbiot": symbiot_id, "limit": limit},
     ).fetchall()
-    # Newest-first off the index, reversed here so the lens reads oldest-first.
+    # Newest-first straight off the index — the order the lens reads.
     return [
         MachineUterrance(mechanism=r[0], text=r[1], trigger=r[2], created_at=r[3])
-        for r in reversed(rows)
+        for r in rows
     ]
 
 

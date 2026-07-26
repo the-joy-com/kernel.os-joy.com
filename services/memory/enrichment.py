@@ -168,10 +168,10 @@ def compose(
     """
     if not related:
         return False, ""
-    voice = persona.load()
+    head = persona.head()
     time_line = zone.render_now(now_local, zone_name) if now_local is not None and zone_name else None
     reply = llm.generate_json(
-        _compose_prompt(origin, related, voice, zone_name or zone.DEFAULT_ZONE, time_line),
+        _compose_prompt(origin, related, head, zone_name or zone.DEFAULT_ZONE, time_line),
         _EnrichmentReply,
         model=models.role_name("enrich"),
     )
@@ -353,17 +353,18 @@ def record_burst(
 
 
 def _compose_prompt(
-    origin: Origin, related: list[deep_retrieval.Related], voice: str, zone_name: str, time_line: str | None
+    origin: Origin, related: list[deep_retrieval.Related], head: str, zone_name: str, time_line: str | None
 ) -> str:
-    # voice first (who is speaking), then the situation, then the symbiot's local time now (when known),
+    # head first (the truth-rules preamble, then the persona that says who is speaking), then the situation, then the symbiot's local time now (when known),
     # then the origin reference (message, prior answer, the recent conversation), then the deep facts, then the gate-and-compose instruction.
+    # The head is the same fixed, cacheable prefix the fast reply leads with (persona.head), shared so both cache as one head.
     # The time line sits right after the framing that says the conversation may have moved on — it is the present that "where things now stand" is measured against,
     # the same current-time reference the fast reply states, so the follow-up composed a beat later does not reason about time in a void.
     # Both the prior answer and the recent conversation — which carries any follow-ups already sent — are named explicitly
     # and repeating either is forbidden, so the model adds only genuinely new ground and never echoes an earlier deep reply.
     now = f"{time_line}\n\n" if time_line else ""
     return (
-        f"{voice}\n\n"
+        f"{head}\n\n"
         "A moment ago you answered the human symbiot you live in symbiosis with. "
         "Since then, off to the side, you have had time to reach deeper into your diary — by meaning, not just wording — "
         "and you have found the entries below. Decide whether they let you add something genuinely worth saying now: "

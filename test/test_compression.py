@@ -54,6 +54,15 @@ def _small_budget(monkeypatch, budget=90):
     monkeypatch.setattr(worker.conversation, "verbatim_budget", lambda: budget)
 
 
+def _backdate(item_id, seconds_ago):
+    # Age an item into the past so the idle-collapse eligibility read sees the conversation as gone quiet.
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE conversation_item SET created_at = NOW() - make_interval(secs => %s) WHERE id = %s",
+            (seconds_ago, item_id),
+        )
+
+
 def test_compress_folds_the_overflow_into_a_new_gist_and_advances_the_cutoff(client, monkeypatch):
     _small_budget(monkeypatch)
     calls = []
@@ -126,3 +135,36 @@ def test_compress_never_folds_the_same_turn_twice(client, monkeypatch):
     assert worker._compress_one() is False  # the remaining tail is within budget, nothing left to fold
     assert len(calls) == 1
     assert len(_gists()) == 1
+
+
+def test_collapse_idle_folds_the_whole_tail_of_a_gone_quiet_conversation(client, monkeypatch):
+    # The idle half of the shrink: a conversation quiet past COMPRESS_IDLE_SECONDS has its whole verbatim tail
+    # collapsed into the Gist, even though it never grew past the size budget, so the next session opens lean.
+    calls = []
+    _stub_fold(monkeypatch, calls)
+    intake_id = _intake("m", answer="a")
+    a = _item("symbiot", 50, intake_id=intake_id)
+    b = _item("machine", 50, intake_id=intake_id)
+    _backdate(a, 3600)
+    _backdate(b, 3600)
+
+    assert worker._collapse_idle_one() is True
+    # The whole tail folded (both turns), oldest first, and the cutoff advanced to the newest turn.
+    assert calls == [(None, [("symbiot", "m"), ("machine", "a")])]
+    assert _gists() == [("FOLDED SUMMARY", b)]
+    # Nothing left past the cutoff, so a second idle pass has nothing to collapse.
+    assert worker._collapse_idle_one() is False
+
+
+def test_collapse_idle_leaves_a_live_conversation_alone(client, monkeypatch):
+    # A conversation whose newest turn is recent is still live and is never collapsed, however old its earlier turns.
+    calls = []
+    _stub_fold(monkeypatch, calls)
+    intake_id = _intake("m", answer="a")
+    a = _item("symbiot", 50, intake_id=intake_id)
+    _backdate(a, 3600)
+    _item("machine", 50, intake_id=intake_id)  # a fresh turn — the conversation is live
+
+    assert worker._collapse_idle_one() is False
+    assert calls == []
+    assert _gists() == []

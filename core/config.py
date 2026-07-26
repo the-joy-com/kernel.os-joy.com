@@ -1,6 +1,6 @@
 """Configuration: every environment-sourced value the kernel reads, in one place.
 
-`.env` is loaded once here so the rest of the code reads plain module-level constants
+`.env` is loaded once here so the rest of the code reads plain module-level constants,
 and never touches `os.environ` directly.
 The same `.env` file is read identically on a dev box and on the server —
 only the values differ (see .env.example for the local-vs-server database URL, in particular).
@@ -66,6 +66,13 @@ PERSONA_PRIVATE_FILE = os.getenv(
     "PERSONA_PRIVATE_FILE", os.path.join(_REPO_ROOT, "persona", "private.md")
 )
 
+# The ground-rules preamble: the truth contract that leads every composed answer (persona.head, reply/enrichment/tools).
+# A repo-versioned file like the public persona — it says nothing secret, only how the machine must handle truth —
+# and it is the front of the fixed, cacheable head every high-volume prose call now shares,
+# so its bytes repeat identically call to call and a caching provider bills them once instead of every turn.
+# Anchored to the repo root like the persona files, and overridable by the environment the same way.
+PREAMBLE_FILE = os.getenv("PREAMBLE_FILE", os.path.join(_REPO_ROOT, "persona", "preamble.md"))
+
 # Where the login code lands when there is no mailbox to send it to.
 # On a box with Gmail wired, the code is emailed and this file is never touched;
 # on a mailboxless box — a friend's home server running everything on Ollama —
@@ -77,11 +84,11 @@ OTP_FILE = os.getenv("OTP_FILE", os.path.join(_REPO_ROOT, "OTP.txt"))
 
 # Lifetimes for the two short-lived secrets.
 # Codes are deliberately brief;
-# a session lasts a day —
+# a session lasts five days —
 # long enough that the shell needn't re-ask for a login on every reload,
 # short enough that a forgotten open tab doesn't stay authed indefinitely.
 LOGIN_CODE_TTL_SECONDS = 10 * 60
-SESSION_TTL_SECONDS = 24 * 60 * 60
+SESSION_TTL_SECONDS = 5 * 24 * 60 * 60
 
 # Abuse limits enforced in the strict layer (the database), not by request timing.
 # The smallest gap between two issued codes for one symbiot:
@@ -127,12 +134,13 @@ WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "4"))
 # the worker kills its own work process at this deadline (execution.run_with_deadline),
 # and the deadline sweep fails any row still 'working' past it as the backstop (worker.run_deadline_sweep).
 # It must clear the generative fallback ladder's worst case:
-# a single reply can try Scaleway, then Mistral, then local Ollama in sequence,
+# a single reply can try Google, then Scaleway, then Mistral, then local Ollama in sequence,
 # each bounded by LLM_TIMEOUT_SECONDS,
-# so a full three-tier fall-through of hard timeouts alone is 3 x LLM_TIMEOUT_SECONDS before any tokens are generated.
-# Ten minutes keeps that chain (plus the composition it precedes) comfortably inside the deadline,
+# so a full four-rung fall-through of hard timeouts alone is 4 x LLM_TIMEOUT_SECONDS before any tokens are generated —
+# one rung more than before the Gemini top rung was prepended, and the deadline grew to match it.
+# Thirteen minutes keeps that chain (plus the composition it precedes) comfortably inside the deadline,
 # while still killing an honest hang; tune it per the slowest honest job.
-INTAKE_DEADLINE_SECONDS = float(os.getenv("INTAKE_DEADLINE_SECONDS", "600"))
+INTAKE_DEADLINE_SECONDS = float(os.getenv("INTAKE_DEADLINE_SECONDS", "800"))
 
 # How many times a message may be attempted before the kernel gives up and parks it in 'abandoned'.
 # A failing message is retried — a transient hiccup shouldn't be a death sentence —
@@ -216,19 +224,67 @@ RECALL_POOL = int(os.getenv("RECALL_POOL", "20"))
 RECALL_EF_SEARCH = int(os.getenv("RECALL_EF_SEARCH", "100"))
 
 # The cloud generative providers and the fallback ladder behind every generative call (llm.py).
-# Generation runs on a bigger, faster model than the box can serve:
-# Scaleway (GPU-backed) is primary, reached through the OpenAI-compatible client Scaleway advertises;
-# a call that hits an outage-class failure there falls to Mistral's own web API,
-# and then — only if both clouds are down — to the local Ollama model,
-# the last resort that keeps the loop answering.
-# The keys and base URL come from .env;
-# an empty key simply means that tier can't answer and the ladder falls through it.
+# Generation runs on a bigger, faster model than the box can serve, on a four-rung ladder tried per request.
+# Google (Gemini) is the top rung, prepended above the rest and answering in the steady state;
+# below it, Scaleway (GPU-backed) reached through the OpenAI-compatible client Scaleway advertises,
+# then Mistral's own web API,
+# and — only if every cloud is down — the local Ollama model, the last resort that keeps the loop answering.
+# A rung is tried only when the one above it fails outage-class, never on a merely-worse answer,
+# so the top rung is what answers essentially always and everything beneath it is insurance.
+# Google leads for one reason: it caches the large, repeated prompt prefix these calls front-load by design,
+# billing it once and then near-free, where the cheaper-per-token clouds re-bill the whole prefix every turn —
+# the ~€200 lesson that a lower sticker price is not a lower bill on an input-heavy, recurring-prompt workload.
+# The keys, the project, and the base URL come from .env;
+# an empty key — or an unwired Google project — simply means that rung can't answer and the ladder falls through it.
+#
+# Google (Gemini) is reached on the Agent Platform (formerly Vertex AI) through the google-genai client,
+# authenticated by ADC — gcloud locally, a service account on the box — never an API key,
+# so nothing here is secret: only the project the calls bill to and the region they run in.
+# An unset project means the Gemini rung is not wired at all, and every call falls straight through to Scaleway below.
+GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "global").strip()
 SCALEWAY_API_BASE_URL = os.getenv("SCALEWAY_API_BASE_URL", "https://api.scaleway.ai/v1")
 SCALEWAY_API_KEY = os.getenv("SCALEWAY_API_KEY", "").strip()
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
-# The two fallback models, tried in order after the primary (a Scaleway model) fails outage-class.
-GENERATIVE_FALLBACK_MODEL = os.getenv("GENERATIVE_FALLBACK_MODEL", "mistral-large-latest")
+# The Scaleway fallback rung, per tier — the rung the Google primary falls to on an outage,
+# keyed (in llm._scaleway_fallback) by the Gemini primary it catches.
+# It mirrors the tiers (FLAGSHIP / MID / SMALL below): a flagship Gemini falls to glm-5.2,
+# the two cheaper tiers to gpt-oss-120b.
+# The two lesser tiers share one model here (MID == SMALL) — the cost/quality call kept from before the switch —
+# named apart so splitting small off is a one-line change if it is ever wanted.
+# Each sits at or above the window of the Gemini primary it catches,
+# so a prompt fitted for Google can never overflow the Scaleway model that inherits it when the ladder falls:
+# glm-5.2 (131072) catches gemini-3.1-pro-preview, gpt-oss-120b (65536) catches the Flash pair.
+SCALEWAY_FLAGSHIP_MODEL = os.getenv("SCALEWAY_FLAGSHIP_MODEL", "glm-5.2")
+SCALEWAY_MID_MODEL = os.getenv("SCALEWAY_MID_MODEL", "gpt-oss-120b")
+SCALEWAY_SMALL_MODEL = os.getenv("SCALEWAY_SMALL_MODEL", SCALEWAY_MID_MODEL)
+# The Mistral fallback rung, per tier — the cross-cloud catch beneath Scaleway,
+# keyed (llm._mistral_fallback) by the Scaleway model it catches,
+# so a failed Scaleway rung falls to the Mistral of the same tier.
+# It mirrors the tiers: a flagship Scaleway rung (glm-5.2) falls to a flagship-class Mistral, the cheaper rungs to a cheaper one,
+# rather than every tier collapsing onto one fallback model.
+# The two lesser tiers share one model today, exactly as the Scaleway rung does (MID == SMALL),
+# named apart so mid can later move up to the stronger mistral-small-latest without dragging small with it
+# (that model is held in the catalog, services.models, ready for the split).
+# Each sits at or above the window of the Scaleway rung it catches,
+# since a prompt is fitted to the tier's window and must not overflow the model that inherits it:
+# mistral-large-latest (131072) catches glm-5.2 (131072), ministral-8b-latest (65536) catches gpt-oss-120b (65536).
+MISTRAL_FLAGSHIP_MODEL = os.getenv("MISTRAL_FLAGSHIP_MODEL", "mistral-large-latest")
+MISTRAL_MID_MODEL = os.getenv("MISTRAL_MID_MODEL", "ministral-8b-latest")
+MISTRAL_SMALL_MODEL = os.getenv("MISTRAL_SMALL_MODEL", MISTRAL_MID_MODEL)
+# The local floor beneath every tier — the single Ollama model reached only when every cloud is down.
 GENERATIVE_LOCAL_FALLBACK_MODEL = os.getenv("GENERATIVE_LOCAL_FALLBACK_MODEL", "qwen3.5:4b")
+# How much of the measured memory ceiling the local window is *not* allowed to claim.
+# Ollama's own placement is the ceiling (services.adapters.calibration),
+# and sizing a window to the last byte of it would leave nothing for the buffers that grow with a longer prompt,
+# so the window is fitted under a ceiling held slightly short of what the probe observed.
+LOCAL_WINDOW_MARGIN = float(os.getenv("LOCAL_WINDOW_MARGIN", "0.1"))
+# Skip the probe and adopt this window for the local model, in tokens.
+# The measurement exists because the right figure depends on hardware this project can't see;
+# an operator who already knows their box — or who wants the loading probe not to run at all —
+# names the number here and nothing is measured.
+# Empty (the default) means measure.
+LOCAL_WINDOW_TOKENS = os.getenv("LOCAL_WINDOW_TOKENS", "").strip()
 
 # The three intelligence tiers behind the generative roles, each a model in the catalog (services.models).
 # A generative call is not one kind of work:
@@ -236,27 +292,29 @@ GENERATIVE_LOCAL_FALLBACK_MODEL = os.getenv("GENERATIVE_LOCAL_FALLBACK_MODEL", "
 # or folding the running conversation Gist every later reply leans on,
 # is prose held to a high bar;
 # pulling one structured decision out of a message is competent extraction;
-# and scoring recalled candidates or breaking a grey-zone tie
-# is a bounded, schema-shaped classification the write path fires several of per message.
+# and scoring recalled candidates or breaking a grey-zone tie is a bounded,
+# schema-shaped classification the write path fires several of per message.
 # So the roles map onto three tiers rather than one model, and the right model plays each:
 #   FLAGSHIP — the voice and the load-bearing memory (reply, enrich, conversation_compress);
 #   MID      — competent language and structured extraction (tool_confirm, tool_decision, mint);
 #   SMALL    — the high-volume bounded classifications (rerank and the ontology router's sub-judgments).
+# These are the tier PRIMARIES: the Google/Gemini models the roles resolve to and that answer in the steady state,
+# each with its Scaleway and Mistral fallbacks (above) sitting beneath it, prepended by the ladder (llm._call).
 # Each is a catalog name its provider answers to, looked up in the model map at call time,
 # so a provider, window, and output ceiling ride along,
-# and an operator's /models reassignment wins over these defaults.
-# The default flagship is glm-5.2 on Scaleway —
-# the capable model kept for the reply and the load-bearing memory,
-# where the quality of the words the symbiot reads matters most.
-# The two cheaper rungs both default to gpt-oss-120b on Scaleway,
-# an order of magnitude cheaper per token,
-# at near-o4-mini parity with the strict instruction-following the schema-shaped calls turn on;
-# they are named apart though they resolve to one model today,
-# so the small rung can later drop to a cheaper model
-# without dragging the middle (and mint in particular) down with it.
-FLAGSHIP_MODEL = os.getenv("FLAGSHIP_MODEL", "glm-5.2")
-MID_MODEL = os.getenv("MID_MODEL", "gpt-oss-120b")
-SMALL_MODEL = os.getenv("SMALL_MODEL", "gpt-oss-120b")
+# and an operator's /models reassignment wins over these defaults —
+# pointing a role at a Scaleway model (glm-5.2) is the rollback that drops the Google rung for that role,
+# and at a local Ollama name the rollback to on-box generation.
+# The default flagship is gemini-3.1-pro-preview (still preview: there is no GA Pro this generation yet),
+# the capable model kept for the reply and the load-bearing memory, where the words the symbiot reads matter most.
+# The mid tier is gemini-3.6-flash — competent language for the tool calls and minting;
+# the small tier is gemini-3.5-flash-lite, the cheapest, for the high-volume router.
+# Unlike the Scaleway and Mistral rungs below (which still share one model across the two lesser tiers),
+# the three Gemini primaries are genuinely distinct — each tier its own model —
+# since the switch is Google-first and the Gemini catalog carries a real model at each rung.
+FLAGSHIP_MODEL = os.getenv("FLAGSHIP_MODEL", "gemini-3.1-pro-preview")
+MID_MODEL = os.getenv("MID_MODEL", "gemini-3.6-flash")
+SMALL_MODEL = os.getenv("SMALL_MODEL", "gemini-3.5-flash-lite")
 
 # The SMALL tier's model, behind the router's judgments — re-ranking the recalled candidates,
 # breaking the grey-zone tie, and the rest of the write path's bounded classifications, which default to it.
@@ -272,8 +330,7 @@ RERANK_MODEL = os.getenv("RERANK_MODEL", SMALL_MODEL)
 # and a bad one is wrong forever.
 # So it sits a rung above its SMALL-tier siblings (RERANK_MODEL),
 # even though the two resolve to one model today —
-# keeping mint named apart means the small rung can move to a cheaper model later
-# without dragging minting's definitions down with it.
+# keeping mint named apart means the small rung can move to a cheaper model later without dragging minting's definitions down with it.
 # It fires only when nothing fits,
 # so its volume is low and thins as the vocabulary fills.
 # Looked up in the model map like every generative model.
@@ -293,8 +350,8 @@ REUSE_THRESHOLD = float(os.getenv("REUSE_THRESHOLD", "0.7"))
 MINT_THRESHOLD = float(os.getenv("MINT_THRESHOLD", "0.3"))
 # The bands only make sense with the mint floor strictly below the reuse floor and both inside 0.0–1.0;
 # cross them and the grey zone vanishes and decide() tests MINT before REUSE,
-# so a fact that clearly fits an existing type gets read as a mint
-# and a needless duplicate is coined — silently, forever.
+# so a fact that clearly fits an existing type gets read as a mint and a needless duplicate is coined —
+# silently, forever.
 # Caught at import (before the pool opens or a worker starts),
 # so a fat-fingered .env refuses to boot rather than quietly mis-filing every fact that follows.
 if not 0.0 <= MINT_THRESHOLD < REUSE_THRESHOLD <= 1.0:
@@ -303,8 +360,7 @@ if not 0.0 <= MINT_THRESHOLD < REUSE_THRESHOLD <= 1.0:
         f"got MINT_THRESHOLD={MINT_THRESHOLD}, REUSE_THRESHOLD={REUSE_THRESHOLD}"
     )
 
-# The offline duplicate garbage-collection pass (services/ontology_gc.py)
-# that merges the semantic duplicates forward-only minting breeds —
+# The offline duplicate garbage-collection pass (services/ontology_gc.py) that merges the semantic duplicates forward-only minting breeds —
 # workout_action coined Tuesday, training_session Friday.
 # GC_DISTANCE is the cosine-distance pre-filter:
 # only type pairs nearer than this are even offered to the model as possible twins.
@@ -347,8 +403,8 @@ CONTEXT_SAFETY_MARGIN = float(os.getenv("CONTEXT_SAFETY_MARGIN", "0.2"))
 # the recent back-and-forth a reply sits inside,
 # held as a gradient — near turns verbatim, far turns folded into one running summary.
 # Two budgets size its share of the reply model's optimal window,
-# each a fraction rather than an absolute so it "travels with" the model
-# the way the rest of the prompt's budget does (llm._fit):
+# each a fraction rather than an absolute,
+# so it "travels with" the model the way the rest of the prompt's budget does (llm._fit):
 # if a provider drops and the fallback ladder switches models,
 # the reserved share is recomputed against whichever model answers.
 # In practice all three generative tiers share one optimal window (131072),
@@ -401,6 +457,17 @@ COMPRESS_ENABLED = os.getenv("COMPRESS_ENABLED", "true").strip().lower() not in 
 # a turn that overflows the verbatim tail sits in the "pending" band until the next fold,
 # and the band staying small is a matter of the sweep chasing it closely, not instantly.
 COMPRESS_SWEEP_INTERVAL_SECONDS = float(os.getenv("COMPRESS_SWEEP_INTERVAL_SECONDS", "10"))
+# The idle span after which a quiet conversation's verbatim tail is collapsed wholesale into the Gist,
+# even though it never grew past the verbatim budget — the rolling window's second shrink, beside the size trigger.
+# The size trigger keeps the tail from bloating during a live exchange;
+# this keeps it from lingering at full width forever once the exchange is over.
+# When a symbiot has said nothing for this long, the sweep folds their whole remaining tail down into the running summary,
+# so the next session opens lean and the repeated, uncached tail every reply pays full rate for is at its smallest —
+# continuity while a conversation is live, compactness the moment it goes quiet, and nothing durable lost
+# (the long-term diary already holds what mattered and hands it back by relevance when it is relevant).
+# Set comfortably longer than ENRICH_SETTLE_SECONDS, so the deep enrichment pass — which reads the verbatim burst —
+# always runs before these turns are folded away beneath it.
+COMPRESS_IDLE_SECONDS = float(os.getenv("COMPRESS_IDLE_SECONDS", "1800"))
 
 # Live diary ingestion (worker.run_ingestion_sweep):
 # the background sweep that files each settled message into the diary through the write path,
@@ -467,8 +534,7 @@ DEEP_RETRIEVAL_LIMIT = int(os.getenv("DEEP_RETRIEVAL_LIMIT", "10"))
 DEEP_RETRIEVAL_EF_SEARCH = int(os.getenv("DEEP_RETRIEVAL_EF_SEARCH", "100"))
 # The ontology walk (deep_retrieval.expand_by_concept):
 # how many sibling facts, sharing the recalled facts' concepts, to pull.
-# Bounds the walk so it broadens the reach along the vocabulary tree
-# without flooding the prompt past the recalled facts it extends.
+# Bounds the walk so it broadens the reach along the vocabulary tree without flooding the prompt past the recalled facts it extends.
 DEEP_RETRIEVAL_EXPANSION_LIMIT = int(os.getenv("DEEP_RETRIEVAL_EXPANSION_LIMIT", "10"))
 
 # Tool calling (services/tools.py, services/reminder.py): the seam where the loop acts rather than only speaks.
@@ -487,8 +553,8 @@ TOOLS_ENABLED = os.getenv("TOOLS_ENABLED", "true").strip().lower() not in ("0", 
 TOOL_DECISION_MODEL = os.getenv("TOOL_DECISION_MODEL", MID_MODEL)
 # The generative model that composes the confirmation the human sees —
 # prose in the symbiot's voice, speaking the tool's result.
-# It is the MID tier: real language, but a bounded factual read-back of a known result
-# rather than the open composition the reply is,
+# It is the MID tier: real language,
+# but a bounded factual read-back of a known result rather than the open composition the reply is,
 # so it sits a rung below the flagship. Reached free-text (llm.generate).
 TOOL_CONFIRM_MODEL = os.getenv("TOOL_CONFIRM_MODEL", MID_MODEL)
 # The catalog recall's gate (tools.search_catalog):

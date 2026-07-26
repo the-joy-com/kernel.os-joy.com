@@ -10,6 +10,7 @@ The privileged work — the buffer, the Dead Man's Switch —
 layers on top of these round trips, never beside them.
 """
 
+import os
 import threading
 from contextlib import asynccontextmanager
 
@@ -18,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core import config
 from core import db
+from services.adapters import calibration
 from services.memory import conversation
 from services import identity
 from core import logs
@@ -76,6 +78,23 @@ async def lifespan(app: FastAPI):
     with db.get_pool().connection() as conn:
         model_config.reconcile_and_seed(conn)
         models.reload_from_conn(conn)
+    # A local-only box sizes its own window rather than being told one.
+    # Gated on IS_LOCAL because the figure only binds where the local model is the one answering:
+    # down the cloud ladder the floor has to stay the widest rung (see llm._call), not this box's rung.
+    # Gated again on there being no figure already, so the probe is a one-time cost on a box —
+    # it loads the model to measure it, and a boot that already knows the answer must not pay for it twice.
+    # An operator who names LOCAL_WINDOW_TOKENS has answered for their own hardware, and nothing is measured.
+    if os.getenv("IS_LOCAL") == "1":
+        local_model = config.GENERATIVE_LOCAL_FALLBACK_MODEL
+        with db.get_pool().connection() as conn:
+            if model_config.measured_window(conn, local_model) is None:
+                if config.LOCAL_WINDOW_TOKENS:
+                    model_config.set_measured_window(conn, local_model, int(config.LOCAL_WINDOW_TOKENS))
+                else:
+                    measurement = calibration.measure(local_model)
+                    if measurement is not None:
+                        model_config.set_measured_window(conn, local_model, measurement.tokens)
+            models.reload_from_conn(conn)
     # Bring the tool catalog in line with the code registry now the schema is in place:
     # the code registry is the source of truth for which tools exist,
     # and this reconcile embeds a new or changed descriptor so recall can match a message against it.

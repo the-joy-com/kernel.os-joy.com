@@ -8,11 +8,14 @@ The read path wants a spoken reply — free prose, held to no schema — and tha
 the same boundary with the schema dropped, returning the model's text as-is.
 
 Beneath both sits one round trip (`_call`) and a **fallback ladder** it walks per request.
-Generation runs on a bigger, faster model than the box can serve,
-so the primary is a model on Scaleway (GPU-backed), reached through the OpenAI-compatible client Scaleway advertises.
-A call that fails *outage-class* there — a transport error, a timeout, a 5xx, a 429 —
-falls to Mistral's own web API,
-and then, only if both clouds are down, to the local Ollama model that used to serve every call.
+Generation runs on a bigger, faster model than the box can serve, on a four-rung ladder.
+The top rung is Google (Gemini) on the Agent Platform — reached first for every automatic call, so in the steady state
+it is what answers, and the reason the switch exists: the Agent Platform caches the large repeated prompt prefix
+these calls front-load, billing it once where the rungs below re-bill it in full every turn.
+A call that fails *outage-class* on Google — a transport error, a timeout, a 5xx, a 429, an unresolvable ADC credential —
+falls to a model on Scaleway (GPU-backed), reached through the OpenAI-compatible client Scaleway advertises;
+one that fails outage-class there falls to Mistral's own web API,
+and then, only if every cloud is down, to the local Ollama model that used to serve every call.
 The ladder is deliberately **stateless**: each call tries the primary afresh, with no shared breaker counting failures.
 The reply is composed inside a killable forked child (execution.run_with_deadline),
 so breaker state set there would die with the child and never reach the next call;
@@ -25,10 +28,11 @@ so it surfaces at once rather than falling through to a provider that would fail
 Four call settings are fixed here so no caller has to remember them:
 thinking is off —
 every call is a fast judgment or a reply the symbiot is waiting on, not a problem that wants a visible reasoning trace —
-so on Scaleway reasoning is turned down per model (GLM and Qwen accept `reasoning_effort="none"`, gpt-oss its floor `"low"`, which still returns no trace for these bounded calls; see _reasoning_effort),
+so on Google reasoning is turned down to its floor per model (`thinking_level` MINIMAL for the Flash pair, LOW for the Pro, since a 3.x model cannot turn it off at all; see _thinking_level),
+on Scaleway reasoning is turned down per model (GLM and Qwen accept `reasoning_effort="none"`, gpt-oss its floor `"low"`, which still returns no trace for these bounded calls; see _reasoning_effort),
 the Mistral tier has no trace to suppress, and the Ollama tier keeps `think=False`;
 the output is held to the shape the caller demands —
-`generate_json` hands its Pydantic model through each SDK's structured-output `parse` helper,
+`generate_json` hands its Pydantic model through each SDK's structured-output mechanism (Scaleway's and Mistral's `parse` helpers, Google's `response_schema`, Ollama's `format`),
 which binds the decoder to that model's schema, and validates the reply back through the same model,
 so the answer that crosses this boundary is a typed object with its fields already checked,
 and a reply that breaks the schema raises here rather than slipping through as a half-read decision;
@@ -45,8 +49,8 @@ if it would overrun the window the model reads well,
 the summarisable context the caller marked is condensed to fit —
 only that context, never the instructions around it —
 so a prompt swollen with folded-in facts is trimmed rather than truncated blind.
-The three generative tiers share one optimal window (131072),
-so a prompt fitted for the primary fits every tier.
+Within a tier every rung sits at or above the window of the rung above it that falls to it (services.models),
+so a prompt fitted for the top rung it was resolved against can never overflow the humbler model that inherits it.
 
 This crosses the kernel's old local-only stance on purpose:
 generation now sends the symbiot's own words to an external provider,
@@ -60,6 +64,9 @@ from typing import TypeVar
 import httpx
 import ollama
 import openai
+from google import genai
+from google.auth import exceptions as google_auth_errors
+from google.genai import errors as genai_errors, types as genai_types
 from mistralai.client import errors as mistral_errors, Mistral
 from openai import OpenAI
 from pydantic import BaseModel
@@ -96,6 +103,82 @@ def _reasoning_effort(model_name: str) -> str:
     Keyed by name, so the value is always one the model accepts and a 400 on the effort field is impossible.
     """
     return "low" if model_name.startswith("gpt-oss") else "none"
+
+
+def _thinking_level(model_name: str) -> str:
+    """The thinking level to send a Gemini model — always its lowest, since these bounded calls never want a trace.
+
+    Google made reasoning mandatory on the 3.x models: unlike Scaleway's "none", it cannot be turned off at all,
+    only turned down. So each Gemini model runs at the floor it allows —
+    the Flash models accept MINIMAL, and the Pro's own floor is LOW (it rejects MINIMAL) —
+    the same shape as _reasoning_effort's gpt-oss exception, keyed by name so the value is always one the model accepts.
+    """
+    return "MINIMAL" if "flash" in model_name else "LOW"
+
+
+def _google(
+    model_name: str,
+    prompt: str,
+    schema: type[BaseModel] | None,
+    temperature: float | None,
+    max_output_tokens: int | None,
+) -> str:
+    """One generative call to Google (Gemini) on the Agent Platform through the google-genai client — the top rung.
+
+    Reached first for every automatic call, so in the steady state this is what answers,
+    and the whole reason the switch exists: the Agent Platform caches the large repeated prompt prefix
+    these calls front-load, billing it once and then near-free where the rungs below re-bill it in full every turn.
+    The client is built fresh per call (fork-safety for the reply's killable child) and authenticated by ADC —
+    gcloud locally, a service account on the box — through `vertexai=True` with the project and region from config,
+    never an API key (that path routes to the consumer Developer API, not the enterprise, zero-retention Agent Platform).
+    Thinking cannot be turned off on a 3.x model, only down, so it runs at its floor (_thinking_level).
+    A schema, when given, is handed over as the response_schema with a JSON mime type —
+    the decoder is bound to it and the reply comes back as JSON text, validated our side like the other tiers'.
+    A free-text reply names no schema and comes back as prose.
+
+    An unwired box (no GOOGLE_CLOUD_PROJECT) raises _Outage at once, so the ladder falls straight through to Scaleway —
+    the same "this rung can't answer" the empty-key case is for the rungs below.
+    Outage-class failures — a 5xx, a 429, a transport error, or an ADC credential the box can't resolve —
+    raise _Outage to fall through to Scaleway;
+    a 4xx that is not a 429 is our own bad request and propagates, the same discipline the other tiers keep.
+    """
+    if not config.GOOGLE_CLOUD_PROJECT:
+        raise _Outage("Google generative rung not wired (no GOOGLE_CLOUD_PROJECT); falling through to Scaleway")
+    client = genai.Client(
+        vertexai=True,
+        project=config.GOOGLE_CLOUD_PROJECT,
+        location=config.GOOGLE_CLOUD_LOCATION,
+    )
+    settings = genai_types.GenerateContentConfig(
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        thinking_config=genai_types.ThinkingConfig(thinking_level=_thinking_level(model_name)),
+    )
+    if schema is not None:
+        settings.response_mime_type = "application/json"
+        settings.response_schema = schema
+    try:
+        completion = client.models.generate_content(
+            model=model_name, contents=prompt, config=settings
+        )
+    except genai_errors.ServerError as exc:
+        raise _Outage(f"Google generative call failed outage-class: {exc}") from exc
+    except genai_errors.ClientError as exc:
+        if getattr(exc, "code", None) == 429:
+            raise _Outage(f"Google generative call rate-limited: {exc}") from exc
+        raise
+    except (
+        httpx.TransportError,
+        httpx.TimeoutException,
+        google_auth_errors.GoogleAuthError,
+    ) as exc:
+        raise _Outage(f"Google generative call unreachable: {exc}") from exc
+    body = completion.text
+    if not body:
+        raise RuntimeError(
+            f"generative model {model_name!r} on Google returned an empty response"
+        )
+    return body
 
 
 def _scaleway(
@@ -230,6 +313,18 @@ def _ollama(
     Built fresh per call for fork-safety, as before.
     A schema becomes Ollama's `format` (its decode-time grammar); temperature and the output ceiling ride `options` —
     the ceiling as `num_predict`, which Ollama leaves unbounded (-1) by default, so setting it is what actually caps the reply here.
+    The context window rides `options` too, as `num_ctx`, and it is not optional:
+    Ollama opens 4096 tokens for every model whatever its weights allow,
+    and a prompt past that is discarded from the *front* with no error —
+    so the persona head, which leads every composed prompt, is the first thing lost.
+    A prompt reaching this tier was fitted upstream to the *requested* model's window (see _fit),
+    never re-fitted on the way down,
+    which is why the catalog holds this floor at or above every rung that can fall to it (see services.models):
+    the floor is the widest window in the ladder by design, and this is where that claim is made true rather than assumed.
+    The window opened is the catalog's own figure for the model about to answer,
+    so the number this call packs to and the number it opens are one number and cannot drift apart.
+    A name the catalog doesn't carry opens no window and takes Ollama's default,
+    the same unmapped-model case _fit and _output_cap already pass through unbudgeted.
     This is the last tier, so it raises its real errors rather than _Outage —
     there is nothing further to fall through to.
     """
@@ -240,6 +335,9 @@ def _ollama(
     if schema is not None:
         request["format"] = schema.model_json_schema()
     options = {}
+    spec = models.spec(model_name)
+    if spec is not None:
+        options["num_ctx"] = spec.optimal_context_tokens
     if temperature is not None:
         options["temperature"] = temperature
     if max_output_tokens is not None:
@@ -273,10 +371,53 @@ def _output_cap(override: int | None, model_name: str) -> int | None:
     return cap
 
 
+# The Scaleway model that catches each Gemini primary when it outages — keyed by the Gemini primary that failed.
+# The Gemini primaries are genuinely distinct per tier (pro / flash / flash-lite), so this maps three keys,
+# and the two cheaper tiers land on one Scaleway model (both gpt-oss-120b today) because the Scaleway rung shares it —
+# the distinction lives in the Gemini rung above, not in the Scaleway one beneath.
+# Keyed by the Gemini model *name* because that is all _call holds when the top rung outages.
+_SCALEWAY_FALLBACK = {
+    config.FLAGSHIP_MODEL: config.SCALEWAY_FLAGSHIP_MODEL,
+    config.MID_MODEL: config.SCALEWAY_MID_MODEL,
+    config.SMALL_MODEL: config.SCALEWAY_SMALL_MODEL,
+}
+
+
+def _scaleway_fallback(google_model: str) -> str:
+    """The Scaleway model that catches this Gemini primary when it outages — its tier's second rung.
+
+    A Gemini model in no tier — an operator's custom assignment through /models — falls to the flagship Scaleway:
+    the widest window and the most capable of the rung, the safest catch when we can't place it in a tier.
+    """
+    return _SCALEWAY_FALLBACK.get(google_model, config.SCALEWAY_FLAGSHIP_MODEL)
+
+
+# The Mistral model that catches each Scaleway rung when it outages — keyed by the Scaleway model that failed.
+# One rung further down than _SCALEWAY_FALLBACK: it catches the Scaleway rung (itself the catch for Google),
+# so the tier is carried by the Scaleway model name, all _call holds at that depth of the chain.
+# The two cheaper tiers share one Scaleway model (gpt-oss-120b) and so share one Mistral catch (ministral-8b),
+# exactly the iso shape the Scaleway rung has — the Mistral rung splits per tier only once the Scaleway one does.
+_MISTRAL_FALLBACK = {
+    config.SCALEWAY_FLAGSHIP_MODEL: config.MISTRAL_FLAGSHIP_MODEL,
+    config.SCALEWAY_MID_MODEL: config.MISTRAL_MID_MODEL,
+    config.SCALEWAY_SMALL_MODEL: config.MISTRAL_SMALL_MODEL,
+}
+
+
+def _mistral_fallback(scaleway_model: str) -> str:
+    """The Mistral model that catches this Scaleway rung when it outages — its tier's cross-cloud fallback.
+
+    A Scaleway model in no tier — an operator's custom assignment through /models — falls to the flagship Mistral:
+    the widest window and the most capable of the rung, the safest catch when we can't place it in a tier.
+    """
+    return _MISTRAL_FALLBACK.get(scaleway_model, config.MISTRAL_FLAGSHIP_MODEL)
+
+
 def _call(
     *,
     model: str,
     prompt: str,
+    context: str | None = None,
     schema: type[BaseModel] | None = None,
     temperature: float | None = None,
     max_output_tokens: int | None = None,
@@ -285,9 +426,11 @@ def _call(
 
     The one place the round trip lives, shared by both public calls and the summariser beneath them.
     The requested model's provider (services.models) decides the entry point:
-    a Scaleway model walks the full ladder — Scaleway, then Mistral, then local Ollama,
-    each next tier tried only when the one above raised _Outage;
-    a model named for another provider is called there directly, the one-line rollback path.
+    a Google model walks the full ladder — Google, then its Scaleway rung, then that rung's Mistral catch, then local Ollama,
+    each next rung tried only when the one above raised _Outage;
+    a Scaleway model is the rollback path — Scaleway, then Mistral, then local, with the Google rung dropped —
+    which is how an operator takes one role off Google through /models;
+    a Mistral or local name is a bare call with nothing beneath it, the one-line rollback to a single provider.
     A model not in the map is treated as a local Ollama name (its historical default).
     The reply is held to an output ceiling (services.models), resolved per tier by _output_cap:
     the ceiling of the model about to answer, so a fallback is held to a cap it actually supports rather than
@@ -301,6 +444,15 @@ def _call(
     IS_LOCAL=1 short-circuits the ladder entirely: every call is served by Ollama on the box.
     Since the resolved role name is a cloud id Ollama can't serve, the call is substituted to the
     local SLM floor (config.GENERATIVE_LOCAL_FALLBACK_MODEL) unless the role already points at an Ollama model.
+    That substitution is why `context` reaches this far.
+    A prompt is fitted once, up in generate/generate_json, to the window of the model that was *requested* —
+    which on a local-only box is a cloud model that will never see it.
+    Down the fallback ladder that mismatch is harmless by construction, since every rung is at least as wide
+    as the one above and the local floor is the widest of all.
+    Here it is not: a measured box sizes its local window to the hardware (services.adapters.calibration),
+    so the window can be far narrower than the cloud model the prompt was fitted for.
+    So the local branch re-fits against the model that will actually answer, and only the local branch does —
+    the ladder's own rungs keep the single fitting the widest-floor invariant already makes safe.
     """
     spec = models.spec(model)
     # Quick override to keep every call on the local box (IS_LOCAL=1): route to Ollama regardless of
@@ -313,28 +465,70 @@ def _call(
             if spec is not None and spec.provider == "ollama"
             else config.GENERATIVE_LOCAL_FALLBACK_MODEL
         )
+        # Re-fit for the model that answers, not the one that was asked for.
+        # Skipped when the substitution was a no-op, since the prompt is already fitted to exactly this model
+        # and re-fitting would spend a summarising call to reach the same place.
+        if local != model:
+            prompt = _fit(prompt, context, local)
         return _ollama(
             local, prompt, schema, temperature, _output_cap(max_output_tokens, local)
         )
     provider = spec.provider if spec is not None else "ollama"
-    if provider == "scaleway":
+    if provider == "google":
+        # The full ladder: Google (the primary the roles resolve to), then its Scaleway rung,
+        # then that rung's Mistral catch, then the local floor — each tried only when the one above raised _Outage.
+        scaleway = _scaleway_fallback(model)
         try:
-            return _scaleway(
-                model,
-                prompt,
-                schema,
-                temperature,
-                _output_cap(max_output_tokens, model),
+            return _google(
+                model, prompt, schema, temperature, _output_cap(max_output_tokens, model)
             )
         except _Outage:
             pass
         try:
-            return _mistral(
-                config.GENERATIVE_FALLBACK_MODEL,
+            return _scaleway(
+                scaleway,
                 prompt,
                 schema,
                 temperature,
-                _output_cap(max_output_tokens, config.GENERATIVE_FALLBACK_MODEL),
+                _output_cap(max_output_tokens, scaleway),
+            )
+        except _Outage:
+            pass
+        mistral = _mistral_fallback(scaleway)
+        try:
+            return _mistral(
+                mistral,
+                prompt,
+                schema,
+                temperature,
+                _output_cap(max_output_tokens, mistral),
+            )
+        except _Outage:
+            pass
+        return _ollama(
+            config.GENERATIVE_LOCAL_FALLBACK_MODEL,
+            prompt,
+            schema,
+            temperature,
+            _output_cap(max_output_tokens, config.GENERATIVE_LOCAL_FALLBACK_MODEL),
+        )
+    if provider == "scaleway":
+        # The rollback path: a role pointed by hand at a Scaleway model, dropping the Google rung for it.
+        # Still a real ladder from there down — Scaleway, then its Mistral catch, then the local floor.
+        try:
+            return _scaleway(
+                model, prompt, schema, temperature, _output_cap(max_output_tokens, model)
+            )
+        except _Outage:
+            pass
+        fallback = _mistral_fallback(model)
+        try:
+            return _mistral(
+                fallback,
+                prompt,
+                schema,
+                temperature,
+                _output_cap(max_output_tokens, fallback),
             )
         except _Outage:
             pass
@@ -346,6 +540,7 @@ def _call(
             _output_cap(max_output_tokens, config.GENERATIVE_LOCAL_FALLBACK_MODEL),
         )
     if provider == "mistral":
+        # A role pointed by hand straight at a Mistral model — a bare call with nothing beneath it.
         return _mistral(
             model, prompt, schema, temperature, _output_cap(max_output_tokens, model)
         )
@@ -439,7 +634,10 @@ def generate(
     """
     model_name = model or models.role_name("rerank")
     return _call(
-        model=model_name, prompt=_fit(prompt, context, model_name), temperature=0
+        model=model_name,
+        prompt=_fit(prompt, context, model_name),
+        context=context,
+        temperature=0,
     )
 
 
@@ -473,6 +671,7 @@ def generate_json(
     reply = _call(
         model=model_name,
         prompt=_fit(prompt, context, model_name),
+        context=context,
         schema=schema,
         temperature=0,
     )

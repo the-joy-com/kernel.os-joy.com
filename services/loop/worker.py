@@ -124,6 +124,46 @@ def _answer(
     )
 
 
+def _collapse_idle_one() -> bool:
+    """Collapse one gone-quiet symbiot's whole verbatim tail into its Gist. True if there was one to collapse.
+
+    The idle half of the rolling window's shrink, beside _compress_one's size half — same machinery, different trigger.
+    Where _compress_one fires when a live exchange's tail grows past the budget and trims it *back* to the budget,
+    this fires when a conversation has gone silent for COMPRESS_IDLE_SECONDS (next_symbiot_to_collapse)
+    and folds its *entire* remaining tail down, by reading pending_for_fold at a zero budget so nothing recent is kept —
+    the next session then opens lean rather than carrying a full-width verbatim tail no reply has needed in a while.
+    That tail is never cached (only the fixed head is), so it is billed at full rate on every reply,
+    which makes collapsing it an unconditional saving on every provider, cached or not.
+    Nothing is lost: the collapsed turns live on in the Gist, and the diary already holds what mattered.
+
+    The same claim-then-fold-in-one-transaction shape as _compress_one, under the same advisory lock,
+    so the two never both fold the one symbiot and append a duplicate Gist,
+    and the cutoff advancing on commit makes the collapse exactly-once the same way.
+    Set COMPRESS_IDLE_SECONDS comfortably above ENRICH_SETTLE_SECONDS so the deep enrichment pass,
+    which reads the verbatim burst, always runs before these turns are folded away beneath it.
+    """
+    pool = db.get_pool()
+    with pool.connection() as conn:
+        with conn.transaction():
+            symbiot_id = conversation.next_symbiot_to_collapse(conn, config.COMPRESS_IDLE_SECONDS)
+            if symbiot_id is None:
+                return False
+            if not conversation.claim_fold(conn, symbiot_id):
+                # Another worker owns this symbiot's fold; skip it cleanly rather than race a duplicate Gist.
+                return False
+            gist = conversation.current_gist(conn, symbiot_id)
+            cutoff = gist[1] if gist is not None else 0
+            # A zero budget makes pending_for_fold keep no turn back: the whole tail past the cutoff is the overflow.
+            turns, new_cutoff = conversation.pending_for_fold(conn, symbiot_id, 0, cutoff)
+            if not turns:
+                # The tail emptied between the eligibility read and here; nothing to collapse this pass.
+                return False
+            zone_name = zone.of(conn, symbiot_id)
+            merged = conversation.fold(gist[0] if gist is not None else None, turns, zone_name)
+            conversation.record_gist(conn, symbiot_id, merged, new_cutoff)
+    return True
+
+
 def _compose_confirmation(task: tuple[str, tools.ToolResult, datetime, str]) -> str:
     """Compose the confirmation the human sees after a tool ran — the speak step, in the killable child.
 
@@ -391,9 +431,12 @@ def _ingest_one() -> bool:
         pending = intake.next_uningested(conn)
     if pending is None:
         return False
-    message_id, message = pending
+    message_id, message, symbiot_id = pending
     with pool.connection() as conn:
-        ontology.ingest(conn, message, intake_id=message_id)
+        # The symbiot's zone is read alongside the write so the fact's time resolves in the human's day:
+        # a "this evening" in the raw text is their evening, wherever they sit, not the server's UTC.
+        zone_name = zone.of(conn, symbiot_id)
+        ontology.ingest(conn, message, intake_id=message_id, zone_name=zone_name)
     return True
 
 
@@ -504,6 +547,10 @@ def run_compression_sweep(stop: threading.Event) -> None:
     and when the verbatim tail grows past its size budget its oldest turns are summarised into the Gist here,
     off to the side, on this thread —
     so the symbiot never waits on a fold, and the tail is trimmed back rather than the reader ever going blind.
+    Each pass folds on either of the tail's two triggers:
+    first the size trigger (_compress_one), an over-budget tail trimmed back to the budget;
+    then, when there is no size fold to make, the idle trigger (_collapse_idle_one),
+    a gone-quiet conversation's whole remaining tail collapsed so the next session opens lean.
     It drains the way the others do: a fold made means looking again at once, an idle pass waits a beat,
     so a tail grown fat clears back to its budget quickly without an idle kernel spinning on the database.
     One bad fold can't take the loop down —
@@ -517,7 +564,9 @@ def run_compression_sweep(stop: threading.Event) -> None:
     log.info("compression sweep started")
     while not stop.is_set():
         try:
-            worked = _compress_one()
+            # Size fold first; only when none is due does the idle collapse get a look,
+            # so a live, over-budget exchange is always served before a gone-quiet one.
+            worked = _compress_one() or _collapse_idle_one()
         except Exception:
             # Keep the loop alive across a bad fold so one symbiot's overflow can't kill it.
             log.exception("compression sweep iteration failed")

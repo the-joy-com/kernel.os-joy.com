@@ -25,3 +25,4 @@ persona/private.md
 # A short-lived secret the operator reads off the box — never committed.
 OTP.txt
 
+tmp.md

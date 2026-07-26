@@ -3,12 +3,15 @@
 The librarian (retrieval.py) gathers the long-term facts that bear on what was said,
 and the conversation module (conversation.py) gathers the short-term thread the message sits inside;
 this module speaks.
-It folds four things into one prompt — the machine symbiot's persona (its voice),
+It folds four things into one prompt — the machine symbiot's head (the truth-rules preamble, then the persona that is its voice),
 the diary facts (long-term memory), the recent conversation (short-term memory, the Gist then the verbatim tail),
 and the message itself — and hands them to the free-text model path (llm.generate) for a reply in that voice.
+The head leads the prompt for a second reason beside speaking first:
+it is the byte-identical, cacheable prefix a caching provider bills once,
+so it must sit ahead of everything that changes call to call (see persona.head).
 
 Two things in that prompt are **sacred** and are never shrunk:
-the **persona** (who is speaking) and the **live input** (the human symbiot's words this turn, or the agent's own line).
+the **head** (the truth rules, and the persona that is who is speaking) and the **live input** (the human symbiot's words this turn, or the agent's own line).
 The little instruction sentences that tell the model how to behave are sacred too —
 tiny, and shrinking them would be self-defeating.
 Everything the reply *remembers* — the diary facts and the whole conversation —
@@ -39,19 +42,22 @@ _NO_FACTS = "(nothing on record that bears on this)"
 # The members below are ordered alphabetically, as far as the code allows:
 # the private helpers first in alphabetical order, then compose —
 # none of the helpers call each other, so define-before-use imposes no further constraint.
-def _compose_prompt(message: str, memory_block: str, voice: str, time_line: str | None) -> str:
-    # voice first (the persona sets who is speaking), then the framing instructions,
+def _compose_prompt(message: str, memory_block: str, head: str, time_line: str | None) -> str:
+    # head first (the truth-rules preamble, then the persona that sets who is speaking), then the framing instructions,
     # then the symbiot's local time (when known),
     # then the one compressible block of everything remembered (diary + Gist + verbatim tail),
     # then the live message, then the closing instruction.
-    # Persona, instructions, time, and message bracket the memory block and are never condensed;
+    # The head is also the fixed, cacheable prefix: it is byte-identical call to call and leads the prompt,
+    # so it must stay ahead of the first thing that changes (the time line) for a caching provider to bill it once —
+    # which is exactly the order here.
+    # Head, instructions, time, and message bracket the memory block and are never condensed;
     # the memory block is the only region the budget guard may touch.
     # The time line is a small sacred fact like the persona — tiny, and shrinking it would be self-defeating —
     # so it sits outside the compressible region,
     # right after the framing, where the model reads it before the memory.
     now = f"{time_line}\n\n" if time_line else ""
     return (
-        f"{voice}\n\n"
+        f"{head}\n\n"
         "You are answering the human symbiot you live in symbiosis with. "
         "Below is what you know that may bear on this and the conversation you are already in — "
         "first your diary in time order, oldest entry first, then the earlier conversation summarised, then the most recent turns word-for-word. "
@@ -137,7 +143,7 @@ def compose(
     Both absent (an anon stand-in never reaches here, a by-hand call that names no clock)
     simply omits the time line rather than asserting a wrong one.
     """
-    voice = persona.load()
+    head = persona.head()
     # Render fact dates in the symbiot's local zone so they share the calendar the time line states;
     # a by-hand or anon call that names no zone falls back to UTC, the old server-clock behaviour made explicit.
     facts_block = _render(context, zone_name or zone.DEFAULT_ZONE)
@@ -145,7 +151,7 @@ def compose(
     tail_block = _render_tail(conv.tail, zone_name or zone.DEFAULT_ZONE)
     memory_block = _render_memory(facts_block, gist_block, tail_block)
     time_line = zone.render_now(now_local, zone_name) if now_local is not None and zone_name else None
-    prompt = _compose_prompt(message, memory_block, voice, time_line)
+    prompt = _compose_prompt(message, memory_block, head, time_line)
     # The whole remembered block is the compressible region — diary and conversation alike —
     # so an overrun condenses what is remembered, never the persona, the instructions, or the live message bracketing it.
     # The reply's model is resolved from the store by role (models.role_name), not read from a config constant,

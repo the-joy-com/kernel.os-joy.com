@@ -29,19 +29,20 @@ this module owns the durable write and the legal moves it makes, not the decidin
 One row per request — the message, never the lines inside it.
 The kernel stores what it can honestly stand behind, nothing it would have to guess.
 
-This table is the symbiot's diary of record, and the raw words in it are kept under two
-guarantees the database itself enforces (migration 0008), not ones a caller has to remember:
+This table is the symbiot's diary of record, and the raw words in it are kept under two guarantees the database itself enforces (migration 0008),
+not ones a caller has to remember:
 the message text is immutable — no update may rewrite it — and a row is never deleted.
 So what the symbiot said is kept verbatim and kept forever; only the work-state around it
 (status, answer, attempts, the timestamps) moves as the message walks toward its outcome.
-And nothing derivable from the words is stored beside them — tags, slices, classifications
-are recomputed on read, never kept as a second source of truth (pinned by a test, since it's
-a rule about what must never be added rather than something the schema can state on its own).
+And nothing derivable from the words is stored beside them —
+tags, slices, classifications are recomputed on read,
+never kept as a second source of truth
+(pinned by a test, since it's a rule about what must never be added rather than something the schema can state on its own).
 
 Every row here is the symbiot's, walking the path above.
 A message the kernel raises *for* a symbiot — a nudge, a line relayed from the World —
-is a different thing with a different shape (no question, no walk), so it lives in its own
-table and module (missive.py), not folded into this one.
+is a different thing with a different shape (no question, no walk),
+so it lives in its own table and module (missive.py), not folded into this one.
 """
 
 # The reason recorded when restart recovery abandons a message rather than re-queuing it:
@@ -126,12 +127,13 @@ def claim_next(conn) -> tuple[int, str, int | None] | None:
     Returns (id, message, symbiot_id) for the message claimed, or None when none is waiting.
     symbiot_id rides along because answering is the worker's job and the reply turns on who sent the line —
     it was stamped at intake (the one moment identity was in hand), and the claim hands it to the worker.
-    The oldest received row is selected and flipped in a single statement, under
-    FOR UPDATE SKIP LOCKED, so two workers can never claim the same message —
+    The oldest received row is selected and flipped in a single statement,
+    under FOR UPDATE SKIP LOCKED, so two workers can never claim the same message —
     a second worker skips the locked row and takes the next one instead.
     updated_at moves with the claim, so the clock starts the moment work begins.
-    attempts is bumped here, on the claim, so it counts every try — a retry of a failed
-    message is a fresh claim, and the count is the budget the retry logic spends.
+    attempts is bumped here, on the claim, so it counts every try —
+    a retry of a failed message is a fresh claim,
+    and the count is the budget the retry logic spends.
     """
     row = conn.execute(
         "UPDATE intake SET status = 'working', attempts = attempts + 1, updated_at = now() "
@@ -207,7 +209,8 @@ def requeue_failed(conn, max_attempts: int) -> int:
     so a failed row with fewer than max_attempts tries behind it goes back to received for a worker to claim again.
     The claim will bump attempts, so the budget spends down with each try.
     failed_reason is cleared on the way back,
-    so a re-queued message is a clean received row again (attempts alone records that it has failed before)
+    so a re-queued message is a clean received row again
+    (attempts alone records that it has failed before),
     and no working or answered row ever carries a stale reason.
     Guarded on status = 'failed', so it can't disturb a message that isn't there.
     """
@@ -310,7 +313,7 @@ def recover_orphaned(conn, max_attempts: int) -> tuple[int, list[int]]:
     return requeued, [row[0] for row in cursor.fetchall()]
 
 
-def next_uningested(conn) -> tuple[int, str] | None:
+def next_uningested(conn) -> tuple[int, str, int] | None:
     """The oldest of the symbiot's messages that has settled but hasn't been filed into the diary yet.
 
     The ingestion sweep's eligibility read (worker.run_ingestion_sweep):
@@ -318,17 +321,20 @@ def next_uningested(conn) -> tuple[int, str] | None:
     that has reached a terminal outcome (answered or abandoned),
     so its reply is done and the message never lands in its own reply's retrieval context,
     and that has no diary fact yet bearing its id — the mirror of the UNIQUE intake_id that makes filing exactly-once.
-    Returns (id, message), or None when none is waiting.
+    Returns (id, message, symbiot_id), or None when none is waiting —
+    the symbiot_id (never null here, the WHERE already excludes anonymous rows) carries through,
+    so the sweep can read the symbiot's zone and resolve the fact's time in the human's day,
+    not the server's UTC.
     A message just filed is excluded next pass (a fact now bears its id);
     one whose filing crashed before it committed is still eligible and simply picked up again —
     so the sweep drops nothing and duplicates nothing.
     A pure read: it takes no lock and moves nothing, so it never contends with a worker.
     """
     row = conn.execute(
-        "SELECT id, message FROM intake "
+        "SELECT id, message, symbiot_id FROM intake "
         "WHERE symbiot_id IS NOT NULL "
         "AND status IN ('answered', 'abandoned') "
         "AND NOT EXISTS (SELECT 1 FROM diary_facts WHERE diary_facts.intake_id = intake.id) "
         "ORDER BY id LIMIT 1"
     ).fetchone()
-    return (row[0], row[1]) if row else None
+    return (row[0], row[1], row[2]) if row else None

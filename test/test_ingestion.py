@@ -27,7 +27,7 @@ def _insert(message="a message", *, symbiot_id=SEEDED_SYMBIOT_ID, status="answer
 def _stub_ingest(monkeypatch, calls):
     # Stand in for the write path: record the call and file a minimal fact carrying the intake_id,
     # so eligibility (which mirrors the fact's intake_id) and the UNIQUE constraint both behave as in production.
-    def fake(conn, raw_text, *, intake_id=None):
+    def fake(conn, raw_text, *, intake_id=None, zone_name="UTC"):
         calls.append((raw_text, intake_id))
         conn.execute(
             "INSERT INTO diary_facts (raw_text, payload, intake_id) VALUES (%s, %s::jsonb, %s)",

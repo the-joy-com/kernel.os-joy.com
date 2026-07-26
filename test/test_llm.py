@@ -92,10 +92,51 @@ class _FakeMistral:
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
 
 
+class _FakeGenai:
+    """Callable stand-in for llm.genai (the google-genai module): its Client(...).models.generate_content(...)
+    records the call and answers from canned data. `generate` may be a value or a callable(captured); a raising
+    callable is a landmine for a path that must never run. The recorded call holds the prompt at
+    captured["contents"] and the GenerateContentConfig at captured["config"].
+    """
+
+    def __init__(self, *, generate=None):
+        self._generate = generate
+        self.captured = {}
+
+    def Client(self, *, vertexai=None, project=None, location=None):
+        self.captured["vertexai"] = vertexai
+        self.captured["project"] = project
+        self.captured["location"] = location
+        return SimpleNamespace(models=SimpleNamespace(generate_content=self._generate_content))
+
+    def _generate_content(self, *, model, contents, config):
+        self.captured["model"] = model
+        self.captured["contents"] = contents
+        self.captured["config"] = config
+        text = self._generate(self.captured) if callable(self._generate) else self._generate
+        return SimpleNamespace(text=text)
+
+
+@pytest.fixture(autouse=True)
+def _google_unwired(monkeypatch):
+    # Every test here fakes a specific rung. Unless a test wires Google on purpose, keep the top rung unwired
+    # (no project), so the ladder falls straight through to the Scaleway boundary each test already fakes —
+    # independent of whatever GOOGLE_CLOUD_PROJECT a developer's own .env happens to carry.
+    monkeypatch.setattr(llm.config, "GOOGLE_CLOUD_PROJECT", "")
+
+
 def _never(msg):
     # A generate handler that fails the test if the boundary it guards is ever reached.
     def _raise(kwargs):  # pragma: no cover - must never be reached
         raise AssertionError(msg)
+
+    return _raise
+
+
+def _google_error(exc):
+    # A Google handler that raises `exc` when the boundary is reached — an outage, a rate limit, or our own 4xx.
+    def _raise(captured):
+        raise exc
 
     return _raise
 
@@ -131,14 +172,16 @@ def test_generate_returns_free_text_with_no_schema_grammar(monkeypatch):
     # A spoken reply is prose, not JSON: no `response_format` is sent, thinking is off, streaming is off,
     # temperature is pinned to 0 (as for every call through this boundary), the reply is held to the model's
     # output ceiling, and the model's text comes back as-is.
+    # Pinned to a Scaleway model so this exercises that rung's free-text path directly — the default path now
+    # leads with Google (covered by the Google tests below), and a Scaleway model is the rollback that enters here.
     fake = _FakeChat(generate="here is a warm reply")
     monkeypatch.setattr(llm, "OpenAI", fake)
 
-    out = llm.generate("say something kind")
+    out = llm.generate("say something kind", model="glm-5.2")
 
     assert out == "here is a warm reply"
     assert "response_format" not in fake.captured["json"]  # free prose, unconstrained by a schema
-    assert fake.captured["json"]["reasoning_effort"] == llm._reasoning_effort(llm.models.role_name("rerank"))  # thinking off, the per-model value for whichever model the default resolves to
+    assert fake.captured["json"]["reasoning_effort"] == llm._reasoning_effort("glm-5.2")  # thinking off, the per-model value
     assert fake.captured["json"]["stream"] is False
     assert fake.captured["json"]["temperature"] == 0  # sampling pinned, not left to the provider's default
     assert fake.captured["json"]["max_tokens"] == llm.models.BUILTIN_MODELS["glm-5.2"].max_output_tokens  # the reply's runaway guard
@@ -252,8 +295,8 @@ def test_summarise_target_is_clamped_to_the_tier_ceiling(monkeypatch):
 
 
 def test_ladder_falls_over_to_mistral_on_a_scaleway_outage(monkeypatch):
-    # Scaleway unreachable: the same request is retried against Mistral, named the fallback model,
-    # and Mistral answering ends the ladder before the local tier is ever touched.
+    # Google unwired (autouse) and Scaleway unreachable: the request falls on down to Mistral, named the
+    # fallback for the Scaleway rung it just lost, and Mistral answering ends the ladder before the local tier.
     monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate=_raises(_scaleway_outage())))
     mistral = _FakeMistral(complete="mistral answered")
     monkeypatch.setattr(llm, "Mistral", mistral)
@@ -263,10 +306,52 @@ def test_ladder_falls_over_to_mistral_on_a_scaleway_outage(monkeypatch):
     out = llm.generate("hello")
 
     assert out == "mistral answered"
-    assert mistral.captured["json"]["model"] == llm.config.GENERATIVE_FALLBACK_MODEL
-    # The output ceiling is resolved per tier, from the model about to answer — so the Mistral tier is held
-    # to Mistral's own ceiling, not the primary's, a cap it is guaranteed to support.
-    assert mistral.captured["json"]["max_tokens"] == llm.models.BUILTIN_MODELS[llm.config.GENERATIVE_FALLBACK_MODEL].max_output_tokens
+    # The Mistral catch is the one for this tier, resolved by chaining down the rungs the request actually fell
+    # through: the default generate() model is the rerank (SMALL) Gemini, whose Scaleway rung's Mistral this is.
+    fallback = llm._mistral_fallback(llm._scaleway_fallback(llm.models.role_name("rerank")))
+    assert mistral.captured["json"]["model"] == fallback
+    # The output ceiling is resolved per rung, from the model about to answer — so the Mistral tier is held
+    # to Mistral's own ceiling, not an upper rung's, a cap it is guaranteed to support.
+    assert mistral.captured["json"]["max_tokens"] == llm.models.BUILTIN_MODELS[fallback].max_output_tokens
+
+
+def test_mistral_fallback_matches_the_tier(monkeypatch):
+    # Falling from a Gemini primary all the way to Mistral lands on the Mistral of the same tier:
+    # the flagship Gemini's chain ends at the flagship-class Mistral,
+    # a cheaper Gemini's at the cheaper (mid/small-shared) one,
+    # not every tier collapsing onto a single fallback model.
+    mistral = _FakeMistral(complete="mistral answered")
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate=_raises(_scaleway_outage())))
+    monkeypatch.setattr(llm, "Mistral", mistral)
+    monkeypatch.setattr(llm.ollama, "Client",
+                        _FakeOllama(generate=_never("Mistral answered; the local tier must not run")))
+
+    llm.generate("hello", model=llm.config.FLAGSHIP_MODEL)
+    assert mistral.captured["json"]["model"] == llm.config.MISTRAL_FLAGSHIP_MODEL
+
+    llm.generate("hello", model=llm.config.SMALL_MODEL)
+    assert mistral.captured["json"]["model"] == llm.config.MISTRAL_SMALL_MODEL
+
+
+def test_scaleway_fallback_resolves_by_tier():
+    # The resolver for the Scaleway rung beneath each Gemini primary:
+    # each Gemini tier maps to its own Scaleway catch, the two cheaper tiers sharing one (gpt-oss-120b),
+    # and a Gemini model in no tier — a custom assignment — takes the flagship Scaleway, the safest catch.
+    assert llm._scaleway_fallback(llm.config.FLAGSHIP_MODEL) == llm.config.SCALEWAY_FLAGSHIP_MODEL
+    assert llm._scaleway_fallback(llm.config.MID_MODEL) == llm.config.SCALEWAY_MID_MODEL
+    assert llm._scaleway_fallback(llm.config.SMALL_MODEL) == llm.config.SCALEWAY_SMALL_MODEL
+    assert llm._scaleway_fallback("a-model-in-no-tier") == llm.config.SCALEWAY_FLAGSHIP_MODEL
+
+
+def test_mistral_fallback_resolves_by_tier():
+    # The resolver for the Mistral rung beneath each Scaleway rung:
+    # each Scaleway model maps to its own Mistral catch,
+    # the two cheaper tiers share one today (SCALEWAY_MID == SCALEWAY_SMALL),
+    # and a Scaleway model in no tier — a custom assignment — takes the flagship Mistral, the safest catch.
+    assert llm._mistral_fallback(llm.config.SCALEWAY_FLAGSHIP_MODEL) == llm.config.MISTRAL_FLAGSHIP_MODEL
+    assert llm._mistral_fallback(llm.config.SCALEWAY_MID_MODEL) == llm.config.MISTRAL_MID_MODEL
+    assert llm._mistral_fallback(llm.config.SCALEWAY_SMALL_MODEL) == llm.config.MISTRAL_SMALL_MODEL
+    assert llm._mistral_fallback("a-model-in-no-tier") == llm.config.MISTRAL_FLAGSHIP_MODEL
 
 
 def test_ladder_falls_to_local_ollama_when_both_clouds_are_down(monkeypatch):
@@ -284,6 +369,10 @@ def test_ladder_falls_to_local_ollama_when_both_clouds_are_down(monkeypatch):
     # The local tier caps output through Ollama's `num_predict` (unbounded by default), resolved from the
     # local model's own ceiling — like the cloud tiers above it, each held to its own.
     assert local.captured["json"]["options"]["num_predict"] == llm.models.BUILTIN_MODELS[llm.config.GENERATIVE_LOCAL_FALLBACK_MODEL].max_output_tokens
+    # And it opens the window the catalog claims for that model, rather than taking Ollama's 4096 default:
+    # the prompt arriving here was fitted for the *requested* model's window and never re-fitted on the way down,
+    # so a floor that quietly opened less than the catalog promises would discard the head of every prompt it answers.
+    assert local.captured["json"]["options"]["num_ctx"] == llm.models.BUILTIN_MODELS[llm.config.GENERATIVE_LOCAL_FALLBACK_MODEL].optimal_context_tokens
 
 
 def test_ladder_surfaces_a_scaleway_4xx_without_falling_over(monkeypatch):
@@ -296,4 +385,74 @@ def test_ladder_surfaces_a_scaleway_4xx_without_falling_over(monkeypatch):
                         _FakeOllama(generate=_never("a 4xx must surface, not fall through to the local tier")))
 
     with pytest.raises(llm.openai.BadRequestError):
+        llm.generate("hello")
+
+
+# --- the Google top rung, prepended above the Scaleway chain --------------------------------
+
+
+def test_google_answers_as_the_top_rung_when_wired(monkeypatch):
+    # Wired (a project is set), Google answers first: the reply comes from Gemini and no rung below it is touched.
+    monkeypatch.setattr(llm.config, "GOOGLE_CLOUD_PROJECT", "the-joy-xyz")
+    google = _FakeGenai(generate="gemini answered")
+    monkeypatch.setattr(llm, "genai", google)
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate=_never("Google answered; Scaleway must not run")))
+    monkeypatch.setattr(llm, "Mistral", _FakeMistral(complete=_never("Google answered; Mistral must not run")))
+    monkeypatch.setattr(llm.ollama, "Client",
+                        _FakeOllama(generate=_never("Google answered; the local tier must not run")))
+
+    out = llm.generate("say something")
+
+    assert out == "gemini answered"
+    assert google.captured["vertexai"] is True  # the Agent Platform, not the consumer Developer API
+    assert google.captured["project"] == "the-joy-xyz"
+    # The default generate() model is the rerank (SMALL) role, which resolves straight to that tier's Gemini.
+    assert google.captured["model"] == llm.models.role_name("rerank")
+    cfg = google.captured["config"]
+    assert cfg.temperature == 0  # sampling pinned, as through the whole boundary
+    assert cfg.thinking_config.thinking_level.value == "MINIMAL"  # thinking at the Flash floor, the nearest to off a 3.x allows
+    assert cfg.response_mime_type is None  # free prose, no JSON schema imposed
+    assert cfg.max_output_tokens == llm.models.spec(google.captured["model"]).max_output_tokens  # the runaway guard
+
+
+def test_ladder_falls_from_google_to_scaleway_on_an_outage(monkeypatch):
+    # A Google outage (a 5xx) falls to the Scaleway rung beneath it, which answers and ends the ladder.
+    monkeypatch.setattr(llm.config, "GOOGLE_CLOUD_PROJECT", "the-joy-xyz")
+    monkeypatch.setattr(llm, "genai", _FakeGenai(
+        generate=_google_error(llm.genai_errors.ServerError(503, {"error": {"message": "down"}}, None))))
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate="scaleway answered"))
+    monkeypatch.setattr(llm.ollama, "Client",
+                        _FakeOllama(generate=_never("Scaleway answered; the local tier must not run")))
+
+    assert llm.generate("hello") == "scaleway answered"
+
+
+def test_google_rate_limit_falls_over_to_scaleway(monkeypatch):
+    # A 429 is a ClientError but an outage-class one, so it falls through to Scaleway rather than surfacing.
+    monkeypatch.setattr(llm.config, "GOOGLE_CLOUD_PROJECT", "the-joy-xyz")
+    monkeypatch.setattr(llm, "genai", _FakeGenai(
+        generate=_google_error(llm.genai_errors.ClientError(429, {"error": {"message": "slow down"}}, None))))
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate="scaleway answered"))
+
+    assert llm.generate("hello") == "scaleway answered"
+
+
+def test_google_unwired_falls_straight_through_to_scaleway(monkeypatch):
+    # No project: the top rung can't answer at all, so the ladder falls straight through — Google is never constructed.
+    monkeypatch.setattr(llm.config, "GOOGLE_CLOUD_PROJECT", "")
+    monkeypatch.setattr(llm, "genai", _FakeGenai(generate=_never("an unwired Google rung must never be called")))
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate="scaleway answered"))
+
+    assert llm.generate("hello") == "scaleway answered"
+
+
+def test_google_surfaces_a_4xx_without_falling_over(monkeypatch):
+    # A 4xx that is not a 429 is our own bad request: it surfaces at once, and no rung below Google is tried.
+    monkeypatch.setattr(llm.config, "GOOGLE_CLOUD_PROJECT", "the-joy-xyz")
+    monkeypatch.setattr(llm, "genai", _FakeGenai(
+        generate=_google_error(llm.genai_errors.ClientError(400, {"error": {"message": "bad request"}}, None))))
+    monkeypatch.setattr(llm, "OpenAI",
+                        _FakeChat(generate=_never("a 4xx must surface, not fall through to Scaleway")))
+
+    with pytest.raises(llm.genai_errors.ClientError):
         llm.generate("hello")
