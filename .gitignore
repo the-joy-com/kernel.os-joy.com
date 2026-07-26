@@ -26,3 +26,8 @@ persona/private.md
 OTP.txt
 
 tmp.md
+
+# The kernel's own rotating log (core/logs.py): one live file plus a single
+# rotation. Per-box runtime output, never committed.
+kernel.log
+kernel.log.*

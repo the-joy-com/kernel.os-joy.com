@@ -32,13 +32,15 @@ class DeliveredRequest(BaseModel):
 class IntakeRequest(BaseModel):
     """One line captured at the shell's prompt, on its way into the kernel.
 
-    A single typed line, never empty,
-    capped so a stray paste can't ship an unbounded body.
+    A single typed line, never empty, and deliberately uncapped in length:
+    the symbiot may hand over as much as they mean to in one message —
+    a long paste is a real message, not an abuse to guard against —
+    and the message store is TEXT, with no ceiling of its own to move the failure downstream.
     The shell trims before sending,
     so by the time a line gets here it already carries real text.
     """
 
-    line: str = Field(min_length=1, max_length=4096)
+    line: str = Field(min_length=1)
     # Which reply channel to nudge once this message has an answer,
     # if the browser registered one (see /push/subscribe).
     # Optional — a message with no channel still gets answered,
@@ -67,14 +69,13 @@ class ModelConfigRequest(BaseModel):
     (the /models command drives all of them),
     and each returns the same full state so the shell re-renders from one source:
       - "register": add or edit an operator model. `name` is required;
-        provider and the two window figures are optional
-        and default to sensible local values (see model_config.upsert_model),
+        provider and the two window figures are optional and default to sensible local values
+        (see model_config.upsert_model),
         so a bare name works.
       - "delete": remove an operator model. `name` is required.
       - "assign": point a role at a catalog model. `role` and `model` are required.
     The route validates the fields each action needs and surfaces a refusal
-    (a builtin edited, a model in use, an unknown role)
-    as a legible reason rather than a 422 —
+    (a builtin edited, a model in use, an unknown role) as a legible reason rather than a 422 —
     the fields are shape-valid, the *change* is what's refused.
     Everything is capped as a stray-input guard; real names and slugs are short.
     """
@@ -95,7 +96,7 @@ class NotificationPreferenceRequest(BaseModel):
     """A symbiot flipping one notification channel on or off — the body of POST /notifications.
 
     channel names which one ('web_push', 'email');
-    the route checks it against the channels that actually exist (notify.ALL_CHANNELS)
+    the route checks it against the channels that actually exist (notify.ALL_CHANNELS),
     and no-ops a name that isn't one,
     so an unknown slug can't write a phantom preference —
     the single source for the channel set stays in code, not duplicated as a rule here.
