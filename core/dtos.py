@@ -133,6 +133,58 @@ class PushSubscriptionRequest(BaseModel):
     keys: PushKeys
 
 
+# The three reminder writes are three bodies rather than one action-tagged shape (the way /models does it),
+# because they are three flat routes: /reminders, /reminders/cancel, /reminders/update.
+# So each body carries exactly the fields its own verb needs and nothing optional it doesn't,
+# and a missing field is a 422 at the door rather than a rule re-checked in the handler.
+#
+# `id` is always the reminder's real id, never the display position the listing printed.
+# The firing sweep runs every few seconds, so a list printed minutes ago has stale positions in it;
+# sending the id makes a stale handle harmless — the kernel refuses a reminder that has since fired
+# rather than acting on whichever one now sits at that position.
+#
+# `when` is free text held to the deterministic grammar the kernel parses (zone.parse_wall_clock) —
+# a relative +45m, a plain wall-clock date and time, or a bare time meaning today —
+# and anything outside it is refused rather than guessed at,
+# since not spending a model call is the whole point of this path.
+
+
+class ReminderCancelRequest(BaseModel):
+    """A reminder the symbiot is calling off — the body of POST /reminders/cancel.
+
+    Nothing but which one. The row is stamped, never deleted,
+    and a reminder that has already fired or already been called off is refused rather than re-stamped.
+    """
+
+    id: int = Field(ge=1)
+
+
+class ReminderCreateRequest(BaseModel):
+    """A reminder typed straight in — the body of POST /reminders.
+
+    Both fields required: this path has no model call to fall back on,
+    so there is no reading of an unclear time to ask about — either the grammar names a moment or it doesn't.
+    `say` is uncapped, like a line at the prompt: the reminder is as long as the symbiot means it to be.
+    """
+
+    say: str = Field(min_length=1)
+    when: str = Field(min_length=1, max_length=64)
+
+
+class ReminderUpdateRequest(BaseModel):
+    """A live reminder being moved, reworded, or both — the body of POST /reminders/update.
+
+    Both `say` and `when` are optional so an edit can move the time without restating the line,
+    but a body carrying neither changes nothing and is refused rather than silently succeeding.
+    Values are absolute, never deltas — a moment, not "an hour later" —
+    which is what makes a retried edit harmless: applied twice, it lands in the same place.
+    """
+
+    id: int = Field(ge=1)
+    say: str | None = None
+    when: str | None = Field(default=None, max_length=64)
+
+
 class SeenRequest(BaseModel):
     """The inbox message ids the shell is reporting it has shown to the symbiot.
 

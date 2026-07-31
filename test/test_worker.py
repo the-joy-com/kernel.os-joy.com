@@ -135,7 +135,7 @@ def test_answer_forks_to_the_tool_when_a_candidate_surfaces(client, monkeypatch)
         worker.tools, "decide",
         lambda *a: tools.Decision("schedule_reminder", {"reminder_message": "x", "fire_at": None}),
     )
-    monkeypatch.setattr(worker, "_execute_tool", lambda *a: tools.ToolResult(True, "did it"))
+    monkeypatch.setattr(worker, "_execute_tool", lambda *a: tools.ToolResult("ACTED", "did it"))
     monkeypatch.setattr(worker.tools, "compose_confirmation", lambda *a: "confirmed")
     shortlist = [tools.ToolCandidate("schedule_reminder", "…", 0.1)]
 

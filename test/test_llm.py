@@ -1,8 +1,10 @@
-"""The free-text generate path and the context-budget guard, with the generative client faked at the boundary.
+"""The generate paths, what a provider is shown of a schema, and the context-budget guard —
+with the generative client faked at the boundary.
 
 generate_json's own contract is exercised in test_ontology.py alongside the router that leans on it;
-here we cover the two things the read path added: a prose reply with no schema grammar, and the _fit guard
-that holds a prompt to the model's optimal window by condensing only its context.
+here we cover the free-text path no kernel caller reaches for any more, the stripping that decides what
+a provider actually sees of a caller's schema (_wire_schema), and the _fit guard that holds a prompt to
+the model's optimal window by condensing only its context.
 
 The default generative model is a Scaleway model, so the boundary faked here is the OpenAI client
 (llm.OpenAI) Scaleway is reached through; the one test that pins an unmapped model exercises the ladder's
@@ -207,6 +209,57 @@ def test_reasoning_effort_is_per_model_and_thinking_off():
     assert llm._reasoning_effort("gpt-oss-20b") == "low"
 
 
+# --- what a provider is shown of a schema (_wire_schema) -----------------------------------
+
+
+def test_wire_schema_strips_our_own_prose_but_keeps_the_shape():
+    # A schema's docstring explains the model to a *reader*. Pydantic puts it in the JSON Schema as the
+    # object's `description`, and every SDK forwards that to the decoder as part of the grammar — so
+    # maintainer prose was being billed on every call and read as instructions on none of the model's business.
+    class _Documented(llm.BaseModel):
+        """Why this model exists, written for whoever maintains it — and no business of the decoder's."""
+
+        answer: str = llm.Field(min_length=1, description="what the model should put here")
+
+    assert "description" in _Documented.model_json_schema()  # Pydantic's default, the leak's source
+    wired = llm._wire_schema(_Documented)
+    schema = wired.model_json_schema()
+    assert "description" not in schema  # the class docstring is gone from what the provider sees
+    # The shape is untouched: the field, its constraint, and the description a caller wrote *for* the model
+    # all survive — only the prose written for a human is dropped.
+    assert schema["required"] == ["answer"]
+    assert schema["properties"]["answer"]["minLength"] == 1
+    assert schema["properties"]["answer"]["description"] == "what the model should put here"
+
+
+def test_wire_schema_hands_back_an_undocumented_schema_unchanged():
+    # Every schema built per call by create_model (the decision, the verdict, the re-rank) carries no
+    # docstring, so there is nothing to strip and no twin worth building — it passes through as itself.
+    class _Bare(llm.BaseModel):
+        answer: str
+
+    assert llm._wire_schema(_Bare) is _Bare
+
+
+def test_every_tier_is_handed_the_stripped_schema(monkeypatch):
+    # The stripping is rebound inside _call, the one place every tier is reached from, so no tier can be
+    # handed the unstripped model — proven at the Scaleway boundary, which is what `parse` receives.
+    class _Documented(llm.BaseModel):
+        """Prose for a reader that must not reach the decoder."""
+
+        answer: str
+
+    fake = _FakeChat(generate='{"answer": "ok"}')
+    monkeypatch.setattr(llm, "OpenAI", fake)
+
+    out = llm.generate_json("a prompt", _Documented, model="glm-5.2")
+
+    # The reply still validates through the caller's own model, docstring and all…
+    assert out.answer == "ok" and isinstance(out, _Documented)
+    # …while what bound the decoder carries none of that prose.
+    assert "description" not in fake.captured["json"]["response_format"].model_json_schema()
+
+
 # --- the context-budget guard (_fit) -------------------------------------------------------
 
 
@@ -262,7 +315,7 @@ def test_fit_leaves_an_unmapped_model_untouched(monkeypatch):
 def test_summarise_asks_to_condense_and_caps_the_result(monkeypatch):
     # The summariser names its token target and carries the context to condense, then the reply is truncated
     # to that target — so the budget is a promise kept, not a request the model may overshoot.
-    fake = _FakeChat(generate="CONDENSED but still rather long")
+    fake = _FakeChat(generate='{"summary": "CONDENSED but still rather long"}')
     monkeypatch.setattr(llm, "OpenAI", fake)
     monkeypatch.setattr(llm.models, "truncate_tokens", lambda text, n: f"{text[:9]}<{n}>")
 
@@ -271,6 +324,10 @@ def test_summarise_asks_to_condense_and_caps_the_result(monkeypatch):
     assert "the big context block to shrink" in _prompt(fake)
     assert "42" in _prompt(fake)
     assert out == "CONDENSED<42>"  # the model's summary, truncated to the target
+    # The condensation is held to a schema, not taken as free text:
+    # its output is spliced back into the prompt it was condensed for,
+    # so a preamble would occupy the very budget the guard was invoked to free.
+    assert fake.captured["json"]["response_format"].model_fields.keys() == {"summary"}
     # The summariser asks for its own target as the output cap — more room than an ordinary reply — and here
     # the target (42) is under the tier's ceiling, so it passes through as named rather than the model default.
     assert fake.captured["json"]["max_tokens"] == 42
@@ -281,7 +338,7 @@ def test_summarise_target_is_clamped_to_the_tier_ceiling(monkeypatch):
     # A target sized to the context budget can run past what a provider accepts (Scaleway 400s over its cap,
     # and a 400 does not fall through). So a target above the tier's own ceiling is clamped down to it,
     # never sent as-is — the clamp only shortens the summary, the truncation after still holds the budget.
-    fake = _FakeChat(generate="CONDENSED")
+    fake = _FakeChat(generate='{"summary": "CONDENSED"}')
     monkeypatch.setattr(llm, "OpenAI", fake)
     monkeypatch.setattr(llm.models, "truncate_tokens", lambda text, n: text)
 

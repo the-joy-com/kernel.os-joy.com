@@ -9,6 +9,7 @@ import psycopg
 import pytest
 
 from core import db
+from services import identity
 from services.memory import intake
 
 
@@ -54,6 +55,34 @@ def test_batch_lands_as_one_message(client):
     rows = _rows()
     assert len(rows) == 1  # one row per request, not one per line
     assert rows[0][1] == batch  # every line intact, nothing dropped
+
+
+def test_a_failed_conversation_mirror_takes_the_message_down_with_it(client, monkeypatch):
+    # The route's two writes are declared as one transaction, and this is what that buys.
+    # Were they to commit separately, a raising mirror would leave the message durable behind a 500 —
+    # and the shell's drain, reading a 500 as a non-receipt, would retry and write the same words again.
+    import main
+
+    token = "test-intake-atomicity-token"
+    with db.get_pool().connection() as conn:
+        symbiot_id = conn.execute("SELECT id FROM symbiot LIMIT 1").fetchone()[0]
+        conn.execute(
+            "INSERT INTO session (symbiot_id, token_hash, expires_at) "
+            "VALUES (%s, %s, now() + interval '1 hour')",
+            (symbiot_id, identity._hash(token)),
+        )
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("the stream row could not be written")
+
+    monkeypatch.setattr(main.conversation, "record_utterance", _explode)
+    with pytest.raises(RuntimeError):
+        client.post(
+            "/intake", json={"line": "a line whose mirror fails"}, headers={"Authorization": f"Bearer {token}"}
+        )
+
+    # Nothing durable: no half-landed message for a retry to duplicate.
+    assert _rows() == []
 
 
 def test_intake_tolerates_a_stale_reply_channel(client):

@@ -129,7 +129,7 @@ def main() -> None:
                     # A tool was named — run it exactly as the worker does, on this connection, in this transaction.
                     intake_id = _file_intake(conn, symbiot_id, message)
                     result = tools.execute(conn, decision, symbiot_id, intake_id, now_local, ZONE_NAME)
-                    effect = f" → {'scheduled' if result.effected else 'asked for more'}: {result.summary}"
+                    effect = f" → {result.outcome}: {result.summary}"
 
                 got = "schedule" if tool == reminder.NAME else ("none" if tool == tools.NO_TOOL else tool)
                 ok = got == expected

@@ -15,10 +15,22 @@ an intake pointer is a fast reply, a missive an enrichment marks is a deep follo
 echoes then embeds those lines and groups the near-duplicates into clusters — the *more or less* the same,
 measured as cosine closeness rather than guessed at — leaving the lines that echoed nothing to stand alone.
 
-The second card is reminders: the symbiot's most recently scheduled reminders, each paired with the human line
-that triggered it (recent_reminders). Its point is that pairing — the message said, and the reminder it produced —
+The second card is reminders: the symbiot's most recent reminders,
+each paired with the human line that triggered it (recent_reminders).
+Its point is that pairing — the message said, and the reminder it produced —
 so a reminder set against a line that only *mentioned* a task, rather than asked for one, is visible at a glance,
 and the real examples can be gathered to harden the tool's judgment. A plain read of the reminder ledger, like the rest here.
+
+The same card carries the mirror image of that mistake:
+the declines (recent_declines) — the times the machine refused to set a reminder it judged the store already held.
+Deduplication writes nothing, that being its entire job,
+so without a row of its own the first decision the machine takes
+on its own judgment rather than on the symbiot's words would be the one decision that leaves no trace,
+which is backwards.
+The failure worth catching is it reading "call the dentist about the referral letter"
+as the same thing as "call the dentist", filing nothing,
+and the symbiot never learning it made that call —
+so the decline carries both wordings, because the wording is the evidence.
 """
 
 from collections import defaultdict
@@ -90,19 +102,44 @@ class RecentReminder:
     trigger is the human message the reminder was scheduled from, the words that made the machine act;
     it is the pairing the card exists for, since a reminder set against a line that only mentioned a task —
     rather than asked to be reminded — is exactly the over-eagerness this lens is meant to surface.
+    It is None for a reminder the symbiot typed in directly, which had no line behind it —
+    and that absence is itself the distinction the card wants to draw.
+    reminder_id is the row's own id, so a line on the card can be spoken about and acted on.
     body is the line to be said back when it fires.
     fire_at is when it is due and created_at when it was scheduled, both absolute instants
     to be rendered in the symbiot's own zone.
-    fired is whether it has already been delivered, so a pending reminder reads apart from a spent one.
+    state is one word for where the reminder stands — pending, fired, or cancelled —
+    so a spent one and a called-off one read apart from each other and from a live one.
     channels is where it is to be delivered, or None when the symbiot named none and it rides every channel.
     """
 
-    trigger: str
+    reminder_id: int
+    trigger: str | None
     body: str
     fire_at: datetime
     created_at: datetime
-    fired: bool
+    state: str
     channels: list[str] | None
+
+
+@dataclass
+class ReminderDecline:
+    """One time the machine refused to set a reminder it judged the store already held.
+
+    asked is the human message that asked for it, held is the line of the standing reminder the judge matched it to;
+    the pairing is the whole point,
+    because the failure worth catching is two differently worded intents collapsing into one,
+    and the wording is the evidence.
+    reminder_id is the matched reminder's own id, so a decline can be read against the reminder above it on the card.
+    fire_at is when that standing reminder is due, and created_at when the refusal was made —
+    both absolute instants to be rendered in the symbiot's own zone.
+    """
+
+    reminder_id: int
+    asked: str
+    held: str
+    fire_at: datetime
+    created_at: datetime
 
 
 def held_back_count(conn, symbiot_id: int) -> int:
@@ -180,6 +217,36 @@ def machine_echoes(conn, symbiot_id: int, threshold: float = echo.ECHO_THRESHOLD
     return MachineEchoes(scored=True, clusters=clusters, singles=singles)
 
 
+def recent_declines(conn, symbiot_id: int, limit: int = RECENT_REMINDER_LIMIT) -> list[ReminderDecline]:
+    """The times the machine refused to set a reminder it judged the store already held, newest first.
+
+    The other half of the reminders card's pairing, and the reason the declines table exists at all:
+    deduplication writes nothing by design,
+    so without this the first decision the machine takes on its own judgment rather than on the symbiot's words
+    would be the one that leaves no trace.
+    Both sides of that judgment are here — the message that asked, and the standing reminder it matched —
+    because the failure worth catching is two differently worded intents collapsing into one,
+    and the wording is the evidence.
+    A pure read like the rest of this module, reaching the symbiot through the reminder it matched.
+    """
+    rows = conn.execute(
+        """
+        SELECT d.reminder_id, i.message, r.body, r.fire_at, d.created_at
+        FROM reminder_decline d
+        JOIN reminder r ON r.id = d.reminder_id
+        JOIN intake i ON i.id = d.intake_id
+        WHERE r.symbiot_id = %(symbiot)s
+        ORDER BY d.id DESC
+        LIMIT %(limit)s
+        """,
+        {"symbiot": symbiot_id, "limit": limit},
+    ).fetchall()
+    return [
+        ReminderDecline(reminder_id=r[0], asked=r[1], held=r[2], fire_at=r[3], created_at=r[4])
+        for r in rows
+    ]
+
+
 def recent_machine_utterances(conn, symbiot_id: int, limit: int = RECENT_UTTERANCE_LIMIT) -> list[MachineUterrance]:
     """The symbiot's most recent machine utterances, newest first, for the echoes lens.
 
@@ -223,19 +290,32 @@ def recent_machine_utterances(conn, symbiot_id: int, limit: int = RECENT_UTTERAN
 
 
 def recent_reminders(conn, symbiot_id: int, limit: int = RECENT_REMINDER_LIMIT) -> list[RecentReminder]:
-    """The symbiot's most recently scheduled reminders, newest first, for the reminders lens.
+    """The symbiot's most recent reminders, newest first, for the reminders lens.
 
     Reads the reminder ledger and resolves each row to the human message that triggered it (intake.message),
     so the card shows the pairing that matters for hardening the tool: the line said, and the reminder it produced.
-    Every reminder carries a triggering intake (the schedule is only ever raised from a message), so the join always resolves.
+
+    A LEFT join, and the distinction is the sort that hides.
+    This used to be an inner join, resting on the fact that every reminder was born from a message —
+    true while that was the only way one could exist, false the moment a reminder can be typed in directly.
+    An inner join does not complain about that; it drops the row.
+    Every directly-made reminder would have been absent from the audit surface,
+    and the card would have gone on looking complete while reporting a subset,
+    which is worse than no card at all.
+    So: a left join, and a reminder with no line behind it reads as one the symbiot set itself —
+    which is the distinction the card exists to draw anyway.
+
     Newest first, the order a "last few reminders" audit is scanned in, and bounded by `limit` at that newest end.
     A pure read: it touches the reminder and intake rows only, holds no lock, and writes nothing — off the loop's path.
     """
     rows = conn.execute(
         """
-        SELECT i.message, r.body, r.fire_at, r.created_at, r.fired_at IS NOT NULL, r.channels
+        SELECT r.id, i.message, r.body, r.fire_at, r.created_at, r.channels,
+               CASE WHEN r.fired_at IS NOT NULL THEN 'fired'
+                    WHEN r.cancelled_at IS NOT NULL THEN 'cancelled'
+                    ELSE 'pending' END AS state
         FROM reminder r
-        JOIN intake i ON i.id = r.intake_id
+        LEFT JOIN intake i ON i.id = r.intake_id
         WHERE r.symbiot_id = %(symbiot)s
         ORDER BY r.id DESC
         LIMIT %(limit)s
@@ -243,6 +323,8 @@ def recent_reminders(conn, symbiot_id: int, limit: int = RECENT_REMINDER_LIMIT) 
         {"symbiot": symbiot_id, "limit": limit},
     ).fetchall()
     return [
-        RecentReminder(trigger=r[0], body=r[1], fire_at=r[2], created_at=r[3], fired=r[4], channels=r[5])
+        RecentReminder(
+            reminder_id=r[0], trigger=r[1], body=r[2], fire_at=r[3], created_at=r[4], channels=r[5], state=r[6]
+        )
         for r in rows
     ]

@@ -77,10 +77,14 @@ def _answer(
     invisible to the overwhelming majority of messages, which ask for nothing to be done.
     With no tool candidate (the gate closed), or an anonymous caller (no symbiot to act for),
     the answer is the ordinary reply — one composing call in the killable child, exactly as before.
-    When a candidate surfaced, the flow is decide, act, speak:
+    When a candidate surfaced, the flow is decide, look, act, speak:
     a decision call names a tool and extracts its arguments, or answers "none";
     a "none" falls back to the ordinary reply, which has the full memory to answer well;
-    a named tool's executor runs on this thread, and a second call composes the confirmation.
+    a named tool that declares an observe hook has it run — a pure read of what the machine already holds —
+    and one small judging call rules on what it found;
+    then the executor runs on this thread, handed that verdict, and a second call composes the confirmation.
+    The look step is what makes a decision contingent on what was *observed* rather than on what was *said*,
+    and it is one step, not a loop: bounded, with a known shape, adding at most one model call.
     Each composing call is its own killable child under the deadline;
     the executor runs here, on the worker's own thread, never in a child that could be severed mid-effect.
     Returns the execution.Result the caller records — completed with the answer, or failed to be retried.
@@ -108,9 +112,41 @@ def _answer(
             (message, symbiot_id, facts, conv, now_local, zone_name),
             config.INTAKE_DEADLINE_SECONDS,
         )
+    # Look, before leaping — but only for a tool that declares it wants to.
+    # The read is a pure one on this thread; the judgment is a model call in the child, under the deadline.
+    # Both fail open, and that decision belongs on the record:
+    # leaving a failure here to fail the message
+    # would mean a safeguard against missing reminders had invented a brand new way for a reminder to go missing,
+    # one that didn't exist while the path was single-pass and had no second call to fail.
+    # A duplicate is a mild annoyance the symbiot can now see and delete;
+    # a silently absent reminder is a broken promise discovered after the thing has passed.
+    # A check must never be able to cause the harm it was added to prevent.
+    # It goes to the log rather than a lens, because it is an infrastructure hiccup
+    # and not a judgment about the symbiot's words.
+    log = logs.get("worker")
+    verdict = None
+    observation = None
+    try:
+        observation = _observe_tool(pool, decision, symbiot_id, now_local, zone_name)
+    except Exception:
+        log.exception("tool observe hook failed for %r — acting without it", decision.tool)
+    if observation is not None and observation.candidates:
+        judged = execution.run_with_deadline(
+            _judge_observation,
+            (message, observation, now_local, zone_name),
+            config.INTAKE_DEADLINE_SECONDS,
+        )
+        if judged.status == execution.COMPLETED:
+            verdict = judged.value
+        else:
+            log.warning(
+                "tool judging call did not complete for %r (%s) — acting without it",
+                decision.tool,
+                judged.status,
+            )
     # A tool was named — run its executor on this thread, never the killable child, exactly-once.
     try:
-        result = _execute_tool(pool, decision, symbiot_id, message_id, now_local, zone_name)
+        result = _execute_tool(pool, decision, symbiot_id, message_id, now_local, zone_name, verdict)
     except Exception:
         # A failed effect fails the message; the retry re-runs,
         # and the executor's exactly-once guard (the reminder's ON CONFLICT) makes that second run harmless,
@@ -331,7 +367,13 @@ def _enrich_one() -> bool:
 
 
 def _execute_tool(
-    pool, decision: tools.Decision, symbiot_id: int, message_id: int, now_local: datetime, zone_name: str
+    pool,
+    decision: tools.Decision,
+    symbiot_id: int,
+    message_id: int,
+    now_local: datetime,
+    zone_name: str,
+    verdict: tools.ObservationVerdict | None = None,
 ) -> tools.ToolResult:
     """Run the named tool's executor on the worker's own thread, in its own transaction — the act step.
 
@@ -341,10 +383,12 @@ def _execute_tool(
     so the effect runs here, where nothing kills it.
     One transaction, so the effect and its exactly-once guard commit together (tools.execute → the executor);
     the message id is that guard's key, so a retried message re-runs this harmlessly.
+    verdict is what the judge made of what the tool's hook saw, or None when there was nothing —
+    passed through untouched, since what it means is the executor's business, not this step's.
     """
     with pool.connection() as conn:
         with conn.transaction():
-            return tools.execute(conn, decision, symbiot_id, message_id, now_local, zone_name)
+            return tools.execute(conn, decision, symbiot_id, message_id, now_local, zone_name, verdict)
 
 
 def _fire_one() -> bool:
@@ -416,6 +460,22 @@ def _gather_context(
     return facts, conv, zone_name, shortlist
 
 
+def _judge_observation(
+    task: tuple[str, tools.Observation, datetime, str],
+) -> tools.ObservationVerdict:
+    """Rule on what a tool's hook saw — the judgment half of the look step, in the killable child.
+
+    Pure model work under the deadline, like the decision and the reply (see _answer).
+    task is (message, observation, now_local, zone_name), one tuple because the child takes a single arg;
+    it answers with the ref of the candidate it names, or None for "none of these" (tools.judge_observation).
+    In the child and not on this thread for the reason every model call is:
+    a provider having a bad afternoon must not pin a worker,
+    and a round trip inside the executor's open transaction is how a slow API becomes a stuck database.
+    """
+    message, observation, now_local, zone_name = task
+    return tools.judge_observation(message, observation, now_local, zone_name)
+
+
 def _ingest_one() -> bool:
     """File the next of the symbiot's settled messages into the diary. True if there was one to file.
 
@@ -438,6 +498,20 @@ def _ingest_one() -> bool:
         zone_name = zone.of(conn, symbiot_id)
         ontology.ingest(conn, message, intake_id=message_id, zone_name=zone_name)
     return True
+
+
+def _observe_tool(
+    pool, decision: tools.Decision, symbiot_id: int, now_local: datetime, zone_name: str
+) -> tools.Observation | None:
+    """Run the named tool's observe hook on the worker's own thread — the look step's read.
+
+    A pure read on its own connection, opened and closed before the executor's transaction is,
+    so nothing this reads is held across the model call that judges it —
+    a provider round trip inside an open transaction is how a slow API becomes a stuck database.
+    Returns None for a tool with no hook, or a hook that found nothing worth judging (tools.observe).
+    """
+    with pool.connection() as conn:
+        return tools.observe(conn, decision, symbiot_id, now_local, zone_name)
 
 
 def _process_one() -> bool:

@@ -62,6 +62,13 @@ def issue_login_code(conn, address: str, email_client: EmailClient) -> None:
     so nothing here is observable from outside.
     On a match, the symbiot's single live code is overwritten in place,
     so only the newest one can ever be spent.
+
+    The write and the mail that announces it land as one (the explicit transaction below).
+    Declared here rather than left to the caller's connection,
+    because the guarantee belongs to this function whoever calls it:
+    a code committed to the row while the mail failed to send would be a code the human can never spend
+    and the re-issue interval would refuse to replace.
+    Rolled back, the same tap a moment later simply issues again.
     """
     normalized = address.strip().lower()
     row = conn.execute(
@@ -85,27 +92,28 @@ def issue_login_code(conn, address: str, email_client: EmailClient) -> None:
     #     and a double-tap never invalidates the code already in the inbox.
     #     The database decides whether a code was issued (RETURNING tells us);
     #     we email only when it says one was.
-    issued = conn.execute(
-        "INSERT INTO login_code (symbiot_id, code_hash, expires_at) "
-        "VALUES (%s, %s, %s) "
-        "ON CONFLICT (symbiot_id) WHERE consumed_at IS NULL "
-        "DO UPDATE SET code_hash = EXCLUDED.code_hash, "
-        "expires_at = EXCLUDED.expires_at, created_at = now(), failed_attempts = 0 "
-        "WHERE login_code.created_at <= %s "
-        "RETURNING id",
-        (symbiot_id, _hash(code), expires_at, reissue_cutoff),
-    ).fetchone()
-    if issued is None:
-        # A fresh code already exists within the re-issue interval: keep it, send nothing.
-        return
+    with conn.transaction():
+        issued = conn.execute(
+            "INSERT INTO login_code (symbiot_id, code_hash, expires_at) "
+            "VALUES (%s, %s, %s) "
+            "ON CONFLICT (symbiot_id) WHERE consumed_at IS NULL "
+            "DO UPDATE SET code_hash = EXCLUDED.code_hash, "
+            "expires_at = EXCLUDED.expires_at, created_at = now(), failed_attempts = 0 "
+            "WHERE login_code.created_at <= %s "
+            "RETURNING id",
+            (symbiot_id, _hash(code), expires_at, reissue_cutoff),
+        ).fetchone()
+        if issued is None:
+            # A fresh code already exists within the re-issue interval: keep it, send nothing.
+            return
 
-    email_client.send(
-        to=email,
-        subject="Your Joy login code",
-        body=f"Your one-time login code is {code}\n\n"
-        f"It expires in {config.LOGIN_CODE_TTL_SECONDS // 60} minutes. "
-        f"If you didn't ask to log in, ignore this.",
-    )
+        email_client.send(
+            to=email,
+            subject="Your Joy login code",
+            body=f"Your one-time login code is {code}\n\n"
+            f"It expires in {config.LOGIN_CODE_TTL_SECONDS // 60} minutes. "
+            f"If you didn't ask to log in, ignore this.",
+        )
 
 
 def logout(conn, token: str | None) -> None:
@@ -145,6 +153,13 @@ def verify_login_code(conn, address: str, code: str) -> str | None:
     the plaintext token is returned once and only its hash is stored.
     Every failure — unknown address, no live code, wrong code, spent budget —
     returns None identically, so nothing here is an oracle.
+
+    Spending the code and minting the session land as one (the explicit transaction below),
+    and this is the pairing that most has to hold:
+    a code marked consumed with no session behind it would spend the human's only way in
+    and leave them locked out of their own kernel.
+    Declared here rather than left to the caller's connection,
+    so the guarantee travels with the function.
     """
     normalized = address.strip().lower()
     row = conn.execute(
@@ -168,12 +183,12 @@ def verify_login_code(conn, address: str, code: str) -> str | None:
         )
         return None
 
-    conn.execute("UPDATE login_code SET consumed_at = now() WHERE id = %s", (code_id,))
-
     token = secrets.token_urlsafe(32)
     expires_at = _now() + timedelta(seconds=config.SESSION_TTL_SECONDS)
-    conn.execute(
-        "INSERT INTO session (symbiot_id, token_hash, expires_at) VALUES (%s, %s, %s)",
-        (symbiot_id, _hash(token), expires_at),
-    )
+    with conn.transaction():
+        conn.execute("UPDATE login_code SET consumed_at = now() WHERE id = %s", (code_id,))
+        conn.execute(
+            "INSERT INTO session (symbiot_id, token_hash, expires_at) VALUES (%s, %s, %s)",
+            (symbiot_id, _hash(token), expires_at),
+        )
     return token

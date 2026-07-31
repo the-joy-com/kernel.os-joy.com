@@ -297,7 +297,8 @@ LOCAL_WINDOW_TOKENS = os.getenv("LOCAL_WINDOW_TOKENS", "").strip()
 # So the roles map onto three tiers rather than one model, and the right model plays each:
 #   FLAGSHIP — the voice and the load-bearing memory (reply, enrich, conversation_compress);
 #   MID      — competent language and structured extraction (tool_confirm, tool_decision, mint);
-#   SMALL    — the high-volume bounded classifications (rerank and the ontology router's sub-judgments).
+#   SMALL    — the high-volume bounded classifications
+#              (rerank, the ontology router's sub-judgments, and picking one of the rows an observe hook found).
 # These are the tier PRIMARIES: the Google/Gemini models the roles resolve to and that answer in the steady state,
 # each with its Scaleway and Mistral fallbacks (above) sitting beneath it, prepended by the ladder (llm._call).
 # Each is a catalog name its provider answers to, looked up in the model map at call time,
@@ -555,7 +556,9 @@ TOOL_DECISION_MODEL = os.getenv("TOOL_DECISION_MODEL", MID_MODEL)
 # prose in the symbiot's voice, speaking the tool's result.
 # It is the MID tier: real language,
 # but a bounded factual read-back of a known result rather than the open composition the reply is,
-# so it sits a rung below the flagship. Reached free-text (llm.generate).
+# so it sits a rung below the flagship.
+# Held to the one-field confirmation schema on the way back (llm.generate_json),
+# since what it says is spoken to the symbiot verbatim and must carry no preamble.
 TOOL_CONFIRM_MODEL = os.getenv("TOOL_CONFIRM_MODEL", MID_MODEL)
 # The catalog recall's gate (tools.search_catalog):
 # the cosine distance under which a tool's descriptor is near enough to a message to be a candidate.
@@ -570,6 +573,16 @@ TOOL_RECALL_LIMIT = int(os.getenv("TOOL_RECALL_LIMIT", "5"))
 # The HNSW working-set width for the catalog search, set per query, comfortably above the shortlist —
 # the same knob and the same reason as the other recalls (RECALL_EF_SEARCH, DEEP_RETRIEVAL_EF_SEARCH).
 TOOL_RECALL_EF_SEARCH = int(os.getenv("TOOL_RECALL_EF_SEARCH", "100"))
+# The generative model behind the judging call (tools.judge_observation) —
+# which of the things a tool's observe hook found is the one.
+# The narrowest judgment the seam makes,
+# and the only one of the three that is a bounded classification rather than language:
+# a handful of plain lines and one question, answered with a ref or a null,
+# with output held to a Literal over exactly the refs offered,
+# so it is the SMALL tier — the same rung as the router's re-rank, and for the same reason.
+# The decision above it and the confirmation after it stay MID:
+# one extracts arguments, the other is the voice the symbiot reads verbatim.
+TOOL_OBSERVATION_JUDGE_MODEL = os.getenv("TOOL_OBSERVATION_JUDGE_MODEL", SMALL_MODEL)
 
 # The reminder firing sweep (worker.run_reminder_sweep): the loop that delivers due reminders as missives.
 # On by default;
@@ -581,3 +594,40 @@ REMINDER_ENABLED = os.getenv("REMINDER_ENABLED", "true").strip().lower() not in 
 # a reminder fires within about this long of its moment,
 # which is close enough for a one-shot nudge and cheap on the partial due index.
 REMINDER_SWEEP_INTERVAL_SECONDS = float(os.getenv("REMINDER_SWEEP_INTERVAL_SECONDS", "10"))
+# How many reminders the standing-set read hands back at most — the listing's cap.
+# The listing is the surface the symbiot operates on by number,
+# so it is bounded to what a person can take in on a screen of plain lines,
+# not to what the store could return.
+# The pending ones come first and are what the cap is really for;
+# a symbiot holding more than this many at once is reading the head of the queue, which is the useful part.
+REMINDER_LISTING_LIMIT = int(os.getenv("REMINDER_LISTING_LIMIT", "50"))
+# The deduplication recall's three knobs — the window, the ranking and the cap —
+# which is the whole of how narrowly the machine looks before it refuses to set a reminder twice.
+# They sit beside the tool recall's own knobs above, and for the same reason: they are what tune a recall.
+#
+# The window: how far either side of the moment just read a standing reminder has to fall to be a candidate.
+# Half a day, because a reminder for Friday tells the machine nothing about whether next month is being doubled up on —
+# and because the same errand named twice is usually named for roughly the same time.
+REMINDER_DEDUP_WINDOW_HOURS = float(os.getenv("REMINDER_DEDUP_WINDOW_HOURS", "12"))
+# The cap: how many candidates the judge is handed at most,
+# ranked by how near their wording sits to what the symbiot said
+# (pg_trgm similarity, the same fuzzy lexical measure the diary recall leans on).
+# Small, so a busy Friday hands the judge a handful of plausible candidates rather than the whole day,
+# which is what keeps the judging call cheap enough to spend on every reminder.
+REMINDER_DEDUP_LIMIT = int(os.getenv("REMINDER_DEDUP_LIMIT", "5"))
+# The same cap for the other reader of the standing set: resolving which reminder a phrase points at
+# ("the dentist one") before cancelling or editing it.
+# A touch wider than the deduplication's, because here there is no proposed time to window by —
+# the whole live set is in play and the wording is the only signal.
+REMINDER_TARGET_LIMIT = int(os.getenv("REMINDER_TARGET_LIMIT", "8"))
+# How many reminders the plain-language read will summarise for one question.
+# "What am I holding this year" is a fair question and the answer might be forty rows,
+# so when this cap bites the machine says there are more beyond what it can see
+# rather than summarising the first handful as though that were all of it.
+REMINDER_DIGEST_LIMIT = int(os.getenv("REMINDER_DIGEST_LIMIT", "20"))
+# How many recently settled reminders — fired or called off — ride along at the foot of the listing.
+# Small, and deliberately not the whole ledger:
+# they are there so a fired one reads as fired rather than as a gap where it was,
+# and so a cancel just made is visibly a cancel.
+# The full history is the audit surface's to show (/observe/reminders), not this listing's.
+REMINDER_LISTING_SETTLED = int(os.getenv("REMINDER_LISTING_SETTLED", "10"))

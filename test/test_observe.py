@@ -88,6 +88,10 @@ def _recent(**kwargs):
     return _with_conn(lambda c: observe.recent_machine_utterances(c, SEEDED_SYMBIOT_ID, **kwargs))
 
 
+def _recent_declines(**kwargs):
+    return _with_conn(lambda c: observe.recent_declines(c, SEEDED_SYMBIOT_ID, **kwargs))
+
+
 def _recent_reminders(**kwargs):
     return _with_conn(lambda c: observe.recent_reminders(c, SEEDED_SYMBIOT_ID, **kwargs))
 
@@ -273,8 +277,75 @@ def test_reminders_pair_each_with_its_trigger_newest_first(client):
         "remind me to call the dentist tomorrow",
     ]
     assert [r.body for r in got] == ["email Sam", "call the dentist"]
-    assert [r.fired for r in got] == [True, False]
+    assert [r.state for r in got] == ["fired", "pending"]
     assert [r.channels for r in got] == [["email"], None]
+
+
+def test_reminders_keep_a_directly_typed_one_the_join_would_have_dropped(client):
+    # The failure this guards is the sort that hides.
+    # The join used to be an inner one, resting on every reminder having been born from a message —
+    # true until one could be typed straight in.
+    # An inner join doesn't complain about that; it drops the row,
+    # and the card goes on looking complete while reporting a subset, which is worse than no card at all.
+    _reminder("remind me to call the dentist tomorrow", "call the dentist")
+    _with_conn(lambda c: c.execute(
+        "INSERT INTO reminder (intake_id, symbiot_id, body, fire_at) "
+        "VALUES (NULL, %s, 'typed in myself', now() + interval '1 day')",
+        (SEEDED_SYMBIOT_ID,),
+    ))
+
+    got = _recent_reminders()
+
+    assert [r.body for r in got] == ["typed in myself", "call the dentist"]
+    # No line behind it reads as one the symbiot set itself, which is the distinction the card is for.
+    assert [r.trigger for r in got] == [None, "remind me to call the dentist tomorrow"]
+
+
+def test_reminders_report_a_cancelled_one_apart_from_a_fired_one(client):
+    pending = _reminder("remind me to stretch", "stretch")
+    _reminder("remind me to email Sam", "email Sam", fired=True)
+    cancelled = _reminder("remind me to ring mum", "ring mum")
+    _with_conn(lambda c: c.execute("UPDATE reminder SET cancelled_at = now() WHERE id = %s", (cancelled,)))
+
+    got = {r.reminder_id: r.state for r in _recent_reminders()}
+
+    # Three endings, three words — a called-off reminder is recorded, not dropped, so it has to read as its own thing.
+    assert got[pending] == "pending"
+    assert got[cancelled] == "cancelled"
+    assert sorted(got.values()) == ["cancelled", "fired", "pending"]
+
+
+def test_declines_carry_both_wordings_of_the_judgment(client):
+    # The trace deduplication would otherwise not leave. Both sides are the point:
+    # the failure worth catching is two differently worded intents collapsing into one,
+    # and the wording is the evidence.
+    held = _reminder("remind me to call the dentist", "call the dentist")
+    asked = _intake(message="remind me to call the dentist about the referral letter", answer="ok")
+    _with_conn(lambda c: c.execute(
+        "INSERT INTO reminder_decline (intake_id, reminder_id) VALUES (%s, %s)", (asked, held)
+    ))
+
+    got = _recent_declines()
+
+    assert len(got) == 1
+    assert got[0].asked == "remind me to call the dentist about the referral letter"
+    assert got[0].held == "call the dentist"
+    assert got[0].reminder_id == held
+
+
+def test_declines_are_another_symbiots_business_only(client):
+    # Reached through the reminder it matched, which is where symbiot_id lives —
+    # so a decline against someone else's reminder is not this symbiot's to see.
+    other = _with_conn(lambda c: c.execute(
+        "INSERT INTO symbiot (email) VALUES ('elsewhere@example.com') RETURNING id"
+    ).fetchone()[0])
+    held = _reminder("their line", "theirs", symbiot_id=other)
+    asked = _intake(message="their second line", answer="ok", symbiot_id=other)
+    _with_conn(lambda c: c.execute(
+        "INSERT INTO reminder_decline (intake_id, reminder_id) VALUES (%s, %s)", (asked, held)
+    ))
+
+    assert _recent_declines() == []
 
 
 def test_reminders_limit_keeps_the_newest(client):
@@ -304,7 +375,7 @@ def test_reminders_route_returns_the_pairing_with_local_time_labels(client, fake
     r = reminders[0]
     assert r["trigger"] == "remind me to stretch at 3"
     assert r["body"] == "stretch"
-    assert r["fired"] is False
+    assert r["state"] == "pending"
     assert r["channels"] is None
     assert r["fire_at"], "expected a rendered local-time label"
     assert r["created_at"], "expected a rendered local-time label"

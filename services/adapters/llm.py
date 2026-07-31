@@ -1,13 +1,16 @@
 """LLM: a prompt in, an answer out, through a bigger cloud model with a fallback ladder home.
 
-Two shapes pass through here, for two kinds of caller.
+Every caller comes through `generate_json`, which holds the reply to an exact Pydantic shape.
 The ontology router wants judgments a vector distance can't make —
-re-ranking the recalled candidates, breaking a tie in the grey zone — and each is a prompt in, JSON out:
-`generate_json` holds those to an exact Pydantic shape.
-The read path wants a spoken reply — free prose, held to no schema — and that is `generate`,
-the same boundary with the schema dropped, returning the model's text as-is.
+re-ranking the recalled candidates, breaking a tie in the grey zone — and each is a prompt in, JSON out.
+The speaking paths — the reply, and the confirmation a tool's result is spoken with — want prose,
+and they take it back through a schema too, as a single named field:
+what they get is said to the symbiot verbatim, so an "Of course! Here's my reply:" opener or a ``` fence
+must have nowhere to land rather than be asked not to appear.
+`generate` is the same boundary with the schema dropped, returning the model's text as-is;
+nothing in the kernel reaches for it, since a shape is always the stronger guarantee.
 
-Beneath both sits one round trip (`_call`) and a **fallback ladder** it walks per request.
+Beneath the public calls sits one round trip (`_call`) and a **fallback ladder** it walks per request.
 Generation runs on a bigger, faster model than the box can serve, on a four-rung ladder.
 The top rung is Google (Gemini) on the Agent Platform — reached first for every automatic call, so in the steady state
 it is what answers, and the reason the switch exists: the Agent Platform caches the large repeated prompt prefix
@@ -33,7 +36,8 @@ on Scaleway reasoning is turned down per model (GLM and Qwen accept `reasoning_e
 the Mistral tier has no trace to suppress, and the Ollama tier keeps `think=False`;
 the output is held to the shape the caller demands —
 `generate_json` hands its Pydantic model through each SDK's structured-output mechanism (Scaleway's and Mistral's `parse` helpers, Google's `response_schema`, Ollama's `format`),
-which binds the decoder to that model's schema, and validates the reply back through the same model,
+which binds the decoder to that model's schema — the shape only, with our own maintainer prose stripped off first (_wire_schema) —
+and validates the reply back through the same model,
 so the answer that crosses this boundary is a typed object with its fields already checked,
 and a reply that breaks the schema raises here rather than slipping through as a half-read decision;
 sampling is at temperature 0 for every call, judgment and reply alike —
@@ -44,7 +48,7 @@ There is no loose-JSON mode:
 the model boundary gets the same typed discipline the HTTP boundary already gets from these DTOs (core/dtos.py),
 from the first call rather than tightened later.
 
-Before either call reaches a model, the prompt is held to that model's context budget (_fit, services.models):
+Before a call reaches a model, the prompt is held to that model's context budget (_fit, services.models):
 if it would overrun the window the model reads well,
 the summarisable context the caller marked is condensed to fit —
 only that context, never the instructions around it —
@@ -69,12 +73,18 @@ from google.auth import exceptions as google_auth_errors
 from google.genai import errors as genai_errors, types as genai_types
 from mistralai.client import errors as mistral_errors, Mistral
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, create_model, Field
 
 from core import config
+from core import logs
 from services.adapters import models
 
+
 M = TypeVar("M", bound=BaseModel)
+
+
+log = logs.get("llm")
+
 
 # The smallest a summarised context is ever aimed at.
 # A budget so tight it left the context almost no room would ask the summariser for nonsense,
@@ -90,32 +100,24 @@ class _Outage(Exception):
     """
 
 
-def _reasoning_effort(model_name: str) -> str:
-    """The reasoning_effort to send Scaleway for this model — always a value its schema accepts.
+class _SummaryReply(BaseModel):
+    """The budget guard's condensation: the shortened context, and nothing wrapped around it.
 
-    Scaleway's Generative APIs take one of 'none' | 'low' | 'medium' | 'high',
-    and every call here wants thinking off:
-    a fast judgment, or a reply the symbiot is waiting on, not a visible reasoning trace.
-    Most models accept 'none' and emit no trace;
-    gpt-oss is the exception — it rejects 'none' with a 400 (its reasoning floor is 'low'),
-    but at 'low' it still returns no reasoning trace for the bounded calls made here,
-    so 'low' is its effective thinking-off.
-    Keyed by name, so the value is always one the model accepts and a 400 on the effort field is impossible.
-    """
-    return "low" if model_name.startswith("gpt-oss") else "none"
+    A plain module-level model — its shape is fixed at a single string, with nothing per-call to fold in.
+    The condensation is held to a schema for the same reason the conversation's fold is:
+    its output is spliced straight back into the prompt it was condensed for,
+    so a "Here are the condensed notes:" preamble or a ``` fence would not merely read oddly —
+    it would occupy the budget the guard was invoked to free, and be read by the next model as if it were context.
+    The summary is the only field the model may emit, so that filler has nowhere to land.
+    `min_length=1` is folded into the decoder grammar and re-checked on the way back:
+    a condensation is only ever asked for when there is context to condense, so an empty one is a mis-read."""
 
-
-def _thinking_level(model_name: str) -> str:
-    """The thinking level to send a Gemini model — always its lowest, since these bounded calls never want a trace.
-
-    Google made reasoning mandatory on the 3.x models: unlike Scaleway's "none", it cannot be turned off at all,
-    only turned down. So each Gemini model runs at the floor it allows —
-    the Flash models accept MINIMAL, and the Pro's own floor is LOW (it rejects MINIMAL) —
-    the same shape as _reasoning_effort's gpt-oss exception, keyed by name so the value is always one the model accepts.
-    """
-    return "MINIMAL" if "flash" in model_name else "LOW"
+    summary: str = Field(min_length=1)
 
 
+# The ladder's four tiers, in rung order rather than alphabetical:
+# each one is written against the tier above it that falls to it — the top rung, its catch, that catch's catch,
+# and the last resort — so read top to bottom the sequence is the one a call actually walks.
 def _google(
     model_name: str,
     prompt: str,
@@ -178,7 +180,7 @@ def _google(
         raise RuntimeError(
             f"generative model {model_name!r} on Google returned an empty response"
         )
-    return body
+    return _served("google", model_name, body)
 
 
 def _scaleway(
@@ -237,7 +239,7 @@ def _scaleway(
         raise RuntimeError(
             f"generative model {model_name!r} on Scaleway returned an empty response"
         )
-    return body
+    return _served("scaleway", model_name, body)
 
 
 def _mistral(
@@ -297,7 +299,7 @@ def _mistral(
         raise RuntimeError(
             f"generative model {model_name!r} on Mistral returned an empty response"
         )
-    return body
+    return _served("mistral", model_name, body)
 
 
 def _ollama(
@@ -349,68 +351,7 @@ def _ollama(
         raise RuntimeError(
             f"generative model {model_name!r} on Ollama returned an empty response"
         )
-    return body
-
-
-def _output_cap(override: int | None, model_name: str) -> int | None:
-    """The output ceiling to hand one tier, resolved from the model about to answer so a fallback is capped
-    at what it supports rather than the primary's figure.
-
-    An ordinary call names no `override`, so it takes that tier's own model figure (services.models).
-    The summariser names one — the room it needs up to its whole target — but that request is *clamped* to
-    the tier's figure rather than winning outright: a target sized to the context budget can run far past
-    what a provider accepts (Scaleway 400s over its cap, and a 400 does not fall through), so the clamp keeps
-    even a huge-context summary a request the tier can honour. Clamping only shortens the summary, never the
-    budget it must fit — the truncation after it (llm._summarise) still holds the promise.
-    An unmapped model has no figure, so its `override` passes through and an ordinary call is left uncapped
-    (None), the historical local-Ollama default."""
-    spec = models.spec(model_name)
-    cap = spec.max_output_tokens if spec is not None else None
-    if override is not None:
-        return min(override, cap) if cap is not None else override
-    return cap
-
-
-# The Scaleway model that catches each Gemini primary when it outages — keyed by the Gemini primary that failed.
-# The Gemini primaries are genuinely distinct per tier (pro / flash / flash-lite), so this maps three keys,
-# and the two cheaper tiers land on one Scaleway model (both gpt-oss-120b today) because the Scaleway rung shares it —
-# the distinction lives in the Gemini rung above, not in the Scaleway one beneath.
-# Keyed by the Gemini model *name* because that is all _call holds when the top rung outages.
-_SCALEWAY_FALLBACK = {
-    config.FLAGSHIP_MODEL: config.SCALEWAY_FLAGSHIP_MODEL,
-    config.MID_MODEL: config.SCALEWAY_MID_MODEL,
-    config.SMALL_MODEL: config.SCALEWAY_SMALL_MODEL,
-}
-
-
-def _scaleway_fallback(google_model: str) -> str:
-    """The Scaleway model that catches this Gemini primary when it outages — its tier's second rung.
-
-    A Gemini model in no tier — an operator's custom assignment through /models — falls to the flagship Scaleway:
-    the widest window and the most capable of the rung, the safest catch when we can't place it in a tier.
-    """
-    return _SCALEWAY_FALLBACK.get(google_model, config.SCALEWAY_FLAGSHIP_MODEL)
-
-
-# The Mistral model that catches each Scaleway rung when it outages — keyed by the Scaleway model that failed.
-# One rung further down than _SCALEWAY_FALLBACK: it catches the Scaleway rung (itself the catch for Google),
-# so the tier is carried by the Scaleway model name, all _call holds at that depth of the chain.
-# The two cheaper tiers share one Scaleway model (gpt-oss-120b) and so share one Mistral catch (ministral-8b),
-# exactly the iso shape the Scaleway rung has — the Mistral rung splits per tier only once the Scaleway one does.
-_MISTRAL_FALLBACK = {
-    config.SCALEWAY_FLAGSHIP_MODEL: config.MISTRAL_FLAGSHIP_MODEL,
-    config.SCALEWAY_MID_MODEL: config.MISTRAL_MID_MODEL,
-    config.SCALEWAY_SMALL_MODEL: config.MISTRAL_SMALL_MODEL,
-}
-
-
-def _mistral_fallback(scaleway_model: str) -> str:
-    """The Mistral model that catches this Scaleway rung when it outages — its tier's cross-cloud fallback.
-
-    A Scaleway model in no tier — an operator's custom assignment through /models — falls to the flagship Mistral:
-    the widest window and the most capable of the rung, the safest catch when we can't place it in a tier.
-    """
-    return _MISTRAL_FALLBACK.get(scaleway_model, config.MISTRAL_FLAGSHIP_MODEL)
+    return _served("ollama", model_name, body)
 
 
 def _call(
@@ -440,6 +381,9 @@ def _call(
     An empty reply raises inside each tier,
     so neither a transport failure nor a blank answer passes as a half-read decision
     or reaches the symbiot as silence.
+    Every rung that answers says so on the way out (_served) and every rung that falls through says why,
+    so a live tail names the model whose words the symbiot actually got —
+    which is the only way to attribute a reply that came back wrong, since the reply itself never names its author.
 
     IS_LOCAL=1 short-circuits the ladder entirely: every call is served by Ollama on the box.
     Since the resolved role name is a cloud id Ollama can't serve, the call is substituted to the
@@ -455,6 +399,11 @@ def _call(
     the ladder's own rungs keep the single fitting the widest-floor invariant already makes safe.
     """
     spec = models.spec(model)
+    # What a provider sees is the shape only, with our own maintainer prose stripped off (_wire_schema).
+    # Rebound here, at the one place every tier is reached from,
+    # so no tier can be handed the unstripped model and no future caller has to remember to strip it.
+    if schema is not None:
+        schema = _wire_schema(schema)
     # Quick override to keep every call on the local box (IS_LOCAL=1): route to Ollama regardless of
     # the role's resolved provider. The resolved name is a cloud id (a role points at gpt-oss-120b, glm-5.2),
     # which Ollama can't serve — pulling it would 404 — so substitute the local SLM floor
@@ -482,8 +431,8 @@ def _call(
             return _google(
                 model, prompt, schema, temperature, _output_cap(max_output_tokens, model)
             )
-        except _Outage:
-            pass
+        except _Outage as outage:
+            log.warning("generative rung fell through: %s", outage)
         try:
             return _scaleway(
                 scaleway,
@@ -492,8 +441,8 @@ def _call(
                 temperature,
                 _output_cap(max_output_tokens, scaleway),
             )
-        except _Outage:
-            pass
+        except _Outage as outage:
+            log.warning("generative rung fell through: %s", outage)
         mistral = _mistral_fallback(scaleway)
         try:
             return _mistral(
@@ -503,8 +452,8 @@ def _call(
                 temperature,
                 _output_cap(max_output_tokens, mistral),
             )
-        except _Outage:
-            pass
+        except _Outage as outage:
+            log.warning("generative rung fell through: %s", outage)
         return _ollama(
             config.GENERATIVE_LOCAL_FALLBACK_MODEL,
             prompt,
@@ -519,8 +468,8 @@ def _call(
             return _scaleway(
                 model, prompt, schema, temperature, _output_cap(max_output_tokens, model)
             )
-        except _Outage:
-            pass
+        except _Outage as outage:
+            log.warning("generative rung fell through: %s", outage)
         fallback = _mistral_fallback(model)
         try:
             return _mistral(
@@ -530,8 +479,8 @@ def _call(
                 temperature,
                 _output_cap(max_output_tokens, fallback),
             )
-        except _Outage:
-            pass
+        except _Outage as outage:
+            log.warning("generative rung fell through: %s", outage)
         return _ollama(
             config.GENERATIVE_LOCAL_FALLBACK_MODEL,
             prompt,
@@ -582,12 +531,109 @@ def _fit(prompt: str, context: str | None, model_name: str) -> str:
     return prompt.replace(context, _summarise(context, target, model_name), 1)
 
 
+# The Mistral model that catches each Scaleway rung when it outages — keyed by the Scaleway model that failed.
+# One rung further down than _SCALEWAY_FALLBACK: it catches the Scaleway rung (itself the catch for Google),
+# so the tier is carried by the Scaleway model name, all _call holds at that depth of the chain.
+# The two cheaper tiers share one Scaleway model (gpt-oss-120b) and so share one Mistral catch (ministral-8b),
+# exactly the iso shape the Scaleway rung has — the Mistral rung splits per tier only once the Scaleway one does.
+_MISTRAL_FALLBACK = {
+    config.SCALEWAY_FLAGSHIP_MODEL: config.MISTRAL_FLAGSHIP_MODEL,
+    config.SCALEWAY_MID_MODEL: config.MISTRAL_MID_MODEL,
+    config.SCALEWAY_SMALL_MODEL: config.MISTRAL_SMALL_MODEL,
+}
+
+
+def _mistral_fallback(scaleway_model: str) -> str:
+    """The Mistral model that catches this Scaleway rung when it outages — its tier's cross-cloud fallback.
+
+    A Scaleway model in no tier — an operator's custom assignment through /models — falls to the flagship Mistral:
+    the widest window and the most capable of the rung, the safest catch when we can't place it in a tier.
+    """
+    return _MISTRAL_FALLBACK.get(scaleway_model, config.MISTRAL_FLAGSHIP_MODEL)
+
+
+def _output_cap(override: int | None, model_name: str) -> int | None:
+    """The output ceiling to hand one tier, resolved from the model about to answer so a fallback is capped
+    at what it supports rather than the primary's figure.
+
+    An ordinary call names no `override`, so it takes that tier's own model figure (services.models).
+    The summariser names one — the room it needs up to its whole target — but that request is *clamped* to
+    the tier's figure rather than winning outright: a target sized to the context budget can run far past
+    what a provider accepts (Scaleway 400s over its cap, and a 400 does not fall through), so the clamp keeps
+    even a huge-context summary a request the tier can honour. Clamping only shortens the summary, never the
+    budget it must fit — the truncation after it (llm._summarise) still holds the promise.
+    An unmapped model has no figure, so its `override` passes through and an ordinary call is left uncapped
+    (None), the historical local-Ollama default."""
+    spec = models.spec(model_name)
+    cap = spec.max_output_tokens if spec is not None else None
+    if override is not None:
+        return min(override, cap) if cap is not None else override
+    return cap
+
+
+def _reasoning_effort(model_name: str) -> str:
+    """The reasoning_effort to send Scaleway for this model — always a value its schema accepts.
+
+    Scaleway's Generative APIs take one of 'none' | 'low' | 'medium' | 'high',
+    and every call here wants thinking off:
+    a fast judgment, or a reply the symbiot is waiting on, not a visible reasoning trace.
+    Most models accept 'none' and emit no trace;
+    gpt-oss is the exception — it rejects 'none' with a 400 (its reasoning floor is 'low'),
+    but at 'low' it still returns no reasoning trace for the bounded calls made here,
+    so 'low' is its effective thinking-off.
+    Keyed by name, so the value is always one the model accepts and a 400 on the effort field is impossible.
+    """
+    return "low" if model_name.startswith("gpt-oss") else "none"
+
+
+# The Scaleway model that catches each Gemini primary when it outages — keyed by the Gemini primary that failed.
+# The Gemini primaries are genuinely distinct per tier (pro / flash / flash-lite), so this maps three keys,
+# and the two cheaper tiers land on one Scaleway model (both gpt-oss-120b today) because the Scaleway rung shares it —
+# the distinction lives in the Gemini rung above, not in the Scaleway one beneath.
+# Keyed by the Gemini model *name* because that is all _call holds when the top rung outages.
+_SCALEWAY_FALLBACK = {
+    config.FLAGSHIP_MODEL: config.SCALEWAY_FLAGSHIP_MODEL,
+    config.MID_MODEL: config.SCALEWAY_MID_MODEL,
+    config.SMALL_MODEL: config.SCALEWAY_SMALL_MODEL,
+}
+
+
+def _scaleway_fallback(google_model: str) -> str:
+    """The Scaleway model that catches this Gemini primary when it outages — its tier's second rung.
+
+    A Gemini model in no tier — an operator's custom assignment through /models — falls to the flagship Scaleway:
+    the widest window and the most capable of the rung, the safest catch when we can't place it in a tier.
+    """
+    return _SCALEWAY_FALLBACK.get(google_model, config.SCALEWAY_FLAGSHIP_MODEL)
+
+
+def _served(provider: str, model_name: str, body: str) -> str:
+    """Record which model actually answered, and how much it said — then hand the reply on unchanged.
+
+    Every generative call in the kernel resolves a *role* to a model name, and then walks a fallback ladder,
+    so the model that answers is often not the one the role names and never appears in the reply itself.
+    Without this line, a reply that came back wrong left no record of who wrote it:
+    the traceback says the JSON was unparseable, and nothing anywhere says which model produced it.
+    That is exactly the case this exists for — a model that degenerates mid-reply
+    (a run of the same character until it hits its own output ceiling, truncating the JSON)
+    is a fault of one model on one tier, and it can't be attributed without knowing which tier served the call.
+
+    The reply's length rides along because it is the cheapest possible tell for that failure:
+    a decision reply is a couple of hundred characters, and one at the output ceiling is degenerate on its face.
+
+    One line per call, at the rung that answered — so a fall-through reads as two lines, not one,
+    and the last of them is always the model whose words the symbiot actually got.
+    """
+    log.info("generative call served by %s/%s — %d chars back", provider, model_name, len(body))
+    return body
+
+
 def _summarise(context: str, target_tokens: int, model_name: str) -> str:
     """Condense `context` to about `target_tokens` tokens, keeping its facts, and guarantee the cap.
 
-    One free-text call asks the model to drop redundancy and elaboration while keeping the concrete facts,
-    names, dates, and numbers a diary answer turns on.
-    It calls the boundary directly, bypassing _fit, so a large context can't recurse into fitting itself,
+    One call asks the model to drop redundancy and elaboration while keeping the concrete facts,
+    names, dates, and numbers a diary answer turns on, and takes the result back as a validated _SummaryReply.
+    It calls the tiers directly, bypassing _fit, so a large context can't recurse into fitting itself,
     and it is sent raw — the model accepts more than its optimal even where it reads that much less well.
     Temperature is 0, as for every call through this boundary — a condensation wants to be faithful and reproducible, not warm.
     The output ceiling is raised toward `target_tokens`: this call legitimately needs room up to its whole target,
@@ -597,17 +643,65 @@ def _summarise(context: str, target_tokens: int, model_name: str) -> str:
     A summariser can still overshoot the length it was asked for,
     so the result is truncated to `target_tokens`,
     making the budget a promise the guard keeps rather than a request the model may ignore.
+    That truncation is also why the schema's few tokens of wrapper cost nothing that matters:
+    the ceiling bounds what the model may say, and the guard bounds what is kept regardless.
     """
     prompt = (
         f"Condense the following notes to at most about {target_tokens} tokens. "
         "Keep every concrete fact, name, date, and number; drop only redundancy and elaboration. "
-        "Return only the condensed notes, nothing else.\n\n"
+        "Put the condensed notes in the `summary` field — "
+        "their text only, with no preamble, heading, or code fence.\n\n"
         f"{context}"
     )
-    summary = _call(
-        model=model_name, prompt=prompt, temperature=0, max_output_tokens=target_tokens
+    reply = _call(
+        model=model_name,
+        prompt=prompt,
+        schema=_SummaryReply,
+        temperature=0,
+        max_output_tokens=target_tokens,
     )
-    return models.truncate_tokens(summary, target_tokens)
+    return models.truncate_tokens(
+        _SummaryReply.model_validate_json(reply).summary, target_tokens
+    )
+
+
+def _thinking_level(model_name: str) -> str:
+    """The thinking level to send a Gemini model — always its lowest, since these bounded calls never want a trace.
+
+    Google made reasoning mandatory on the 3.x models: unlike Scaleway's "none", it cannot be turned off at all,
+    only turned down. So each Gemini model runs at the floor it allows —
+    the Flash models accept MINIMAL, and the Pro's own floor is LOW (it rejects MINIMAL) —
+    the same shape as _reasoning_effort's gpt-oss exception, keyed by name so the value is always one the model accepts.
+    """
+    return "MINIMAL" if "flash" in model_name else "LOW"
+
+
+def _wire_schema(schema: type[BaseModel]) -> type[BaseModel]:
+    """The caller's schema as a provider should see it: the shape, with our own prose stripped off.
+
+    Every schema at this boundary is a Pydantic model whose docstring explains — to a *reader* — why the model exists:
+    that its shape never depends on the pool, that an empty list would be a mis-read, what the field guards against.
+    That is the kernel's own convention, and it belongs in the source.
+    But Pydantic puts a class's docstring in its JSON Schema as the object's `description`,
+    and each SDK's structured-output mechanism forwards that description to the model as part of the grammar —
+    so prose written for a maintainer was reaching the decoder as instructions,
+    billed on every call and read as guidance on none of the model's business.
+    In one case it was worse than noise: the fold's docstring names the very preamble the schema exists to prevent,
+    so the model was being handed the exact string we do not want back.
+
+    Stripping happens here rather than on each of the models, for the same reason the validation does:
+    one law at the boundary cannot be forgotten by the next schema someone writes.
+    It is done by building a twin that inherits the caller's shape and carries no docstring,
+    which keeps every tier's documented entry point intact — each still receives a Pydantic model class,
+    not a hand-rolled dict — while the description simply is not there to forward.
+    The twin is what goes on the wire; the caller's own model is still what validates the reply (generate_json),
+    so field-level constraints and any `Field(description=...)` a caller wrote *for* the model are untouched.
+    A schema with no docstring — every one built per call by create_model — is handed back as it came,
+    since there is nothing to strip and no twin worth building.
+    """
+    if not (schema.__doc__ or "").strip():
+        return schema
+    return create_model(schema.__name__, __base__=schema, __doc__=None)
 
 
 def generate(

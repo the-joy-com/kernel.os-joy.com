@@ -44,10 +44,41 @@ def close_pool() -> None:
 
 
 def get_conn():
-    """A pooled connection for the request,
-    committed on success and rolled back on error when the `with` block closes after the response."""
+    """A pooled connection for the request, in autocommit — so nothing a route writes is still pending when it answers.
+
+    The subtlety this exists to fix, and it is the sort that hides.
+    A FastAPI dependency that yields runs the code *after* its yield when the dependency unwinds,
+    and that unwinding happens after the response has already gone out.
+    So a connection whose transaction closed there would commit *after* the shell had its reply in hand —
+    leaving a window in which the shell holds an acknowledgement for a write no other connection can see yet,
+    and a second request made inside that window reads the state as it was before.
+    Measured on the reminder routes, roughly half of back-to-back read-after-writes fell in it.
+    Which is corrosive wherever the shell acts on what a reply told it:
+    the reminders listing hands out display positions, so a reply one change stale points at the wrong row.
+
+    Autocommit closes the window at the root rather than route by route:
+    each statement commits as it runs, so by the time a handler returns there is nothing pending at all,
+    and every route gets the same guarantee without having to remember it.
+
+    A route or a store function that needs several statements to land together says so —
+    `with conn.transaction():` — which under autocommit is a real transaction that commits at the block's end,
+    still before the handler returns
+    (the /intake route's message-and-mirror pair and identity.verify_login_code are where that matters).
+    Nested inside a caller's own transaction it degrades to a savepoint,
+    so the same store functions stay correct when a worker calls them instead of a route.
+
+    Autocommit is set on the borrowed connection rather than on the pool, and restored on the way back,
+    because the pool is shared with the background workers —
+    and their `_process_one` leans on the implicit transaction to commit a reply and its conversation row together.
+    A leaked autocommit would quietly take that guarantee away from them.
+    """
     with get_pool().connection() as conn:
-        yield conn
+        previous = conn.autocommit
+        conn.autocommit = True
+        try:
+            yield conn
+        finally:
+            conn.autocommit = previous
 
 
 def get_pool() -> ConnectionPool:

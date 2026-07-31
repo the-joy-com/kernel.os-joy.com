@@ -45,7 +45,7 @@ def test_executor_stores_a_reminder_exactly_once_against_the_message(client):
     with db.get_pool().connection() as conn:
         first = tools.execute(conn, decision, SEEDED_SYMBIOT_ID, intake_id, now, "Europe/Paris")
         second = tools.execute(conn, decision, SEEDED_SYMBIOT_ID, intake_id, now, "Europe/Paris")
-    assert first.effected and second.effected
+    assert first.outcome == "ACTED" and second.outcome == "ACTED"
     with db.get_pool().connection() as conn:
         count = conn.execute("SELECT count(*) FROM reminder WHERE intake_id = %s", (intake_id,)).fetchone()[0]
     # A retried message re-runs the executor; the UNIQUE intake_id makes the second write a no-op.
@@ -60,8 +60,25 @@ def test_executor_asks_rather_than_guesses_when_the_time_is_unclear(client):
         result = tools.execute(conn, decision, SEEDED_SYMBIOT_ID, intake_id, now, "UTC")
         stored = conn.execute("SELECT count(*) FROM reminder WHERE intake_id = %s", (intake_id,)).fetchone()[0]
     # No clear time: nothing is stored, and the result asks rather than confirming (the reactive-ambiguity law).
-    assert result.effected is False
+    assert result.outcome == "UNCLEAR"
     assert stored == 0
+
+
+def test_executor_refuses_a_time_already_gone_rather_than_asking_for_it_again(client):
+    intake_id = _intake()
+    fire_at = datetime(2026, 7, 13, 9, 0, tzinfo=timezone.utc)  # the day before the `now` below
+    decision = tools.Decision("schedule_reminder", {"reminder_message": "call the dentist", "fire_at": fire_at})
+    now = datetime(2026, 7, 14, 9, 0, tzinfo=timezone.utc)
+    with db.get_pool().connection() as conn:
+        result = tools.execute(conn, decision, SEEDED_SYMBIOT_ID, intake_id, now, "UTC")
+        stored = conn.execute("SELECT count(*) FROM reminder WHERE intake_id = %s", (intake_id,)).fetchone()[0]
+    # UNABLE rather than UNCLEAR, and the distinction is the whole point:
+    # a human asked when they want it instead answers with the moment they already named,
+    # so asking about a past time is a question that can never be answered and an exchange that never ends.
+    assert result.outcome == "UNABLE"
+    assert stored == 0
+    # The reading is named back, so the other case — a bare UTC instant mis-stamped hours early — is visible to correct.
+    assert "Monday 13 July 2026 at 09:00" in result.summary
 
 
 def test_claim_due_takes_a_reminder_whose_moment_has_come_and_leaves_a_future_one(client):

@@ -5,7 +5,8 @@ and the conversation module (conversation.py) gathers the short-term thread the 
 this module speaks.
 It folds four things into one prompt — the machine symbiot's head (the truth-rules preamble, then the persona that is its voice),
 the diary facts (long-term memory), the recent conversation (short-term memory, the Gist then the verbatim tail),
-and the message itself — and hands them to the free-text model path (llm.generate) for a reply in that voice.
+and the message itself — and hands them to the model boundary (llm.generate_json) for a reply in that voice,
+taken back as a validated _SpokenReply so that only the words to say can come across and no preamble rides along.
 The head leads the prompt for a second reason beside speaking first:
 it is the byte-identical, cacheable prefix a caching provider bills once,
 so it must sit ahead of everything that changes call to call (see persona.head).
@@ -28,6 +29,8 @@ the honest answer when there is nothing on record and nothing yet said to lean o
 """
 
 from datetime import datetime
+
+from pydantic import BaseModel, Field
 
 from core import config
 from services.adapters import llm, models
@@ -66,7 +69,9 @@ def _compose_prompt(message: str, memory_block: str, head: str, time_line: str |
         f"{now}"
         f"{memory_block}\n\n"
         f'The human symbiot just said:\n"{message}"\n\n'
-        "Reply in your own voice — directly, as yourself, not as an assistant describing what it found."
+        "Reply in your own voice — directly, as yourself, not as an assistant describing what it found. "
+        "Put the reply in the `reply` field — the words you would say and nothing else, "
+        "with no preamble, heading, or code fence around them."
     )
 
 
@@ -117,6 +122,22 @@ def _render_tail(tail: list[conversation.Turn], zone_name: str) -> str:
     )
 
 
+class _SpokenReply(BaseModel):
+    """The composed answer: the words to say, and nothing wrapped around them.
+
+    A plain module-level model — its shape is fixed at a single string, with nothing per-call to fold in.
+    The reply crosses the boundary held to a schema rather than as free text
+    because what comes back is spoken to the symbiot verbatim:
+    an "Of course! Here's my reply:" opener, a heading, or a ``` fence has no field to land in,
+    where in free text it would simply be part of the answer and reach them as the machine's own words.
+    That the prompt also asks for the words alone is not the same guarantee —
+    an instruction is a request the model may ignore, and the field is a shape it cannot.
+    `min_length=1` is folded into the decoder grammar and re-checked on the way back:
+    an empty reply would reach the symbiot as silence, which is a mis-read, not an answer."""
+
+    reply: str = Field(min_length=1)
+
+
 def compose(
     message: str,
     context: list[retrieval.Fact],
@@ -128,7 +149,7 @@ def compose(
     """Compose the reply to `message`, drawing on the long-term facts in `context` and the short-term thread in `conv`.
 
     Loads the persona, assembles everything the reply remembers — the diary facts, the Gist, and the verbatim tail —
-    into one compressible context block, and calls the free-text model path for the answer.
+    into one compressible context block, and calls the model boundary for the answer, held to _SpokenReply.
     That memory block is the sole region the budget guard may condense if the prompt would overrun the model's window (llm._fit):
     the persona, the framing instructions, and the current message bracket it and are never shrunk.
     So the reply degrades gracefully — it condenses what it remembers, never who it is or what was just said —
@@ -157,4 +178,6 @@ def compose(
     # The reply's model is resolved from the store by role (models.role_name), not read from a config constant,
     # so an operator's reassignment through /models takes effect here — resolved in the parent and, when this
     # runs in a spawned child, from the store the child loads for itself.
-    return llm.generate(prompt, model=models.role_name("reply"), context=memory_block)
+    return llm.generate_json(
+        prompt, _SpokenReply, model=models.role_name("reply"), context=memory_block
+    ).reply

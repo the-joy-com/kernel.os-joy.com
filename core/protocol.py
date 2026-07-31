@@ -30,6 +30,7 @@ ANSWER_READY = "answer"  # answered — the reply is in data.answer
 ANSWER_UNKNOWN = "unknown"  # no message carries that id
 ABANDONED_NOTICE = "no joy"  # the line the shell shows when a message is abandoned — retry budget spent, negative outcome
 COPY = "roger"  # POST /intake — received all your last, durably written down (not the answer, which comes later)
+UNABLE = "unable"  # the line the shell shows when intake refuses a transmission at the door (a 4xx) — received and declined, a hard no it does not retry; COPY's counterpart, the way "no joy" is "answer"'s
 REPLY = "reply"  # the push nudge's kind for a reply to the symbiot's own message — its outcome rides in status (an ANSWER_* word); the missive's counterpart is TRAFFIC_WAITING
 STANDIN_ANSWER_ANON = "authenticate"  # stand-in reply to a line with no live session — a stranger is answered without the symbiot's diary, and told to authenticate (a recognised symbiot gets a real reply composed off the diary, reply.py)
 
@@ -48,6 +49,10 @@ NOT_AUTHED = "not authenticated"  # GET /status — no live session
 
 # Notifications: the symbiot's per-channel enable/disable (authed only).
 NOTIFICATIONS = "notifications"  # GET/POST /notifications — the current per-channel state rides in data.channels
+
+# Reminders: the standing reminder set, read and operated on directly (authed only).
+REMINDERS = "reminders"  # GET /reminders and any successful POST — the full standing set rides in data.reminders, so the shell re-renders from one source
+REMINDERS_REFUSED = "that reminder change didn't take"  # POST /reminders — the change was refused (already fired, already called off, no such reminder); data.reason says why, alongside the unchanged set
 
 # Observe: the observability corner's read surface, one word per card (authed only).
 OBSERVE_ECHOES = "observe echoes"  # GET /observe/echoes — the scored redundancy rides in data (clusters, singles, scored)

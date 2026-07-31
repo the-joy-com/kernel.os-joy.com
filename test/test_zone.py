@@ -8,7 +8,8 @@ The store reads and the /timezone route (authed only) are exercised end to end a
 with the inference faked so no test makes a network call.
 """
 
-from datetime import date, datetime, timezone as dt_timezone
+from datetime import date, datetime, timedelta, timezone as dt_timezone
+from zoneinfo import ZoneInfo
 
 from core import db
 from core import protocol
@@ -71,6 +72,57 @@ def test_local_date_falls_back_to_utc_on_a_bad_zone():
     # A name that no longer resolves reads as the UTC day rather than raising, mirroring now_for's fallback.
     instant = datetime(2026, 7, 13, 13, 0, tzinfo=dt_timezone.utc)
     assert zone.local_date(instant, "Nowhere/Bogus") == date(2026, 7, 13)
+
+
+def test_parse_future_wall_clock_names_which_way_a_time_was_wrong():
+    now = datetime(2026, 7, 14, 20, 5, tzinfo=ZoneInfo("Europe/Paris"))
+    # A moment still ahead comes back with nothing to say about it.
+    ahead, refusal = zone.parse_future_wall_clock("+45m", now)
+    assert ahead == now + timedelta(minutes=45) and refusal is None
+    # The two failures are told apart, because they are different mistakes:
+    # a phrase outside the grammar was typed wrong, a moment already gone was aimed wrong.
+    unreadable, reason = zone.parse_future_wall_clock("tomorrow at nine", now)
+    assert unreadable is None and reason.startswith("couldn't read 'tomorrow at nine' as a time")
+    gone, gone_reason = zone.parse_future_wall_clock("19:00", now)
+    assert gone is None and gone_reason == "that time has already passed"
+
+
+def test_parse_future_wall_clock_only_suggests_forms_the_grammar_accepts():
+    # The hint lives next to the grammar so it can't go on advising a form the parser has stopped taking.
+    # That is the claim; this is it checked — every example the refusal offers must itself parse.
+    now = datetime(2026, 7, 14, 20, 5, tzinfo=ZoneInfo("Europe/Paris"))
+    _, reason = zone.parse_future_wall_clock("next week", now)
+    suggested = [said.removeprefix("or ") for said in reason.split("try ")[1].split(", ")]
+    assert len(suggested) == 3
+    for said in suggested:
+        assert zone.parse_wall_clock(said, now) is not None, said
+
+
+def test_parse_wall_clock_reads_a_span_from_now():
+    now = datetime(2026, 7, 14, 20, 5, tzinfo=ZoneInfo("Europe/Paris"))
+    assert zone.parse_wall_clock("+45m", now) == now + timedelta(minutes=45)
+    assert zone.parse_wall_clock("+2h", now) == now + timedelta(hours=2)
+    assert zone.parse_wall_clock("+3d", now) == now + timedelta(days=3)
+
+
+def test_parse_wall_clock_reads_the_face_of_the_clock_in_the_symbiots_zone():
+    now = datetime(2026, 7, 14, 20, 5, tzinfo=ZoneInfo("Europe/Paris"))
+    # A full date and time, and a bare time meaning today — both stamped with the symbiot's own zone,
+    # never an offset read off the text or off the box.
+    assert zone.parse_wall_clock("2026-08-01 09:30", now) == datetime(
+        2026, 8, 1, 9, 30, tzinfo=ZoneInfo("Europe/Paris")
+    )
+    assert zone.parse_wall_clock("21:15", now) == datetime(
+        2026, 7, 14, 21, 15, tzinfo=ZoneInfo("Europe/Paris")
+    )
+
+
+def test_parse_wall_clock_refuses_anything_outside_the_grammar():
+    now = datetime(2026, 7, 14, 20, 5, tzinfo=ZoneInfo("Europe/Paris"))
+    # The terse path spends no model call, so a phrase it can't read deterministically is refused,
+    # never guessed at — the caller surfaces that as a legible "try +45m, 20:05, …".
+    for said in ("tomorrow at nine", "next week", "+2 hours", "9pm", "2026-08-01", "", "+9999999h"):
+        assert zone.parse_wall_clock(said, now) is None, said
 
 
 def test_of_defaults_to_utc_until_a_zone_is_set(client):

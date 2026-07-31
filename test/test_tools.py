@@ -4,12 +4,16 @@ The embedding and the model are the two parts that reach off the box, so both ar
 what the tests pin is the machinery around them —
 that the catalog is derived from the code registry and kept in sync,
 that the search surfaces a candidate by meaning or by wording and is empty (and cheap) when nothing fits,
-and that the decision returns a named tool with its arguments or an honest "none".
+that the decision returns a named tool with its arguments or an honest "none",
+and that every outcome the seam can speak has a line written for it — and an unwritten one breaks in the open.
+That last pair is what let REPORTED be added later as one tuple entry and one table row, with nothing else to remember.
 The live inference and the end-to-end fork are the by-hand smoke's to prove (test/qa/0007).
 """
 
 import types
 from datetime import datetime, timezone
+
+import pytest
 
 from core import db
 from services.tools import tools
@@ -34,7 +38,7 @@ def test_reconcile_inserts_a_descriptor_and_embedding_per_registered_tool(client
         tools.reconcile_catalog(conn)
         rows = conn.execute("SELECT count(*) FROM tool_catalog").fetchone()[0]
         embeds = conn.execute("SELECT count(*) FROM active_tool_embedding").fetchone()[0]
-    # One descriptor row and one embedding per tool the code registry carries (the reminder, today).
+    # One descriptor row and one embedding per tool the code registry carries (the reminder's four, today).
     assert rows == len(tools.REGISTRY)
     assert embeds == len(tools.REGISTRY)
     assert "schedule_reminder" in tools.REGISTRY
@@ -125,6 +129,25 @@ def test_decide_names_the_tool_and_extracts_its_arguments(monkeypatch):
     decision = tools.decide("remind me to call the dentist at 9", candidates, [], fire_at, "UTC")
     assert decision.tool == "schedule_reminder"
     assert decision.args == {"reminder_message": "call the dentist", "fire_at": fire_at, "channels": None}
+
+
+def test_every_outcome_has_a_confirmation_instruction():
+    # Walk the vocabulary:
+    # a word the seam can speak but nothing knows how to say would sit in the code unnoticed
+    # until a message produced it.
+    for outcome in tools.ALL_OUTCOMES:
+        assert outcome in tools._CONFIRM_INSTRUCTIONS, f"no confirmation instruction for {outcome}"
+    # And nothing beyond the vocabulary has a line, so the table and the words stay the one set.
+    assert set(tools._CONFIRM_INSTRUCTIONS) == set(tools.ALL_OUTCOMES)
+
+
+def test_an_unwritten_outcome_breaks_loudly_rather_than_speaking_as_another():
+    # The table has no fallback row on purpose: better to break in the open
+    # than to speak an unwritten outcome as one of the outcomes that do have a line.
+    now = datetime(2026, 7, 14, 9, 0, tzinfo=timezone.utc)
+    result = tools.ToolResult(outcome="INVENTED", summary="something the code has no line for")
+    with pytest.raises(KeyError):
+        tools._confirm_prompt("do the thing", result, "head", now, "UTC")
 
 
 def test_decide_returns_no_tool_when_the_model_declines(monkeypatch):

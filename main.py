@@ -32,6 +32,7 @@ from services.memory import ontology_gc
 from services.memory import presence
 from services.adapters import push
 from services.loop import notify
+from services.tools import reminder
 from services.tools import tools
 from services.loop import worker
 from services.loop import zone
@@ -42,6 +43,9 @@ from core.dtos import (
     ModelConfigRequest,
     NotificationPreferenceRequest,
     PushSubscriptionRequest,
+    ReminderCancelRequest,
+    ReminderCreateRequest,
+    ReminderUpdateRequest,
     SeenRequest,
     TimezoneRequest,
     VerifyRequest,
@@ -379,8 +383,8 @@ def intake(
     # FastAPI validates the body against the DTO;
     # we persist it as one 'received' row *before* answering, so "roger" now means
     # *The Joy has it, durably* — not "saw it and dropped it", as it did before.
-    # The write commits in lockstep with this response
-    # (db.get_conn commits the request's transaction on success),
+    # The write is committed before this response is composed
+    # (the request's connection runs in autocommit — see db.get_conn),
     # so the acknowledgement can never outrun the durable record behind it.
     # One row per request, never the lines within: a reconnect arrives as one batch
     # (the outbox joins its queued lines with newlines),
@@ -392,14 +396,19 @@ def intake(
     # We stamp that on the row so the worker can answer by it later;
     # the shell can't assert identity, only the token proves it.
     symbiot_id = identity.authenticated_symbiot_id(conn, token)
-    message_id = record_message(conn, body.line, body.reply_channel_id, symbiot_id)
-    # Mirror a recognised symbiot's line onto the conversation stream,
-    # in the same transaction as the intake row so the two commit together and the stream row points at the durable words.
-    # Only an authed line: the conversation is the symbiot's, the same boundary the diary keeps,
+    # The intake row and the conversation mirror are declared as one transaction, out loud.
+    # Under autocommit each statement would otherwise commit on its own,
+    # and a mirror that raised would leave the message durable, the stream row missing, and a 500 on the wire —
+    # which the shell's drain reads as a non-receipt and retries,
+    # writing the same words a second time (the outbox's exactly-once pin is the reminder's, not the message's).
+    # Together, a failed mirror takes the message down with it, and the retry lands the pair.
+    # The mirror is an authed line only: the conversation is the symbiot's, the same boundary the diary keeps,
     # so an anonymous caller adds nothing to a short-term memory that isn't theirs.
     # The reply to this line joins the stream later, when the worker marks it answered (worker._process_one).
-    if symbiot_id is not None:
-        conversation.record_utterance(conn, symbiot_id, "symbiot", body.line, intake_id=message_id)
+    with conn.transaction():
+        message_id = record_message(conn, body.line, body.reply_channel_id, symbiot_id)
+        if symbiot_id is not None:
+            conversation.record_utterance(conn, symbiot_id, "symbiot", body.line, intake_id=message_id)
     logs.get("intake").info("intake — %d line(s)", body.line.count("\n") + 1)
     # Hand back the row's id: the batch crossed the wire with no identity of its own,
     # so this is the handle the shell keeps to ask /answers, later, what became of it.
@@ -509,7 +518,7 @@ def set_models(
             model_config.set_role(conn, body.role, body.model)
     except model_config.ModelConfigError as exc:
         return envelope(protocol.MODEL_REFUSED, {**_models_state(conn), "reason": str(exc)})
-    # The write is committed when this connection's `with` block closes after the response; refresh the
+    # The write is already committed (the request's connection runs in autocommit — see db.get_conn); refresh the
     # resolver cache from the same connection now so the parent resolves the new config on the very next call.
     models.reload_from_conn(conn)
     return envelope(protocol.MODELS, _models_state(conn))
@@ -638,18 +647,26 @@ def observe_reminders(
     so a caller with no live session is turned away with NOT_AUTHED.
     fire_at and created_at are rendered in the symbiot's own zone — the same clock the reminder was set on —
     so the shell prints ready labels rather than re-deriving the local time itself.
+    The declines ride alongside: the times the machine refused to set a reminder it judged already held.
+    That is the one decision it takes on its own judgment rather than on the symbiot's words,
+    and it writes no reminder by design,
+    so without this the card would be blind to exactly the judgment most worth watching.
     """
     symbiot_id = identity.authenticated_symbiot_id(conn, token)
     if symbiot_id is None:
         return envelope(protocol.NOT_AUTHED, {"authed": False})
     zone_name = zone.of(conn, symbiot_id)
     reminders = observe.recent_reminders(conn, symbiot_id)
+    declines = observe.recent_declines(conn, symbiot_id)
     return envelope(
         protocol.OBSERVE_REMINDERS,
         {
             "reminders": [
                 {
+                    # id: the reminder's own handle, so a line on the card can be spoken about and acted on.
+                    "id": r.reminder_id,
                     # trigger: the human line the reminder was scheduled from — the pairing this card exists to show.
+                    # Null for one the symbiot typed in directly, which had no line behind it.
                     "trigger": r.trigger,
                     # body: the line to be said back when the reminder fires.
                     "body": r.body,
@@ -657,12 +674,27 @@ def observe_reminders(
                     "fire_at": zone.local(r.fire_at, zone_name).strftime("%a %d %b %Y, %H:%M"),
                     # created_at: when it was scheduled, same clock — so a suspicious pairing can be placed in time.
                     "created_at": zone.local(r.created_at, zone_name).strftime("%a %d %b %Y, %H:%M"),
-                    # fired: whether it has already been delivered, so a pending reminder reads apart from a spent one.
-                    "fired": r.fired,
+                    # state: pending, fired, or cancelled — so a spent one and a called-off one read apart.
+                    "state": r.state,
                     # channels: where it is delivered, or null when the symbiot named none and it rides every channel.
                     "channels": r.channels,
                 }
                 for r in reminders
+            ],
+            "declines": [
+                {
+                    # id: the standing reminder the judge matched, so a decline reads against the reminder above it.
+                    "id": d.reminder_id,
+                    # asked: the human line that asked for a reminder the machine judged already held.
+                    "asked": d.asked,
+                    # held: the line of the reminder it matched that against — the other half of the evidence.
+                    "held": d.held,
+                    # fire_at: when the reminder it matched is due, on the symbiot's own clock.
+                    "fire_at": zone.local(d.fire_at, zone_name).strftime("%a %d %b %Y, %H:%M"),
+                    # created_at: when the refusal was made, same clock.
+                    "created_at": zone.local(d.created_at, zone_name).strftime("%a %d %b %Y, %H:%M"),
+                }
+                for d in declines
             ],
         },
     )
@@ -693,6 +725,183 @@ def push_subscribe(
         conn, body.endpoint, body.keys.p256dh, body.keys.auth, symbiot_id
     )
     return envelope(protocol.SUBSCRIBED, {"id": channel_id})
+
+
+def _reminders_state(conn, symbiot_id: int) -> dict:
+    """The standing reminder set the shell renders — the live ones soonest first, then the last few that settled.
+
+    Returned by every /reminders response (the read, a successful write, and a refusal alike),
+    so the shell always re-renders from one source rather than trusting what it thinks it changed —
+    the same stance /models and /notifications take.
+    fire_at is rendered in the symbiot's own zone, the clock the reminder was set on,
+    so the shell prints a ready label rather than re-deriving the local time itself.
+    Each reminder carries its real id, which is the handle every write comes back with:
+    the shell prints positions, holds the ids, and sends the ids.
+    What the reminder *is* — its state among the two stamps it is read from — is settled in the module
+    that owns the row (reminder.standing);
+    what is left here is the rendering, which is this layer's to do.
+    """
+    zone_name = zone.of(conn, symbiot_id)
+    rows = reminder.standing(
+        conn, symbiot_id, config.REMINDER_LISTING_LIMIT, config.REMINDER_LISTING_SETTLED
+    )
+    return {
+        "reminders": [
+            {
+                # id: the real handle — what a cancel or an edit names, never the printed position.
+                "id": r.reminder_id,
+                # body: the line to be said back when it fires.
+                "body": r.body,
+                # fire_at: when it is (or was) due, on the symbiot's own clock.
+                "fire_at": zone.local(r.fire_at, zone_name).strftime("%a %d %b %Y, %H:%M"),
+                # channels: where it is delivered, or null when the symbiot named none and it rides every channel.
+                "channels": r.channels,
+                # state: one word rather than two stamps, since a listing prints one line per reminder —
+                # pending is the live set, fired has been delivered, cancelled was called off and never will be.
+                "state": r.state,
+            }
+            for r in rows
+        ],
+        "timezone": zone_name,
+    }
+
+
+@app.get("/reminders")
+def read_reminders(
+    conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)
+) -> dict:
+    """Report the symbiot's standing reminder set — authed only, the /reminders command's read.
+
+    The first thing in the kernel that lets anything at all read the reminders the machine is currently holding.
+    Until this route the reminder's lifecycle was one-way: born from a sentence, fired, done,
+    with nothing able to look at the set in between.
+    Authed-gated like /timezone and /notifications, and for the same reason:
+    a reminder belongs to a particular symbiot, so there is no anonymous version to serve.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    return envelope(protocol.REMINDERS, _reminders_state(conn, symbiot_id))
+
+
+@app.post("/reminders")
+def add_reminder(
+    body: ReminderCreateRequest,
+    conn=Depends(db.get_conn),
+    token: str | None = Depends(bearer_token),
+) -> dict:
+    """Store a reminder typed straight in — authed only, the /reminders command's `add`.
+
+    The terse way in, beside the plain-language one the tool seam travels.
+    It exists because when what the symbiot wants is already unambiguous,
+    sending it through reasoning is slower, costs tokens,
+    and leaves room to misread an instruction that had no ambiguity in it —
+    so this path spends no model call at all.
+    The time is parsed deterministically and kernel-side (zone.parse_future_wall_clock):
+    kernel-side because the browser's clock and the zone the symbiot named can disagree, and the zone is truth;
+    deterministically because a closed grammar is exactly what makes the model call unnecessary.
+    A time outside the grammar, or one that isn't in the future, comes back refused with a legible reason
+    the route prints as it is — worded next to the grammar it describes, so it can't drift from what is accepted.
+    A reminder made this way carries no triggering message, and needs none:
+    the exactly-once pin guards a *retried message*, and there is no message here to retry.
+
+    The write has landed by the time the set is read back below,
+    and that is the request connection's doing rather than this route's (db.get_conn runs it in autocommit) —
+    which matters here more than anywhere,
+    because the shell resolves the positions it prints against exactly this reply,
+    so a set one change behind would have it name the wrong reminder.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    zone_name = zone.of(conn, symbiot_id)
+    now_local = zone.now_for(zone_name)
+    fire_at, unreadable = zone.parse_future_wall_clock(body.when, now_local)
+    if unreadable is not None:
+        return envelope(
+            protocol.REMINDERS_REFUSED,
+            {**_reminders_state(conn, symbiot_id), "reason": unreadable},
+        )
+    said = body.say.strip()
+    if not said:
+        return envelope(
+            protocol.REMINDERS_REFUSED,
+            {**_reminders_state(conn, symbiot_id), "reason": "a reminder needs something to say"},
+        )
+    reminder.create(conn, symbiot_id, said, fire_at)
+    return envelope(protocol.REMINDERS, _reminders_state(conn, symbiot_id))
+
+
+@app.post("/reminders/cancel")
+def cancel_reminder(
+    body: ReminderCancelRequest,
+    conn=Depends(db.get_conn),
+    token: str | None = Depends(bearer_token),
+) -> dict:
+    """Call a reminder off — authed only, the /reminders command's `rm`.
+
+    The row is stamped, never deleted: a reminder called off is recorded,
+    so the symbiot sees they called it off rather than finding a gap where it was.
+    The write is scoped in the statement itself — this symbiot's, unfired, uncancelled —
+    so a reminder that fired in the moment between the listing being printed and this arriving is refused
+    rather than re-stamped, and the reason says which of those it was (reminder.refusal_reason).
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    cancelled = reminder.cancel(conn, symbiot_id, body.id)
+    if cancelled:
+        return envelope(protocol.REMINDERS, _reminders_state(conn, symbiot_id))
+    return envelope(
+        protocol.REMINDERS_REFUSED,
+        {
+            **_reminders_state(conn, symbiot_id),
+            "reason": reminder.refusal_reason(conn, symbiot_id, body.id),
+        },
+    )
+
+
+@app.post("/reminders/update")
+def update_reminder(
+    body: ReminderUpdateRequest,
+    conn=Depends(db.get_conn),
+    token: str | None = Depends(bearer_token),
+) -> dict:
+    """Move a live reminder's time, change its line, or both — authed only, the /reminders command's `at` and `say`.
+
+    Two verbs on one route, because they are one write: an absolute value into a column, or into both.
+    The time, when one is given, is read by the same deterministic grammar `add` uses, in the symbiot's own zone.
+    Scoped like the cancel above, and refused the same way with the same legible reason.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    said = body.say.strip() if body.say is not None else None
+    if not said and body.when is None:
+        return envelope(
+            protocol.REMINDERS_REFUSED,
+            {**_reminders_state(conn, symbiot_id), "reason": "nothing to change — name a new time, a new line, or both"},
+        )
+    fire_at = None
+    if body.when is not None:
+        zone_name = zone.of(conn, symbiot_id)
+        now_local = zone.now_for(zone_name)
+        fire_at, unreadable = zone.parse_future_wall_clock(body.when, now_local)
+        if unreadable is not None:
+            return envelope(
+                protocol.REMINDERS_REFUSED,
+                {**_reminders_state(conn, symbiot_id), "reason": unreadable},
+            )
+    updated = reminder.update(conn, symbiot_id, body.id, body=said or None, fire_at=fire_at)
+    if updated:
+        return envelope(protocol.REMINDERS, _reminders_state(conn, symbiot_id))
+    return envelope(
+        protocol.REMINDERS_REFUSED,
+        {
+            **_reminders_state(conn, symbiot_id),
+            "reason": reminder.refusal_reason(conn, symbiot_id, body.id),
+        },
+    )
 
 
 @app.get("/status")

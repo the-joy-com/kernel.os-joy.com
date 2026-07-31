@@ -126,9 +126,9 @@ def main() -> None:
                 "SELECT body, fire_at FROM reminder WHERE intake_id = %s", (intake_id,)
             ).fetchone()
             print(f"\n=== the act ===")
-            print(f"  effected  : {result.effected}")
+            print(f"  outcome   : {result.outcome}")
             print(f"  stored    : body={stored[0]!r}  fire_at={stored[1].astimezone(now_local.tzinfo).isoformat()}")
-            assert result.effected, "the executor should have scheduled the reminder"
+            assert result.outcome == "ACTED", "the executor should have scheduled the reminder"
             print("  ✓ the reminder is in the store, at the resolved instant")
 
             # --- 4. speak: the confirmation, live ----------------------------------------------
@@ -147,7 +147,7 @@ def main() -> None:
             )
             due = reminder.claim_due(conn)
             assert due is not None, "the backdated reminder should now be due"
-            reminder_id, due_symbiot, due_body = due
+            reminder_id, due_symbiot, due_body, _due_channels = due
             missive_id = missive.raise_for(conn, due_symbiot, due_body)
             conversation.record_utterance(conn, due_symbiot, "machine", due_body, missive_id=missive_id)
             reminder.mark_fired(conn, reminder_id)

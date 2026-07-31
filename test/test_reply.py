@@ -2,10 +2,10 @@
 
 The composer's job is to fold four things — the persona's voice, the diary facts (long-term memory),
 the recent conversation (short-term memory, the Gist then the verbatim tail), and the message —
-into one prompt and hand it to the free-text model path.
+into one prompt and hand it to the model boundary, which answers with a validated _SpokenReply.
 Two of those are sacred and never marked summarisable — the persona and the live message;
 everything the reply remembers (diary + Gist + tail) is assembled into the one compressible context block.
-So the persona load and llm.generate are faked,
+So the persona load and llm.generate_json are faked (see _capture),
 and the assertions are about what reaches the model: the voice, the dated facts, the conversation, the message,
 and that the summarisable region is exactly the remembered block — never the persona or the message.
 """
@@ -26,15 +26,21 @@ def _convo(gist=None, tail=()) -> conversation.Conversation:
     return conversation.Conversation(gist=gist, tail=list(tail))
 
 
+def _capture(monkeypatch, captured, text="ok"):
+    # Stand in for the model boundary: record everything that reached it,
+    # and answer with a valid _SpokenReply rather than a bare string —
+    # the same shape compose unwraps, so these tests exercise that unwrapping rather than bypassing it.
+    def fake_generate_json(prompt, schema, *, model=None, context=None):
+        captured.update(prompt=prompt, schema=schema, model=model, context=context)
+        return schema(reply=text)
+
+    monkeypatch.setattr(reply.llm, "generate_json", fake_generate_json)
+
+
 def test_compose_folds_persona_facts_and_message_into_the_prompt(monkeypatch):
     monkeypatch.setattr(reply.persona, "load", lambda: "MACHINE VOICE")
     captured = {}
-
-    def fake_generate(prompt, *, model=None, context=None):
-        captured.update(prompt=prompt, model=model, context=context)
-        return "here is your answer"
-
-    monkeypatch.setattr(reply.llm, "generate", fake_generate)
+    _capture(monkeypatch, captured, "here is your answer")
     facts = [
         _fact(1, "boxing with Jeremy", datetime(2026, 7, 10, tzinfo=timezone.utc), rank=0.9),
         _fact(2, "I live in Strasbourg", datetime(2026, 7, 1, tzinfo=timezone.utc), rank=0.5),
@@ -59,10 +65,7 @@ def test_compose_orders_diary_facts_oldest_first_regardless_of_relevance(monkeyp
     # so the model reads position as chronology rather than mistaking relevance rank for recency.
     monkeypatch.setattr(reply.persona, "load", lambda: "VOICE")
     captured = {}
-    monkeypatch.setattr(
-        reply.llm, "generate",
-        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt) or "ok",
-    )
+    _capture(monkeypatch, captured)
     facts = [  # relevance order: the newer fact ranked higher, so it arrives first
         _fact(1, "the newer thing", datetime(2026, 7, 10, tzinfo=timezone.utc), rank=0.9),
         _fact(2, "the older thing", datetime(2026, 7, 1, tzinfo=timezone.utc), rank=0.4),
@@ -79,10 +82,7 @@ def test_compose_folds_short_term_memory_gist_then_verbatim_tail(monkeypatch):
     # and it is part of the one compressible context block — diary and conversation alike.
     monkeypatch.setattr(reply.persona, "load", lambda: "VOICE")
     captured = {}
-    monkeypatch.setattr(
-        reply.llm, "generate",
-        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt, context=context) or "ok",
-    )
+    _capture(monkeypatch, captured)
     conv = _convo(
         gist="Earlier they told me about two projects.",
         tail=[
@@ -113,10 +113,7 @@ def test_compose_marks_the_whole_memory_summarisable_and_never_the_persona_or_me
     # the persona and the live message are sacred and never reach the summarisable context.
     monkeypatch.setattr(reply.persona, "load", lambda: "SACRED PERSONA VOICE")
     captured = {}
-    monkeypatch.setattr(
-        reply.llm, "generate",
-        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt, context=context) or "ok",
-    )
+    _capture(monkeypatch, captured)
     conv = _convo(
         gist="a summarised backstory",
         tail=[conversation.Turn(role="symbiot", text="a recent verbatim turn", created_at=datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc))],
@@ -142,10 +139,7 @@ def test_compose_states_the_symbiot_local_time_when_the_zone_is_known(monkeypatc
     # the prompt states that local time so the reply reasons about time in the human's day, not the server's UTC.
     monkeypatch.setattr(reply.persona, "load", lambda: "VOICE")
     captured = {}
-    monkeypatch.setattr(
-        reply.llm, "generate",
-        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt, context=context) or "ok",
-    )
+    _capture(monkeypatch, captured)
     now_local = datetime(2026, 7, 13, 18, 30, tzinfo=timezone.utc)
 
     reply.compose("what time is it?", [], _convo(), now_local=now_local, zone_name="Asia/Tokyo")
@@ -165,10 +159,7 @@ def test_compose_stamps_each_recent_turn_with_its_local_time(monkeypatch):
     # which is exactly why the stamp carries the weekday and not a bare clock.
     monkeypatch.setattr(reply.persona, "load", lambda: "VOICE")
     captured = {}
-    monkeypatch.setattr(
-        reply.llm, "generate",
-        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt) or "ok",
-    )
+    _capture(monkeypatch, captured)
     conv = _convo(tail=[
         conversation.Turn(
             role="symbiot", text="waiting at the laundromat",
@@ -188,10 +179,7 @@ def test_compose_omits_the_time_line_when_the_zone_is_unknown(monkeypatch):
     # the prompt asserts no time at all rather than a wrong one — the honest silence over a fabricated hour.
     monkeypatch.setattr(reply.persona, "load", lambda: "VOICE")
     captured = {}
-    monkeypatch.setattr(
-        reply.llm, "generate",
-        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt) or "ok",
-    )
+    _capture(monkeypatch, captured)
 
     reply.compose("hello", [], _convo())
 
@@ -204,10 +192,7 @@ def test_compose_over_an_empty_diary_and_no_conversation_still_composes_over_the
     # the persona and the message stay out of it.
     monkeypatch.setattr(reply.persona, "load", lambda: "VOICE")
     captured = {}
-    monkeypatch.setattr(
-        reply.llm, "generate",
-        lambda prompt, *, model=None, context=None: captured.update(prompt=prompt, context=context) or "ok",
-    )
+    _capture(monkeypatch, captured)
 
     reply.compose("hello there", [], _convo())
 

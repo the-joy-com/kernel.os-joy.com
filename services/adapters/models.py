@@ -211,6 +211,7 @@ BUILTIN_ROLES = {
     "enrich": config.ENRICH_MODEL,
     "tool_decision": config.TOOL_DECISION_MODEL,
     "tool_confirm": config.TOOL_CONFIRM_MODEL,
+    "tool_observation_judge": config.TOOL_OBSERVATION_JUDGE_MODEL,
     "conversation_compress": config.CONVERSATION_COMPRESS_MODEL,
 }
 

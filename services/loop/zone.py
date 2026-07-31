@@ -19,13 +19,20 @@ Switching zones is re-naming where you are;
 the store holds one zone per symbiot and the newest naming wins,
 so a symbiot that moves simply says so again.
 
+Reading a *time* the symbiot names happens two ways, and both land here.
+In the ordinary flow of talk the decision call reads it out of the sentence, against the local now this module hands it.
+On the terse command path there is no model call to spend, so parse_wall_clock reads a small closed grammar itself
+and refuses anything outside it — deterministic on purpose, because that path exists to skip the reasoning.
+Either way the law is the same one: read the face of the clock, stamp the symbiot's zone, never trust an offset.
+
 Why IANA names and not a fixed offset:
 an offset ('+02:00') can't know about the summer-time shift, so it would drift half the year.
 A zone name resolves to the correct offset for the instant it is read,
 which is exactly what now_for does — it is the one place a stored name becomes a concrete local moment.
 """
 
-from datetime import date, datetime
+import re
+from datetime import date, datetime, timedelta
 from zoneinfo import available_timezones, ZoneInfo
 
 from pydantic import BaseModel
@@ -134,6 +141,65 @@ def of(conn, symbiot_id: int) -> str:
     A row that somehow carries a blank still reads as the default, never empty."""
     row = conn.execute("SELECT timezone FROM symbiot WHERE id = %s", (symbiot_id,)).fetchone()
     return row[0] if row and row[0] else DEFAULT_ZONE
+
+
+def parse_future_wall_clock(text: str, now_local: datetime) -> tuple[datetime | None, str | None]:
+    """Read a typed time that has to still be ahead of the symbiot — the moment, or None and why not.
+
+    parse_wall_clock below says what the text names;
+    this is the rule the terse command path adds on top, since a reminder is for the future,
+    so a moment already gone means it was typed wrong.
+    It lives here, next to the grammar, because a refusal has to describe that grammar to be any use —
+    and a hint written anywhere else can go on advising a form the parser has stopped accepting,
+    with nothing to say it has drifted.
+    The two ways it fails are worth telling apart in the answer:
+    a text outside the grammar was typed wrong, a moment in the past was aimed wrong.
+    The reason comes back as plain words, ready to be printed as it is.
+    """
+    fire_at = parse_wall_clock(text, now_local)
+    if fire_at is None:
+        return None, f"couldn't read {text!r} as a time — try +45m, 20:05, or 2026-07-14 20:05"
+    if fire_at <= now_local:
+        return None, "that time has already passed"
+    return fire_at, None
+
+
+def parse_wall_clock(text: str, now_local: datetime) -> datetime | None:
+    """Read a time the symbiot typed into an absolute instant on their own clock, or None when it isn't one of the forms.
+
+    The deterministic half of reading time, beside infer's inferring half —
+    and the one the terse command path uses (the shell's /reminders),
+    where spending a model call is the thing that path exists to avoid:
+    an instruction that had no ambiguity in it shouldn't be sent through reasoning,
+    which is slower, costs tokens, and leaves room to misread it.
+    So the grammar is small and closed, and anything outside it comes back None to be refused flatly
+    rather than guessed at:
+      +45m, +2h, +3d      a span from now, in minutes, hours or days
+      2026-07-14 20:05    a plain wall-clock date and time
+      20:05               a bare time, meaning today
+    Kernel-side, not browser-side,
+    because the browser's clock and the zone the symbiot told the kernel it lives in can disagree,
+    and the zone is the ground truth.
+    The zone comes off now_local (now_for stamps it), so a bare face of the clock is read as the symbiot's own —
+    the same law the reminder's fire time follows: read the face, stamp the zone, never infer an offset.
+    Whether the instant is far enough in the future is not this function's rule to keep;
+    this only says what the text names, and parse_future_wall_clock above is where the terse path adds that rule.
+    """
+    said = text.strip()
+    relative = re.fullmatch(r"\+(\d{1,4})([mhd])", said)
+    if relative is not None:
+        span, unit = int(relative.group(1)), relative.group(2)
+        return now_local + {"m": timedelta(minutes=span), "h": timedelta(hours=span), "d": timedelta(days=span)}[unit]
+    for pattern in ("%Y-%m-%d %H:%M", "%H:%M"):
+        try:
+            read = datetime.strptime(said, pattern)
+        except ValueError:
+            continue
+        # A bare time names no date, so strptime dates it 1900-01-01; today is what the symbiot meant.
+        if pattern == "%H:%M":
+            read = read.replace(year=now_local.year, month=now_local.month, day=now_local.day)
+        return read.replace(tzinfo=now_local.tzinfo)
+    return None
 
 
 def render_now(now_local: datetime, zone_name: str) -> str:

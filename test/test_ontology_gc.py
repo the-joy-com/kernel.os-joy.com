@@ -167,7 +167,10 @@ def test_confirm_same_kind_reads_both_definitions(monkeypatch):
     assert fake.captured["json"]["reasoning_effort"] == llm._reasoning_effort(
         llm._scaleway_fallback(llm.models.role_name("rerank"))
     )  # thinking off, the per-model value — of the rung that answers, the rerank primary's Scaleway catch
-    assert _schema(fake) == ontology_gc._SameKindReply.model_json_schema()
+    # The shape the decoder is bound to is the caller's, with our own maintainer prose stripped (llm._wire_schema):
+    # the model's docstring explains the field to a reader, and has no business being read as an instruction.
+    assert _schema(fake) == llm._wire_schema(ontology_gc._SameKindReply).model_json_schema()
+    assert "description" not in _schema(fake)
 
 
 def test_confirm_same_kind_false_leaves_them_apart(monkeypatch):

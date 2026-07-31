@@ -125,10 +125,10 @@ def main() -> None:
                 result, stored = _store(conn, symbiot_id, fire_at, FIXED_NOW)
                 got = stored.strftime("%H:%M") if stored else None
                 if expected is None:
-                    ok = result.effected is False and stored is None
+                    ok = result.outcome == "UNCLEAR" and stored is None
                     verdict = "refused (past)" if ok else "STORED A PAST INSTANT"
                 else:
-                    ok = result.effected and got == expected
+                    ok = result.outcome == "ACTED" and got == expected
                     verdict = f"stored {got}" if ok else f"stored {got}, wanted {expected}"
                 print(f"  {'✓' if ok else '✗'} {label:32} emitted={fire_at!r} -> {verdict}")
                 assert ok, f"contract broken for '{label}': {verdict}"
@@ -144,7 +144,7 @@ def main() -> None:
             print(f"  emitted   : {decision.args.get('fire_at')!r}")
             assert decision.tool == "schedule_reminder", "the decision should name the reminder tool"
             result, stored = _store(conn, symbiot_id, decision.args.get("fire_at"), now_local)
-            assert result.effected and stored is not None, f"the reminder was not stored: {result.summary}"
+            assert result.outcome == "ACTED" and stored is not None, f"the reminder was not stored: {result.summary}"
             drift_min = (stored - target).total_seconds() / 60.0
             print(f"  stored    : {stored.isoformat()}  (target ~{target.strftime('%H:%M')}, drift {drift_min:+.1f} min)")
             assert stored > now_local, "the resolved instant is in the past — it would fire immediately"
