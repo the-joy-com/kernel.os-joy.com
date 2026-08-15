@@ -319,6 +319,7 @@ cp .env.example .env
 | --- | --- |
 | `DATABASE_URL` | Postgres connection. **Local:** `postgresql://joy:joy@localhost:5432/joy` (docker-compose). **Server:** `postgresql:///joy` — empty host = default socket = peer auth as the service's OS user. |
 | `TEST_DATABASE_URL` | Optional; the test suite's database. Defaults to `DATABASE_URL` with a `_test` suffix. |
+| `LOG_LEVEL` | Override; how much of the kernel tree reaches stdout (journalctl) and `kernel.log`. Default `INFO` — one line per thing the kernel did. `DEBUG` adds the per-call detail beneath it, chiefly which model answered each generative call (several per message, including the internal ones the `/observe` ledger doesn't keep). Turn it up to attribute an internal call, then back down. An unrecognised name is ignored and `INFO` stands. |
 | `SYMBIOT_EMAIL` | The one human allowed to log in, seeded at startup. |
 | `KERNEL_SECRET` | Server secret HMAC'ing codes + tokens. Generate with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. |
 | `GMAIL_CREDENTIALS_FILE`, `GMAIL_SENDER` | Gmail API service-account key path and the mailbox it sends as — see [Email (Gmail API)](#email-gmail-api). **Leave both blank to run mailboxless:** the login code is then written to `OTP_FILE` instead of emailed (see [Running fully local](#running-fully-local-no-cloud-api-no-gmail)). |

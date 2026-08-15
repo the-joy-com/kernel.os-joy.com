@@ -14,7 +14,7 @@ to `kernel.log.1`, so the log on disk can never grow past two files.
 
 A module wants two things from this file: call `configure()` once at startup,
 and `get("<area>")` for its logger. Nothing reaches for `logging` directly, so
-the format and the `kernel.` prefix live in one place.
+the format, the `kernel.` prefix, and the level all live in one place.
 """
 
 import logging
@@ -33,6 +33,20 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 1
 
+# How much of the tree reaches the two handlers.
+# INFO is the operator's level: what the kernel did, once per thing done.
+# DEBUG adds the per-call detail beneath it,
+# chiefly which model answered each generative call —
+# several lines per message, and the only place the internal calls are named at all,
+# since the durable ledger keeps only the ones made for a role (services.adapters.llm._served).
+# Raised through the environment, so reaching that detail on a box is a restart rather than an edit here.
+# An unrecognised name falls back to INFO rather than failing the boot:
+# a typo in .env should cost the operator a level, never the kernel its startup.
+LEVELS = {"CRITICAL", "DEBUG", "ERROR", "INFO", "WARNING"}
+LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+if LEVEL not in LEVELS:
+    LEVEL = "INFO"
+
 
 def configure() -> None:
     """Attach a timestamped stream and rotating-file handler to the `kernel` tree.
@@ -50,7 +64,7 @@ def configure() -> None:
     stream.setFormatter(formatter)
     rotating = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
     rotating.setFormatter(formatter)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(LEVEL)
     logger.addHandler(stream)
     logger.addHandler(rotating)
     logger.propagate = False

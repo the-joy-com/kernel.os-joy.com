@@ -672,17 +672,26 @@ def _served(provider: str, model_name: str, body: str) -> str:
     The reply's length rides along because it is the cheapest possible tell for that failure:
     a decision reply is a couple of hundred characters, and one at the output ceiling is degenerate on its face.
 
-    One line per call, at the rung that answered — so a fall-through reads as two lines, not one,
-    and the last of them is always the model whose words the symbiot actually got.
+    One line per call, at the rung that answered, and at DEBUG rather than INFO.
+    One message from the symbiot is several generative calls — the re-rank, the tool decision,
+    the reply, the fold — and in the steady state every one of them reports the same ordinary thing:
+    the rung that was asked answered. At INFO that buries the log in its own traffic.
+    The two cases actually worth an operator's eye are already loud without it:
+    a rung that falls through says so where it falls, at WARNING,
+    and a call made for a named role lands durably in the ledger the observe card reads.
+    What the level keeps reachable is the remainder:
+    the internal calls the ledger deliberately does not file,
+    whose model is otherwise named nowhere at all.
 
-    The same fact is parked on the thread (_rung) for the public call above to read back.
+    The same fact is parked on the thread (_rung) for the public call above to read back,
+    which happens at every level and is the load-bearing half of this function.
     A log line survives until the log rotates, and the question it answers —
     whose words did the symbiot actually get? — is one they may ask long after that,
     so a call made for a named role also lands durably in the ledger (generate / generate_json).
     This is the one place every rung passes through,
     which is why the note is taken here rather than at each of the ladder's return points.
     """
-    log.info("generative call served by %s/%s — %d chars back", provider, model_name, len(body))
+    log.debug("generative call served by %s/%s — %d chars back", provider, model_name, len(body))
     _rung.served = (provider, model_name, len(body))
     return body
 
