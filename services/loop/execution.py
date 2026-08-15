@@ -42,7 +42,13 @@ Result = namedtuple("Result", "status value")
 
 
 def _entry(fn, arg, queue):
-    """The child's entry point: run the work, hand its outcome back over the queue.
+    """The child's entry point: wire its logging, run the work, hand its outcome back over the queue.
+
+    Logging comes first, because a spawned child begins with none of it —
+    without this the work's own account of what it did reaches no file at all,
+    and its warnings surface only through logging's last resort on stderr.
+    It sits inside the try so that a failure to wire it comes back as a reported crash,
+    rather than as a child that dies without a word.
 
     A raised exception is caught and reported as its full traceback,
     so a crash comes back as the whole story — every frame, not just the exception line —
@@ -52,6 +58,7 @@ def _entry(fn, arg, queue):
     Stored on the row, it's the raw material a later self-healing pass can read to understand what actually broke.
     """
     try:
+        logs.configure_child()
         queue.put((COMPLETED, fn(arg)))
     except BaseException:  # the child reports every failure, never swallows one
         queue.put((CRASHED, traceback.format_exc()))
