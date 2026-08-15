@@ -361,7 +361,7 @@ def _enrich_one() -> bool:
         # if the symbiot is watching the shell,
         # the live /inbox poll already surfaces this record,
         # so the out-of-app nudge is held rather than doubling up.
-        notification = notify.Notification(title="The Joy", body=follow_up, pointer="/inbox")
+        notification = notify.Notification(title="The Joy", body=follow_up, pointer=protocol.POINTER_INBOX)
         notify.dispatch(pool, symbiot_id, notification, list(notify.ALL_CHANNELS), suppress_when_present=True)
     return True
 
@@ -424,7 +424,7 @@ def _fire_one() -> bool:
     # the whole set the tool supports. Empty and null both mean "they didn't narrow it", so both fall back to
     # the full set; the dispatcher then drops any channel they've since globally disabled.
     fire_channels = list(channels) if channels else list(reminder.SUPPORTED_CHANNELS)
-    notification = notify.Notification(title="Reminder", body=body, pointer="/inbox")
+    notification = notify.Notification(title="Reminder", body=body, pointer=protocol.POINTER_INBOX)
     notify.dispatch(pool, symbiot_id, notification, fire_channels)
     return True
 

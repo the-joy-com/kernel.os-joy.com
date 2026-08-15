@@ -84,9 +84,13 @@ class Notification:
     a channel-free knock was the old web-push doorbell,
     and the layer deliberately left it behind
     (both channels carry content now — see doc/notifications.md on why the encrypted push is the more private).
-    pointer is the path back to the durable inbox record this copies (e.g. "/inbox"):
-    the web push carries it so the shell can deep-link,
-    and the email turns it into a link to open The Joy.
+    pointer is the path back to the durable record this copies (protocol.POINTER_INBOX):
+    the web push carries it as `url`,
+    and the shell spends it when the notification is clicked —
+    naming the record to reconcile rather than a page to open,
+    since that shell is a single screen with no routes.
+    The email ignores it and links the shell's front door instead,
+    since a mail client can only ever open a URL.
     The record is the source of truth;
     the notification is only ever the faster way to it."""
 

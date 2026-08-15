@@ -10,11 +10,17 @@
 --
 -- symbiot_id is who the missive is for — required, since a message with no addressee is
 -- meaningless (unlike an intake row, which is unauthed and has no addressee at all).
--- body is what the kernel wants to say. seen_at is the server-side "the shell has shown
--- this" flag, null until surfaced: /inbox lists a symbiot's unseen missives, and marking
--- them seen is what stops them returning on the next open or a second device. A symbiot's
--- own answers need none of this — the shell discovers those from the id it kept at COPY,
--- not from an inbox read.
+-- body is what the kernel wants to say.
+-- seen_at is the server-side "the shell has shown this" flag, null until surfaced:
+-- /inbox lists a symbiot's unseen missives,
+-- and marking them seen is what stops them returning —
+-- on the next open, and on a second device that polls after the ack.
+-- It is a flag, not a claim:
+-- nothing here locks the read against the acknowledgement,
+-- so two devices polling inside the same window both read it unseen and both show it
+-- (services/loop/missive.py, doc/notifications.md).
+-- A symbiot's own answers need none of this —
+-- the shell discovers those from the id it kept at COPY, not from an inbox read.
 CREATE TABLE missive (
     id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     symbiot_id BIGINT      NOT NULL REFERENCES symbiot (id) ON DELETE CASCADE,

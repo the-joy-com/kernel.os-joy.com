@@ -16,6 +16,8 @@ the symbiot is at the shell, which has somewhere to poll back to.
 It nudges the one channel a message named,
 and serves an anonymous caller as readily as a known one,
 since the channel is tied to the message, not to an identity.
+Held back, though, while a known symbiot is actively watching the shell (services/memory/presence) —
+their own open terminal is already showing the answer, so the knock would only double it up.
 
 The second is fan_out(): the web-push leg of the notification dispatcher
 (services/loop/notify.py).
@@ -62,6 +64,7 @@ from pywebpush import WebPushException, webpush
 from core import config
 from core import logs
 from core import protocol
+from services.memory import presence
 
 # The internal terminal states, mapped to the shell-facing word the reply nudge carries.
 # The words come from protocol.py — the same source /answers reads —
@@ -108,12 +111,14 @@ def _vapid() -> Vapid02 | None:
 def _read_target(conn, message_id: int):
     """The reply channel owed a nudge for this message, plus how the message settled.
 
-    Returns (channel_id, endpoint, p256dh, auth, status),
+    Returns (channel_id, endpoint, p256dh, auth, status, symbiot_id),
     or None when the message has no channel linked (nobody asked to be told)
     or doesn't exist — either way, nothing to send.
+    symbiot_id is the channel's own, and is null for a channel registered anonymously
+    (see save_subscription) — the identity notify() needs to ask presence about, when there is one.
     """
     return conn.execute(
-        "SELECT rc.id, rc.endpoint, rc.p256dh, rc.auth, i.status "
+        "SELECT rc.id, rc.endpoint, rc.p256dh, rc.auth, i.status, rc.symbiot_id "
         "FROM intake i JOIN reply_channel rc ON rc.id = i.reply_channel_id "
         "WHERE i.id = %s",
         (message_id,),
@@ -273,15 +278,21 @@ def notify(pool, message_id: int) -> None:
     it follows the one channel a message named,
     so it serves an anonymous caller exactly as it serves a known one,
     where the notification layer (fan_out) reaches only a known symbiot's registered channels.
+    Held back on the same courtesy notify.dispatch already gives a missive:
+    when the channel belongs to a symbiot who is actively watching the shell (services/memory/presence),
+    their own open terminal is already reconciling the answer, so the out-of-band knock would only double it up.
+    An anonymous channel carries no symbiot to ask presence about, so it is nudged unconditionally, as before.
     A no-op when push is off or the message has no channel linked.
     """
     if not is_enabled():
         return
     with pool.connection() as conn:
         target = _read_target(conn, message_id)
-    if target is None:
-        return
-    channel_id, endpoint, p256dh, auth, status = target
+        if target is None:
+            return
+        channel_id, endpoint, p256dh, auth, status, symbiot_id = target
+        if symbiot_id is not None and presence.is_active(conn, symbiot_id):
+            return
     payload = {
         "id": message_id,
         "kind": protocol.REPLY,

@@ -11,6 +11,7 @@ signing and sending a real push needs a real browser, proven by hand.
 from core import config
 from core import db
 from services.memory import intake
+from services.memory import presence
 from services.adapters import push
 from conftest import SYMBIOT_EMAIL, extract_code
 
@@ -42,11 +43,13 @@ def _channel_symbiot(channel_id: int):
         ).fetchone()[0]
 
 
-def _answered_with_subscription(monkeypatch, endpoint="https://push.example/abc"):
+def _answered_with_subscription(monkeypatch, endpoint="https://push.example/abc", symbiot_id=None):
     # A message linked to a subscription and driven to 'answered' — the state that owes a nudge.
+    # symbiot_id ties the subscription to a symbiot (as a real /push/subscribe while logged in would);
+    # left None, the subscription stays anonymous, as most of this suite's fixtures need it.
     # Returns (message_id, subscription_id).
     with db.get_pool().connection() as conn:
-        subscription_id = push.save_subscription(conn, endpoint, "p256", "authsecret")
+        subscription_id = push.save_subscription(conn, endpoint, "p256", "authsecret", symbiot_id)
         message_id = intake.record_message(conn, "a message", subscription_id)
         intake.claim_next(conn)
         intake.mark_answered(conn, message_id, "the reply")
@@ -176,6 +179,35 @@ def test_notify_prunes_a_subscription_the_service_reports_gone(client, monkeypat
     assert remaining == 0  # the dead subscription is gone
     assert status == "answered"  # the answer outlives the address it would have announced
     assert link is None  # the link nulled, not the message dropped
+
+
+def test_notify_holds_the_reply_nudge_when_the_symbiot_is_present(client, monkeypatch):
+    # The channel belongs to a known symbiot who is actively watching the shell: their own open
+    # terminal is already reconciling the answer, so the out-of-band knock would only double it up —
+    # the same courtesy notify.dispatch already gives a missive.
+    monkeypatch.setattr(config, "VAPID_PRIVATE_KEY", TEST_VAPID_KEY)
+    called = []
+    monkeypatch.setattr(push, "_send", lambda *a: called.append(1) or False)
+    symbiot_id = _symbiot_id()
+    message_id, _ = _answered_with_subscription(monkeypatch, symbiot_id=symbiot_id)
+    with db.get_pool().connection() as conn:
+        presence.mark_seen(conn, symbiot_id)
+    push.notify(db.get_pool(), message_id)
+    assert called == []
+
+
+def test_notify_still_pushes_a_known_symbiot_who_is_not_present(client, monkeypatch):
+    # The channel is linked to a symbiot, but they haven't polled recently — presence reads them as
+    # gone, so the nudge fires exactly as it would for an anonymous channel.
+    monkeypatch.setattr(config, "VAPID_PRIVATE_KEY", TEST_VAPID_KEY)
+    sent = []
+    monkeypatch.setattr(
+        push, "_send", lambda endpoint, p256dh, auth, payload: sent.append(payload) or False
+    )
+    symbiot_id = _symbiot_id()
+    message_id, _ = _answered_with_subscription(monkeypatch, symbiot_id=symbiot_id)
+    push.notify(db.get_pool(), message_id)
+    assert len(sent) == 1
 
 
 # --- the send itself ------------------------------------------------------------------

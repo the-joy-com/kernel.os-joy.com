@@ -341,6 +341,8 @@ def inbox(conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)) 
     so a caller with no live session is owed nothing and gets an empty list rather than an error
     (nothing here is an oracle about who's registered or what's waiting).
     Each message carries its id and body; the shell shows it, then POSTs the ids to /inbox/seen so it isn't offered again.
+    Every signed-in device polls this on its own timer, and the read takes no lock against that acknowledgement,
+    so two polls inside the same narrow window are both handed the same message and both show it (see missive.py).
     """
     symbiot_id = identity.authenticated_symbiot_id(conn, token)
     if symbiot_id is None:

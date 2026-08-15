@@ -36,6 +36,12 @@ STANDIN_ANSWER_ANON = "authenticate"  # stand-in reply to a line with no live se
 
 # Traffic waiting: unsolicited messages the kernel raises for the symbiot, discovered on open.
 TRAFFIC_WAITING = "traffic waiting"  # GET /inbox — the symbiot's unseen inbound; the messages ride in data.messages
+# The pointer a notification carries back to the durable record it copies (notify.Notification.pointer),
+# riding the web push payload as `url`.
+# It names a record, not a page:
+# the shell has one screen, so it reads this as what to reconcile when the notification is clicked,
+# never as somewhere to navigate to.
+POINTER_INBOX = "/inbox"  # the record behind a missive nudge — a reminder firing, a follow-up, a line relayed from the World
 
 # Identity: the login handshake and session state.
 AUTHED = "authenticated"  # GET /status — a live session

@@ -12,13 +12,21 @@ The shell never sent a missive, so it holds no id to ask about one —
 the way it does for its own lines (see intake.read_outcome and the /answers route).
 Discovery is the whole point of this module: /inbox lists a symbiot's unseen missives,
 and /inbox/seen marks the ones the shell has shown,
-so each surfaces exactly once across opens and devices.
+so each is offered again on every open until some device acknowledges it, and never after.
+That holds across opens, and across devices once one of them has acked first.
+It does not hold against two devices reading at once:
+a missive is addressed to the symbiot rather than to a device,
+every signed-in device polls /inbox on its own timer,
+and nothing locks the unseen read against the acknowledgement,
+so two polls landing inside the same narrow window are both handed the same missive,
+and both will show it. That race is named rather than guarded (see doc/notifications.md).
 
 The record and the reads below are pure data access. `deliver` sits one layer up:
 it's the complete act of the kernel reaching out — record the missive, then nudge —
 and is what a producer (or a QA session) calls to send one.
 """
 
+from core import protocol
 from services.memory import conversation
 from services.loop import notify
 
@@ -52,6 +60,10 @@ def unseen_for_symbiot(conn, symbiot_id: int) -> list[tuple[int, str]]:
 
     The read behind /inbox — the messages the shell couldn't have discovered on its own,
     since it never sent them. Already-seen ones are out of scope.
+
+    The read takes no lock, and isn't paired with the acknowledgement below:
+    a second device polling in the same window is handed these same rows,
+    and shows them too (see the module header).
     """
     rows = conn.execute(
         "SELECT id, body FROM missive "
@@ -112,6 +124,6 @@ def deliver(pool, symbiot_id: int, body: str) -> int:
     # suppress_when_present because this is a pure courtesy nudge:
     # if the symbiot is watching the shell, the live /inbox poll already surfaces this record in front of them,
     # so the out-of-app channels are held rather than doubling up on something on the screen.
-    notification = notify.Notification(title="The Joy", body=body, pointer="/inbox")
+    notification = notify.Notification(title="The Joy", body=body, pointer=protocol.POINTER_INBOX)
     notify.dispatch(pool, symbiot_id, notification, list(notify.ALL_CHANNELS), suppress_when_present=True)
     return missive_id
