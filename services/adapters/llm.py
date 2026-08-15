@@ -63,6 +63,7 @@ Embedding does not make that trade — it stays on the box (embedding.py), tied 
 """
 
 import os
+import threading
 from typing import TypeVar
 
 import httpx
@@ -78,6 +79,7 @@ from pydantic import BaseModel, create_model, Field
 from core import config
 from core import logs
 from services.adapters import models
+from services.memory import generative_call
 
 
 M = TypeVar("M", bound=BaseModel)
@@ -90,6 +92,20 @@ log = logs.get("llm")
 # A budget so tight it left the context almost no room would ask the summariser for nonsense,
 # so the target is floored here — better a little over budget than a summary squeezed to nothing.
 _MIN_CONTEXT_TOKENS = 128
+
+# The rung that answered most recently, per thread —
+# how the role a call served is joined back to the model that actually served it.
+# The two facts are known in two different places and neither can reach the other directly:
+# the *role* is known only up at the public call (generate / generate_json), which resolved it,
+# and the *rung* is known only down inside the ladder, at whichever tier returned (_served) —
+# with an unknown number of tiers, and possibly a summarising call of its own, in between.
+# Threading the answer back up would mean changing the return shape at every tier and every rung of the ladder;
+# this is the same fact, parked at the one choke point every rung already passes through,
+# and read once, immediately, by the one caller that knows what to call it.
+# Thread-local because the worker is a pool of threads and two units of work compose at the same time:
+# process-wide state here would let one thread read another's rung and file a reply under the wrong model.
+# Read only ever directly after the call that set it, so nothing stale is attributable to a live call.
+_rung = threading.local()
 
 
 class _Outage(Exception):
@@ -571,6 +587,41 @@ def _output_cap(override: int | None, model_name: str) -> int | None:
     return cap
 
 
+def _record_call(role: str | None, requested_model: str) -> None:
+    """Land the call just made in the ledger, when it was made for a named role.
+
+    The join no other place can make: the *role* is known only here, at the public call that resolved it,
+    and the *rung that answered* only down in the ladder, where the role was never in scope.
+    So this pairs the role the caller named with the rung _served parked on this thread a moment ago,
+    and writes the two down together (memory/generative_call).
+    That is what makes a reply attributable after the fact,
+    since the reply itself never names its author,
+    and the requested model is only a guess at it whenever the ladder moved.
+
+    A call made without naming a role is not recorded:
+    the ledger is read by role, and a row filed under a model name alone would answer no question the card asks.
+    That is how a role joins the ledger — by naming itself at its call site —
+    rather than by anything here enumerating them.
+    A call with no rung noted is not recorded either.
+    Nothing on this path produces that, since every tier returns through _served,
+    so it is the belt-and-braces stance the rest of this boundary takes:
+    record what is known, never a guess dressed as a measurement.
+    """
+    if role is None:
+        return
+    served = getattr(_rung, "served", None)
+    if served is None:
+        return
+    provider, served_model, reply_chars = served
+    generative_call.record(
+        role=role,
+        requested_model=requested_model,
+        served_provider=provider,
+        served_model=served_model,
+        reply_chars=reply_chars,
+    )
+
+
 def _reasoning_effort(model_name: str) -> str:
     """The reasoning_effort to send Scaleway for this model — always a value its schema accepts.
 
@@ -608,7 +659,7 @@ def _scaleway_fallback(google_model: str) -> str:
 
 
 def _served(provider: str, model_name: str, body: str) -> str:
-    """Record which model actually answered, and how much it said — then hand the reply on unchanged.
+    """Note which model actually answered, and how much it said — then hand the reply on unchanged.
 
     Every generative call in the kernel resolves a *role* to a model name, and then walks a fallback ladder,
     so the model that answers is often not the one the role names and never appears in the reply itself.
@@ -623,8 +674,16 @@ def _served(provider: str, model_name: str, body: str) -> str:
 
     One line per call, at the rung that answered — so a fall-through reads as two lines, not one,
     and the last of them is always the model whose words the symbiot actually got.
+
+    The same fact is parked on the thread (_rung) for the public call above to read back.
+    A log line survives until the log rotates, and the question it answers —
+    whose words did the symbiot actually get? — is one they may ask long after that,
+    so a call made for a named role also lands durably in the ledger (generate / generate_json).
+    This is the one place every rung passes through,
+    which is why the note is taken here rather than at each of the ladder's return points.
     """
     log.info("generative call served by %s/%s — %d chars back", provider, model_name, len(body))
+    _rung.served = (provider, model_name, len(body))
     return body
 
 
@@ -705,15 +764,18 @@ def _wire_schema(schema: type[BaseModel]) -> type[BaseModel]:
 
 
 def generate(
-    prompt: str, *, model: str | None = None, context: str | None = None
+    prompt: str, *, model: str | None = None, context: str | None = None, role: str | None = None
 ) -> str:
     """Run one generative call and return its reply as free text.
 
     The counterpart to generate_json for the reply the read path composes:
     prose the caller cannot — and should not — hold to a schema,
     so no `response_format` is sent and the model is free to emit natural language rather than JSON.
-    model defaults to the model assigned the router's rerank role (models.role_name("rerank"));
-    the reply path passes the model assigned its own role, which may point at a different one than the router's.
+    role is the generative job this call is for ('reply', 'enrich', …):
+    naming it resolves the model from the store and lands the call in the ledger,
+    so the model that actually answered stays attributable afterward (_record_call).
+    A caller that names a `model` instead is asking for one specific model, and is not recorded;
+    naming neither takes the router's rerank role, the boundary's default.
     context, when given, is the summarisable slice of `prompt` the budget guard may condense
     if the prompt overruns the model's optimal window (see _fit) — for the reply, the folded-in facts.
 
@@ -726,13 +788,17 @@ def generate(
     but it removes the avoidable variance, so each answers as consistently as it can and the same diary tends to reproduce the same reply.
     An empty response raises rather than returning a blank reply that would reach the symbiot as silence.
     """
-    model_name = model or models.role_name("rerank")
-    return _call(
+    model_name = model or models.role_name(role or "rerank")
+    # Cleared before the call so the rung read back after it can only be this call's own.
+    _rung.served = None
+    reply = _call(
         model=model_name,
         prompt=_fit(prompt, context, model_name),
         context=context,
         temperature=0,
     )
+    _record_call(role, model_name)
+    return reply
 
 
 def generate_json(
@@ -741,6 +807,7 @@ def generate_json(
     *,
     model: str | None = None,
     context: str | None = None,
+    role: str | None = None,
 ) -> M:
     """Run one generative call and validate its reply into an instance of `schema`.
 
@@ -752,8 +819,11 @@ def generate_json(
     A reply that breaks the model's constraints raises here
     rather than slipping through as a half-read decision that would quietly mis-file a fact —
     the provider's schema is best-effort guidance, but this validation is the guarantee, whichever tier answered.
-    model defaults to the model assigned the router's rerank role (models.role_name("rerank"));
-    a caller that wants a different model passes its own.
+    role is the generative job this call is for ('reply', 'enrich', …):
+    naming it resolves the model from the store and lands the call in the ledger,
+    so the model that actually answered stays attributable afterward (_record_call).
+    A caller that names a `model` instead is asking for one specific model, and is not recorded;
+    naming neither takes the router's rerank role, the boundary's default.
     context, when given, is the summarisable slice of `prompt` the budget guard may condense
     if the prompt overruns the model's optimal window (see _fit); the router's prompts are bounded, so they leave it unset.
 
@@ -761,7 +831,9 @@ def generate_json(
     every call through here is a fast classification-style judgment,
     and sampling is pinned to temperature 0 so the same inputs score the same way twice.
     """
-    model_name = model or models.role_name("rerank")
+    model_name = model or models.role_name(role or "rerank")
+    # Cleared before the call so the rung read back after it can only be this call's own.
+    _rung.served = None
     reply = _call(
         model=model_name,
         prompt=_fit(prompt, context, model_name),
@@ -769,4 +841,9 @@ def generate_json(
         schema=schema,
         temperature=0,
     )
+    # Recorded before the reply is validated, on purpose:
+    # a reply that breaks its schema is the very case this attribution was built for —
+    # a model degenerating against its own output ceiling until the JSON truncates —
+    # so the row naming which model produced it must be written before the raise, not after.
+    _record_call(role, model_name)
     return schema.model_validate_json(reply)

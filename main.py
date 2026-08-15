@@ -634,13 +634,70 @@ def observe_machine_echoes(
     )
 
 
+@app.get("/observe/models")
+def observe_generative_calls(
+    conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)
+) -> dict:
+    """The models lens: which model actually answered the last calls that produced words — authed only.
+
+    The observability corner's second card (see services/observe.py). Read-only like the other two:
+    it reports calls already made and writes nothing, so opening it can never change how the machine behaves.
+    Its point is the gap between two names.
+    Every generative call resolves a *role* to a model and then walks a fallback ladder,
+    so the model that answers is often not the one the role names,
+    and the reply never says which one it was —
+    a run of replies quietly composed by a humbler rung reads only as the machine getting duller
+    for no reason anyone can point at.
+    Set the requested model beside the served one and it is legible.
+    Narrowed to the two roles whose words the symbiot actually reads, the fast reply and the deep follow-up,
+    each carrying the same plain mechanism word the echoes card uses ('quick', 'deep').
+    Authed-gated like the other cards.
+    What it reports, though, is box-level rather than the symbiot's own:
+    which model served a call is a property of the machine and the clouds it can reach,
+    exactly like the catalog and the role assignments read through /models —
+    and no row here carries anyone's content.
+    created_at is rendered in the symbiot's own zone, so the shell prints a ready label.
+    """
+    symbiot_id = identity.authenticated_symbiot_id(conn, token)
+    if symbiot_id is None:
+        return envelope(protocol.NOT_AUTHED, {"authed": False})
+    zone_name = zone.of(conn, symbiot_id)
+    calls = observe.recent_generative_calls(conn)
+    return envelope(
+        protocol.OBSERVE_MODELS,
+        {
+            "calls": [
+                {
+                    # mechanism: which kind of line this call produced — 'quick' a fast reply, 'deep' a follow-up.
+                    # The same word the echoes card uses, so the two read as one vocabulary.
+                    "mechanism": c.mechanism,
+                    # requested: the model the role resolved to before the ladder was walked.
+                    "requested": c.requested_model,
+                    # served: the model that actually answered. Equal to requested, the primary answered;
+                    # different, a rung outaged and a humbler model composed the words the symbiot read.
+                    "served": c.served_model,
+                    # provider: the cloud that answered, because the ladder falls across providers, not only models.
+                    "provider": c.served_provider,
+                    # chars: how much came back, measured on the model's raw body rather than the words
+                    # unwrapped from it, since the output ceiling it is the tell for applies to that raw body.
+                    # A length only, never the words themselves.
+                    "chars": c.reply_chars,
+                    # when: the instant the call was made, on the symbiot's own clock so the shell prints it as-is.
+                    "when": zone.local(c.created_at, zone_name).strftime("%a %d %b, %H:%M"),
+                }
+                for c in calls
+            ],
+        },
+    )
+
+
 @app.get("/observe/reminders")
 def observe_reminders(
     conn=Depends(db.get_conn), token: str | None = Depends(bearer_token)
 ) -> dict:
     """The reminders lens: the symbiot's most recently scheduled reminders, each with the line that triggered it — authed only.
 
-    The observability corner's second card (see services/observe.py). Read-only like the first:
+    The observability corner's third card (see services/observe.py). Read-only like the first two:
     it reports reminders already scheduled and writes nothing, so opening it can never change how the machine behaves.
     Its point is the pairing — the human message and the reminder it produced —
     so an over-eager schedule (a reminder set against a line that only mentioned a task, never asked for one)

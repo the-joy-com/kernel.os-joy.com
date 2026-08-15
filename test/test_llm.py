@@ -513,3 +513,41 @@ def test_google_surfaces_a_4xx_without_falling_over(monkeypatch):
 
     with pytest.raises(llm.genai_errors.ClientError):
         llm.generate("hello")
+
+
+def test_a_named_role_records_the_rung_that_actually_answered(monkeypatch):
+    # The ledger's whole point: the row names the model that *answered*, never the one the role resolved to.
+    # Attributing a fallen-through reply to the primary would be precisely the lie the record exists to prevent,
+    # and nothing downstream could catch it, since the reply reads the same either way.
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate=_raises(_scaleway_outage())))
+    monkeypatch.setattr(llm, "Mistral", _FakeMistral(complete="mistral answered"))
+    monkeypatch.setattr(llm.ollama, "Client",
+                        _FakeOllama(generate=_never("Mistral answered; the local tier must not run")))
+    recorded = []
+    monkeypatch.setattr(llm.generative_call, "record", lambda **kw: recorded.append(kw))
+
+    llm.generate("hello", role="reply")
+
+    requested = llm.models.role_name("reply")
+    assert len(recorded) == 1
+    assert recorded[0]["role"] == "reply"
+    assert recorded[0]["requested_model"] == requested
+    # Two clouds down, so it is Mistral that composed the words — the gap the card is read for.
+    assert recorded[0]["served_provider"] == "mistral"
+    assert recorded[0]["served_model"] == llm._mistral_fallback(llm._scaleway_fallback(requested))
+    assert recorded[0]["reply_chars"] == len("mistral answered")
+
+
+def test_a_call_that_names_no_role_is_left_out_of_the_ledger(monkeypatch):
+    # A role joins the ledger by naming itself at its call site.
+    # A row filed under a model name alone answers no question the card asks, so it is never written —
+    # which is what keeps the ledger honest about being a record of the two roles it claims to cover.
+    monkeypatch.setattr(llm, "OpenAI", _FakeChat(generate=_raises(_scaleway_outage())))
+    monkeypatch.setattr(llm, "Mistral", _FakeMistral(complete="mistral answered"))
+    monkeypatch.setattr(llm.ollama, "Client", _FakeOllama(generate=_never("Mistral answered")))
+    recorded = []
+    monkeypatch.setattr(llm.generative_call, "record", lambda **kw: recorded.append(kw))
+
+    llm.generate("hello")
+
+    assert recorded == []

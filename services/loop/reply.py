@@ -33,7 +33,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from core import config
-from services.adapters import llm, models
+from services.adapters import llm
 from services.loop import persona, zone
 from services.memory import conversation, retrieval
 
@@ -175,9 +175,13 @@ def compose(
     prompt = _compose_prompt(message, memory_block, head, time_line)
     # The whole remembered block is the compressible region — diary and conversation alike —
     # so an overrun condenses what is remembered, never the persona, the instructions, or the live message bracketing it.
-    # The reply's model is resolved from the store by role (models.role_name), not read from a config constant,
-    # so an operator's reassignment through /models takes effect here — resolved in the parent and, when this
-    # runs in a spawned child, from the store the child loads for itself.
+    # The call names its *role*, not a model:
+    # the boundary resolves 'reply' against the store,
+    # so an operator's reassignment through /models takes effect here —
+    # resolved in the parent and, when this runs in a spawned child, from the store the child loads for itself.
+    # Naming the role is also what lands the call in the ledger the observe hub's models card reads,
+    # so which model actually composed this reply — the resolved one, or a humbler rung the ladder fell to —
+    # stays attributable after the fact.
     return llm.generate_json(
-        prompt, _SpokenReply, model=models.role_name("reply"), context=memory_block
+        prompt, _SpokenReply, role="reply", context=memory_block
     ).reply

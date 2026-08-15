@@ -49,7 +49,6 @@ from services.memory import conversation
 from services.memory import deep_retrieval
 from services.adapters import embedding
 from services.adapters import llm
-from services.adapters import models
 from services.loop import persona
 from services.loop import zone
 
@@ -170,10 +169,15 @@ def compose(
         return False, ""
     head = persona.head()
     time_line = zone.render_now(now_local, zone_name) if now_local is not None and zone_name else None
+    # The call names its *role* rather than a model,
+    # so the boundary resolves 'enrich' against the store
+    # and the call lands in the ledger the observe hub's models card reads —
+    # which is what keeps a deep follow-up attributable to the model that actually composed it,
+    # ladder fall-through and all.
     reply = llm.generate_json(
         _compose_prompt(origin, related, head, zone_name or zone.DEFAULT_ZONE, time_line),
         _EnrichmentReply,
-        model=models.role_name("enrich"),
+        role="enrich",
     )
     surface = reply.surface and bool(reply.message.strip())
     return surface, reply.message.strip() if surface else ""

@@ -15,7 +15,19 @@ an intake pointer is a fast reply, a missive an enrichment marks is a deep follo
 echoes then embeds those lines and groups the near-duplicates into clusters — the *more or less* the same,
 measured as cosine closeness rather than guessed at — leaving the lines that echoed nothing to stand alone.
 
-The second card is reminders: the symbiot's most recent reminders,
+The second card is models: which model actually answered the last calls that produced words for the symbiot —
+the fast reply and the deep follow-up (recent_generative_calls).
+Every generative call resolves a *role* to a model and then walks a fallback ladder,
+so the model that answers is often not the one the role names, and the reply never says which one it was.
+That makes the card's real subject the gap between the two:
+the requested model beside the served one, so a run of replies quietly composed by a humbler rung —
+which reads as the machine getting duller for no reason anyone can point at — is visible as what it is.
+A plain read of the ledger the model boundary writes (migration 0026, memory/generative_call),
+and the only card here that is box-level rather than the symbiot's own,
+because which model served a call is a property of the machine and the clouds it can reach,
+exactly like the catalog and the role assignments it is read against.
+
+The third card is reminders: the symbiot's most recent reminders,
 each paired with the human line that triggered it (recent_reminders).
 Its point is that pairing — the message said, and the reminder it produced —
 so a reminder set against a line that only *mentioned* a task, rather than asked for one, is visible at a glance,
@@ -49,6 +61,23 @@ RECENT_UTTERANCE_LIMIT = 40
 # because a reminder is a rarer event and the card is read to spot a bad pairing, not to scroll a stream.
 # The same un-tuned plain default, to be set against real use rather than guessed at blind.
 RECENT_REMINDER_LIMIT = 20
+
+# The generative roles the models lens reports on, and the plain word each is shown under.
+# The two roles whose words the symbiot actually *reads* — the fast answer and the deep follow-up —
+# which is why these two and not the other six:
+# every other role is an internal judgment (a re-rank, a tool decision, a fold),
+# and the question this card answers is "whose words did I get?",
+# not "what did the machine think along the way".
+# A role joins by naming itself at its call site (llm.generate_json's `role`) and appearing here.
+# The words match the echoes lens's own — a 'quick' line and a 'deep' line mean the same thing on both cards.
+GENERATIVE_CALL_ROLES = {"enrich": "deep", "reply": "quick"}
+
+# How many generative calls the models lens reaches back over.
+# Sized like the utterances window rather than the reminders one:
+# a call happens on every message, so the question the card answers —
+# has the ladder been falling through, and to what? — is only legible across a decent run of them.
+# The same un-tuned plain default as the other two, to be set against real use rather than guessed at blind.
+RECENT_GENERATIVE_CALL_LIMIT = 40
 
 
 @dataclass
@@ -139,6 +168,30 @@ class ReminderDecline:
     asked: str
     held: str
     fire_at: datetime
+    created_at: datetime
+
+
+@dataclass
+class GenerativeCall:
+    """One generative call as the models lens reports it — what was asked for, and what actually answered.
+
+    mechanism is the plain word for the role the call served, matched to the echoes lens's vocabulary:
+    'quick' for the fast reply, 'deep' for the enrichment follow-up.
+    requested_model is the model the role resolved to before the fallback ladder was walked,
+    and served_model the one that answered; equal, the primary answered and nothing fell through,
+    different, a rung outaged and a humbler model composed the words —
+    which is the whole reason the card exists, since the reply reads the same either way.
+    served_provider is the cloud that answered, because the ladder falls across providers and not only models.
+    reply_chars is how much came back, measured on the model's raw body rather than the words unwrapped from it,
+    since the output ceiling it is the tell for applies to that raw body — a reply sitting at the cap is degenerate.
+    created_at is when the call was made, to be rendered in the symbiot's own zone.
+    """
+
+    mechanism: str
+    requested_model: str
+    served_provider: str
+    served_model: str
+    reply_chars: int
     created_at: datetime
 
 
@@ -243,6 +296,46 @@ def recent_declines(conn, symbiot_id: int, limit: int = RECENT_REMINDER_LIMIT) -
     ).fetchall()
     return [
         ReminderDecline(reminder_id=r[0], asked=r[1], held=r[2], fire_at=r[3], created_at=r[4])
+        for r in rows
+    ]
+
+
+def recent_generative_calls(conn, limit: int = RECENT_GENERATIVE_CALL_LIMIT) -> list[GenerativeCall]:
+    """The most recent generative calls that produced words for the symbiot, newest first, for the models lens.
+
+    A plain read of the ledger the model boundary writes (memory/generative_call),
+    narrowed to the roles whose output the symbiot actually reads (GENERATIVE_CALL_ROLES)
+    and handed back with each role rendered as the same plain word the echoes lens uses for it,
+    so 'quick' and 'deep' mean one thing across the whole hub.
+
+    Takes no symbiot: alone among the reads here, this one is box-level.
+    Which model served a call is a property of the machine and the clouds it can reach —
+    the same thing the model catalog and the role assignments are, which are box-level too
+    and read through the box-level /models command.
+    Nothing in a row is anyone's content: a role, two model names, a provider, a length, an instant.
+
+    Newest first and bounded at that end, the order a "what has been answering lately" read is scanned in.
+    A pure read like the rest of this module: no lock, nothing written, off the loop's path.
+    """
+    rows = conn.execute(
+        """
+        SELECT role, requested_model, served_provider, served_model, reply_chars, created_at
+        FROM generative_call
+        WHERE role = ANY(%(roles)s)
+        ORDER BY id DESC
+        LIMIT %(limit)s
+        """,
+        {"roles": list(GENERATIVE_CALL_ROLES), "limit": limit},
+    ).fetchall()
+    return [
+        GenerativeCall(
+            mechanism=GENERATIVE_CALL_ROLES[r[0]],
+            requested_model=r[1],
+            served_provider=r[2],
+            served_model=r[3],
+            reply_chars=r[4],
+            created_at=r[5],
+        )
         for r in rows
     ]
 

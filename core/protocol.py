@@ -62,6 +62,7 @@ REMINDERS_REFUSED = "that reminder change didn't take"  # POST /reminders — th
 
 # Observe: the observability corner's read surface, one word per card (authed only).
 OBSERVE_ECHOES = "observe echoes"  # GET /observe/echoes — the scored redundancy rides in data (clusters, singles, scored)
+OBSERVE_MODELS = "observe models"  # GET /observe/models — the recent generative calls ride in data (requested against served)
 OBSERVE_REMINDERS = "observe reminders"  # GET /observe/reminders — recent reminders and their triggering lines ride in data
 
 # Models: the operator's model catalog and role assignments (authed only, box-level).

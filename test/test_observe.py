@@ -5,9 +5,15 @@ things it must get right and nothing it doesn't: that each utterance is resolved
 the mechanism that raised it (a fast reply, a deep follow-up, a note), and that the stream's own order is
 handed back newest-first with the symbiot's own lines left out. It writes nothing, so there is no write to check.
 
-recent_reminders is the read behind the second card: a plain join of the reminder ledger to its triggering
+recent_reminders is the read behind the third card: a plain join of the reminder ledger to its triggering
 intake, so the tests pin what that card is for — each reminder paired with the human line that triggered it,
 newest first — and that the route gates on a session and renders its times on the symbiot's own clock.
+
+recent_generative_calls is the read behind the second card, and the thing worth pinning there is the pair of
+names: the model a role resolved to beside the one that actually answered, since a reply the ladder fell
+through on reads identically to one the primary composed. The tests also hold the card to the two roles whose
+words the symbiot reads, to the echoes card's own mechanism vocabulary, and to being box-level on purpose —
+that last one pinned so the missing symbiot filter reads as a decision rather than an oversight.
 """
 
 from core import db
@@ -379,3 +385,93 @@ def test_reminders_route_returns_the_pairing_with_local_time_labels(client, fake
     assert r["channels"] is None
     assert r["fire_at"], "expected a rendered local-time label"
     assert r["created_at"], "expected a rendered local-time label"
+
+
+def _call(role, requested="gemini-3.1-pro-preview", provider="google", served=None, chars=120) -> None:
+    _with_conn(lambda c: c.execute(
+        "INSERT INTO generative_call "
+        "(role, requested_model, served_provider, served_model, reply_chars) VALUES (%s, %s, %s, %s, %s)",
+        (role, requested, provider, served or requested, chars),
+    ))
+
+
+def test_calls_report_the_served_model_beside_the_one_asked_for(client):
+    # The gap between the two names is the whole card:
+    # a reply the ladder fell through on reads identically to one the primary answered,
+    # so the row has to carry both or the fall-through is invisible.
+    _call("reply", requested="gemini-3.1-pro-preview", provider="mistral", served="mistral-large-latest")
+
+    got = _with_conn(observe.recent_generative_calls)
+
+    assert len(got) == 1
+    assert got[0].requested_model == "gemini-3.1-pro-preview"
+    assert got[0].served_model == "mistral-large-latest"
+    assert got[0].served_provider == "mistral"
+
+
+def test_calls_wear_the_same_mechanism_words_the_echoes_card_uses(client):
+    # 'quick' and 'deep' have to mean one thing across the hub, so the roles are rendered, never leaked raw.
+    _call("reply")
+    _call("enrich")
+
+    got = _with_conn(observe.recent_generative_calls)
+
+    assert [c.mechanism for c in got] == ["deep", "quick"]
+
+
+def test_calls_leave_out_the_roles_whose_words_no_one_reads(client):
+    # Every other role is an internal judgment; the card answers "whose words did I get?", so they stay out.
+    _call("reply")
+    _call("rerank")
+    _call("tool_decision")
+
+    got = _with_conn(observe.recent_generative_calls)
+
+    assert [c.mechanism for c in got] == ["quick"]
+
+
+def test_calls_come_back_newest_first_and_bounded_at_that_end(client):
+    for n in range(5):
+        _call("reply", chars=n)
+
+    got = _with_conn(lambda c: observe.recent_generative_calls(c, limit=2))
+
+    assert [c.reply_chars for c in got] == [4, 3]
+
+
+def test_calls_route_requires_a_session(client):
+    body = client.get("/observe/models").json()
+    assert body["msg"] == "not authenticated"
+
+
+def test_calls_route_returns_the_two_names_with_a_local_time_label(client, fake_email):
+    token = _token(client, fake_email)
+    _call("reply", requested="gemini-3.1-pro-preview", provider="ollama", served="qwen3.5:4b", chars=88)
+
+    body = client.get("/observe/models", headers=_auth(token)).json()
+
+    assert body["msg"] == "observe models"
+    calls = body["data"]["calls"]
+    assert len(calls) == 1
+    c = calls[0]
+    assert c["mechanism"] == "quick"
+    assert c["requested"] == "gemini-3.1-pro-preview"
+    assert c["served"] == "qwen3.5:4b"
+    assert c["provider"] == "ollama"
+    assert c["chars"] == 88
+    assert c["when"], "expected a rendered local-time label"
+
+
+def test_calls_are_box_level_on_purpose_and_not_scoped_to_a_symbiot(client):
+    # Deliberate, and the one read here that is not the symbiot's own.
+    # Which model served a call is a property of the machine and the clouds it can reach —
+    # the same thing the catalog and the role assignments are, and those are box-level too.
+    # Pinned so the absence of a symbiot filter reads as a decision rather than an oversight
+    # anyone would be right to "fix".
+    _with_conn(lambda c: c.execute("INSERT INTO symbiot (email) VALUES ('other@example.com')"))
+    _call("reply")
+
+    got = _with_conn(observe.recent_generative_calls)
+
+    assert len(got) == 1
+    assert not hasattr(got[0], "symbiot_id")

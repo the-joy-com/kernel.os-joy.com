@@ -155,7 +155,8 @@ def clean_db(client):
         conn.execute(
             "TRUNCATE symbiot, login_code, session, intake, missive, reply_channel, "
             "schema_ontology, diary_facts, conversation_item, conversation_gist, enrichment, "
-            "tool_catalog, reminder, reminder_decline, notification_preference, model, model_role "
+            "generative_call, tool_catalog, reminder, reminder_decline, notification_preference, "
+            "model, model_role "
             "RESTART IDENTITY CASCADE"
         )
         conn.execute("INSERT INTO symbiot (email) VALUES (%s)", (SYMBIOT_EMAIL,))

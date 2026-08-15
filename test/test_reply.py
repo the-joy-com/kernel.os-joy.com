@@ -12,7 +12,6 @@ and that the summarisable region is exactly the remembered block — never the p
 
 from datetime import datetime, timezone
 
-from core import config
 from services.memory import conversation
 from services.loop import reply
 from services.memory import retrieval
@@ -30,8 +29,8 @@ def _capture(monkeypatch, captured, text="ok"):
     # Stand in for the model boundary: record everything that reached it,
     # and answer with a valid _SpokenReply rather than a bare string —
     # the same shape compose unwraps, so these tests exercise that unwrapping rather than bypassing it.
-    def fake_generate_json(prompt, schema, *, model=None, context=None):
-        captured.update(prompt=prompt, schema=schema, model=model, context=context)
+    def fake_generate_json(prompt, schema, *, model=None, context=None, role=None):
+        captured.update(prompt=prompt, schema=schema, model=model, context=context, role=role)
         return schema(reply=text)
 
     monkeypatch.setattr(reply.llm, "generate_json", fake_generate_json)
@@ -54,8 +53,14 @@ def test_compose_folds_persona_facts_and_message_into_the_prompt(monkeypatch):
     assert "how have I been?" in captured["prompt"]
     assert "boxing with Jeremy" in captured["prompt"] and "2026-07-10" in captured["prompt"]
     assert "I live in Strasbourg" in captured["prompt"] and "2026-07-01" in captured["prompt"]
-    # The reply model, and the facts block passed as the summarisable context — verbatim, as it sits in the prompt.
-    assert captured["model"] == config.REPLY_MODEL
+    # The call names the reply *role* and no model of its own:
+    # resolving 'reply' against the store is the boundary's job,
+    # and naming it is also what lands the call in the ledger the models lens reads —
+    # so a compose that reached for a model name directly
+    # would be both a stale resolution and an unrecorded call.
+    assert captured["role"] == "reply"
+    assert captured["model"] is None
+    # The facts block passed as the summarisable context — verbatim, as it sits in the prompt.
     assert captured["context"] in captured["prompt"]
     assert "boxing with Jeremy" in captured["context"]
 
